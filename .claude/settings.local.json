@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(New-Item -ItemType Directory -Force \"C:\\\\Repos\\\\KeyFigurator\\\\keyfigurator\\\\src-tauri\\\\capabilities\")",
+      "Bash(Out-Null)",
+      "Bash(Set-Content -Path 'C:\\\\Repos\\\\KeyFigurator\\\\keyfigurator\\\\src-tauri\\\\capabilities\\\\default.json' -Encoding utf8 -Value '{ *)",
+      "PowerShell(New-Item *)",
+      "PowerShell(Get-Process *)",
+      "Skill(run)"
+    ]
+  }
+}

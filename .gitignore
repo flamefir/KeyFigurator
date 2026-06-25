@@ -1,0 +1,13 @@
+## Node / Vite
+keyfigurator/node_modules/
+keyfigurator/dist/
+keyfigurator/.vite/
+keyfigurator/.vite-temp/
+
+## Tauri / Rust
+keyfigurator/src-tauri/target/
+keyfigurator/rustup-init.exe
+
+## OS
+.DS_Store
+Thumbs.db

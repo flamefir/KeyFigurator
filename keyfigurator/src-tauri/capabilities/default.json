@@ -1,0 +1,11 @@
+{
+  "identifier": "default",
+  "description": "Default capabilities for KeyFigurator Pro",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-close"
+  ]
+}
