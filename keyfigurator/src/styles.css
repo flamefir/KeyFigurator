@@ -1,5 +1,5 @@
 :root {
-  --bg:    #0c0d10;
+  --bg:    #16171d;
   --panel: #1d2026;
   --line:  #2c3038;
   --txt:   #e6e8eb;
@@ -12,7 +12,7 @@
 
 * { box-sizing: border-box; }
 
-html { background: #0c0d10; }
+html { background: #16171d; }
 
 body {
   margin: 0;
@@ -632,6 +632,7 @@ header {
   border-width: 2px;
   color: var(--sel);
   box-shadow: 0 0 14px rgba(255, 180, 84, 0.65), 0 0 28px rgba(255, 180, 84, 0.30);
+  transition: none; /* JS animation drives selected keys at 60fps — CSS transition causes flicker */
 }
 /* ── Encoder knob ────────────────────────────────────────────────────────── */
 .encoder-knob {
@@ -1276,4 +1277,63 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 50%; }
   border-color: var(--accent) !important;
   color: var(--accent) !important;
   animation: oled-flash 0.5s infinite alternate;
+}
+
+/* ── Key hover tooltip ───────────────────────────────────────────────────── */
+#key-tooltip {
+  position: fixed;
+  pointer-events: none;
+  z-index: 9000;
+  display: none;
+  flex-direction: column;
+  gap: 5px;
+  background: linear-gradient(160deg, #23262f 0%, #1a1d24 100%);
+  border: 1px solid rgba(255,255,255,0.09);
+  border-radius: 12px;
+  padding: 11px 15px;
+  min-width: 128px;
+  box-shadow:
+    0 14px 44px rgba(0,0,0,0.75),
+    0 3px 10px rgba(0,0,0,0.45),
+    inset 0 1px 0 rgba(255,255,255,0.06);
+}
+#key-tooltip.visible {
+  display: flex;
+  animation: pill-appear 0.12s ease-out;
+}
+.ktt-kc {
+  font-family: 'Courier New', monospace;
+  font-size: 17px;
+  font-weight: bold;
+  color: var(--txt);
+  letter-spacing: 0.03em;
+  line-height: 1.1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.ktt-icon { font-size: 20px; line-height: 1; }
+.ktt-empty { color: var(--muted); font-weight: normal; font-size: 14px; }
+.ktt-divider { height: 1px; background: rgba(255,255,255,0.07); margin: 2px 0; }
+.ktt-row { display: flex; align-items: center; gap: 8px; }
+.ktt-label {
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--muted);
+  min-width: 36px;
+  flex-shrink: 0;
+}
+.ktt-val {
+  font-size: 11px;
+  color: var(--txt);
+  font-family: 'Courier New', monospace;
+}
+.ktt-muted { color: var(--muted); }
+.ktt-swatch {
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  border: 1px solid rgba(255,255,255,0.22);
+  flex-shrink: 0;
 }

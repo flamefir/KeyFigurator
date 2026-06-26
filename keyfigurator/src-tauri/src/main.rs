@@ -103,10 +103,10 @@ fn main() {
 
     tauri::Builder::default()
         .setup(|app| {
-            // Match native window background to the app's dark theme (#0c0d10) so that
+            // Match native window background to the app's dark theme (#16171d) so that
             // resize events don't flash white before the WebView repaints.
             if let Some(win) = app.get_webview_window("main") {
-                let _ = win.set_background_color(Some(Color(12, 13, 16, 255)));
+                let _ = win.set_background_color(Some(Color(22, 23, 29, 255)));
             }
             Ok(())
         })

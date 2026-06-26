@@ -551,6 +551,73 @@ function oledAnimTick(now) {
   oledAnimFrame = requestAnimationFrame(oledAnimTick);
 }
 
+// ── Key hover tooltip ─────────────────────────────────────────────────────
+function buildTooltipHTML(idx) {
+  const kc    = keymap?.layers[0]?.keys[idx] ?? "KC_NO";
+  const kcDisp = (kc === "KC_NO" || kc === "KC_TRNS") ? null : kc.replace(/^KC_/, "");
+  const led   = keyLedColors[idx];
+  const hasLed = led && led !== "#000000";
+  const icon  = keyIconLabels[idx];
+  const anim  = (keyAnimStates[idx] ?? mkKeyAnim()).animation;
+  const layer = getSavedLayers().find(l => l.id === activeProfileId);
+
+  let html = `<div class="ktt-kc">`;
+  if (icon) html += `<span class="ktt-icon">${icon}</span>`;
+  html += kcDisp
+    ? `<span>${kcDisp}</span>`
+    : `<span class="ktt-empty">—</span>`;
+  html += `</div><div class="ktt-divider"></div>`;
+
+  if (hasLed) {
+    html += `<div class="ktt-row">
+      <span class="ktt-label">LED</span>
+      <span class="ktt-swatch" style="background:${led};box-shadow:0 0 6px ${led}66"></span>
+      <span class="ktt-val">${anim}</span>
+    </div>`;
+  }
+
+  if (layer) {
+    html += `<div class="ktt-row">
+      <span class="ktt-label">LAYER</span>
+      <span class="ktt-val">${layer.name}</span>
+    </div>`;
+  }
+
+  html += `<div class="ktt-row">
+    <span class="ktt-label">KEY</span>
+    <span class="ktt-val ktt-muted">#${idx}</span>
+  </div>`;
+
+  return html;
+}
+
+function showKeyTooltip(idx, el) {
+  if (isDragging || oledAssigningBack) return;
+  const tt = document.getElementById("key-tooltip");
+  if (!tt) return;
+
+  tt.innerHTML = buildTooltipHTML(idx);
+  tt.classList.add("visible");
+
+  const keyRect = el.getBoundingClientRect();
+  tt.style.left = "0";
+  tt.style.top  = "0";
+  const ttW = tt.offsetWidth;
+  const ttH = tt.offsetHeight;
+
+  let x = keyRect.left + keyRect.width / 2 - ttW / 2;
+  let y = keyRect.top - ttH - 8;
+  if (y < 8) y = keyRect.bottom + 8;
+  x = Math.max(8, Math.min(x, window.innerWidth - ttW - 8));
+
+  tt.style.left = x + "px";
+  tt.style.top  = y + "px";
+}
+
+function hideKeyTooltip() {
+  document.getElementById("key-tooltip")?.classList.remove("visible");
+}
+
 function hexToRgbTriple(hex) {
   const r = parseInt(hex.slice(1, 3), 16);
   const g = parseInt(hex.slice(3, 5), 16);
@@ -1218,6 +1285,7 @@ async function init() {
   });
 
   document.addEventListener("mouseup", () => { isDragging = false; });
+  window.addEventListener("blur", () => { isDragging = false; });
 
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
@@ -1428,9 +1496,9 @@ function renderBoard() {
       enc.id = "key-" + pos.idx;
       enc.className = "encoder-knob" + (isSel ? " sel" : "");
       enc.textContent = "◉";
-      enc.title = "Click to select encoder LED · ↻/↺ to rotate · OLED ↓ Press to enter screen sub-mode";
       enc.addEventListener("mousedown", (e) => { e.preventDefault(); onKeyDown(pos.idx); });
-      enc.addEventListener("mouseenter", () => onKeyEnter(pos.idx));
+      enc.addEventListener("mouseenter", (e) => { onKeyEnter(pos.idx); showKeyTooltip(pos.idx, e.currentTarget); });
+      enc.addEventListener("mouseleave", hideKeyTooltip);
       encWrap.appendChild(enc);
 
       const cwBtn = document.createElement("button");
@@ -1464,9 +1532,9 @@ function renderBoard() {
       k.style.cssText = `grid-row:${pos.row};grid-column:${pos.col}`;
       const icon = keyIconLabels[pos.idx];
       k.textContent = icon || (isEmpty ? "·" : kc.replace(/^KC_/, ""));
-      k.title = `Key ${pos.idx}: ${kc}${icon ? ` [${icon}]` : ""} · Click / drag to select · Selection opens LED settings`;
       k.addEventListener("mousedown", (e) => { e.preventDefault(); onKeyDown(pos.idx); });
-      k.addEventListener("mouseenter", () => onKeyEnter(pos.idx));
+      k.addEventListener("mouseenter", (e) => { onKeyEnter(pos.idx); showKeyTooltip(pos.idx, e.currentTarget); });
+      k.addEventListener("mouseleave", hideKeyTooltip);
       el.appendChild(k);
     }
   }
@@ -1500,6 +1568,7 @@ function onKeyDown(idx) {
     return;
   }
 
+  hideKeyTooltip();
   lastKeyClickTime = performance.now();
   keyClickTimes[idx] = performance.now();
   isDragging = true;
@@ -1515,6 +1584,7 @@ function onKeyDown(idx) {
 
 function onKeyEnter(idx) {
   if (!isDragging) return;
+  if (selectedKeys.has(idx)) return; // already selected — skip re-render to avoid cascade
   selectedKeys.add(idx);
   syncKeyLedPill();
   renderBoard();
