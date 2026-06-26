@@ -1075,6 +1075,10 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 50%; }
 .oled-action-btn:hover { border-color: var(--sel); color: var(--sel); }
 .oled-del-screen:hover { border-color: #c23b3b !important; color: #c23b3b !important; }
 
+.oled-back-row { gap: 8px; }
+.oled-back-val { color: var(--sel); font-family: monospace; font-size: 12px; min-width: 40px; }
+.oled-set-back.assigning { border-color: var(--accent); color: var(--accent); animation: oled-flash 0.6s infinite alternate; }
+
 /* ── OLED screen content types ───────────────────────────────────────────── */
 .oled-layer-screen {
   display: flex; flex-direction: column; align-items: center; justify-content: center;
@@ -1155,4 +1159,17 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 50%; }
   border-width: 2px;
   color: #7ee8ff !important;
   box-shadow: 0 0 14px rgba(126,232,255,0.65), 0 0 28px rgba(126,232,255,0.30) !important;
+}
+
+/* Assigned OLED back/escape key */
+.key.oled-back-key {
+  border-color: rgba(255,120,120,0.6) !important;
+  color: rgba(255,120,120,0.8) !important;
+}
+
+/* All keys flash to indicate "press any key to assign" */
+.key.oled-assigning {
+  border-color: var(--accent) !important;
+  color: var(--accent) !important;
+  animation: oled-flash 0.5s infinite alternate;
 }

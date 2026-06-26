@@ -67,6 +67,7 @@ let encoderMode   = "layer"; // "layer" | "scroll"
 // ── OLED state ────────────────────────────────────────────────────────────
 const OLED_CUSTOM_KEY     = "kf-oled-custom";
 const OLED_CD_KEY         = "kf-oled-cd";
+const OLED_BACK_KEY       = "kf-oled-back";
 // Max chars that fit on the 120px screen at each font size (Courier New, with 110px text area)
 const OLED_LAYER_NAME_MAX  = 16;   // 10px Courier ≈ 6px/char → ~18 fit; 16 is the enforced display limit
 const OLED_CUSTOM_TITLE_MAX = 14;  // 13px Courier ≈ 7.8px/char → ~14 fit
@@ -90,6 +91,9 @@ let oledCdDone       = false;
 
 let oledFlashKeys    = false;
 let oledFlashStart   = 0;
+
+let oledBackKeyIdx     = null;       // physical key index assigned as OLED back/escape; null = unassigned
+let oledAssigningBack  = false;      // true while waiting for the user to press a key to assign
 
 let oledCustomScreens = [];         // { id, type:"custom", title, imageDataUrl }
 let oledAnimFrame     = null;
@@ -465,6 +469,29 @@ function renderOledPillContent() {
     default:
       container.innerHTML = "";
   }
+
+  // ── Shared footer: back-key assignment ──────────────────────────────────
+  const footer = document.createElement("div");
+  footer.className = "oled-pill-section oled-back-row";
+  const backLabel = oledBackKeyIdx !== null ? `Key ${oledBackKeyIdx}` : "None";
+  const assignLabel = oledAssigningBack ? "Press a key…" : "Set";
+  footer.innerHTML = `
+    <span class="pill-label">BACK KEY</span>
+    <span class="oled-back-val">${backLabel}</span>
+    <button class="oled-action-btn oled-set-back" id="oled-set-back">${assignLabel}</button>
+    ${oledBackKeyIdx !== null ? `<button class="oled-action-btn oled-del-screen" id="oled-clear-back">Clear</button>` : ""}`;
+  container.appendChild(footer);
+
+  document.getElementById("oled-set-back")?.addEventListener("click", () => {
+    oledAssigningBack = !oledAssigningBack;
+    renderOledPillContent();
+  });
+  document.getElementById("oled-clear-back")?.addEventListener("click", () => {
+    oledBackKeyIdx = null;
+    oledAssigningBack = false;
+    localStorage.removeItem(OLED_BACK_KEY);
+    renderBoard(); renderOledPillContent();
+  });
 }
 
 function renderOledPill() {
@@ -1038,12 +1065,14 @@ async function init() {
   activeProfileId = bootLayer.id;
   await invoke("set_keymap", { map: keymap });
 
-  // Restore OLED custom screens + countdown settings
+  // Restore OLED custom screens + countdown settings + back key
   try { oledCustomScreens = JSON.parse(localStorage.getItem(OLED_CUSTOM_KEY) || "[]"); } catch {}
   try {
     const c = JSON.parse(localStorage.getItem(OLED_CD_KEY) || "{}");
     oledCdH = c.h ?? 0; oledCdM = c.m ?? 1; oledCdS = c.s ?? 0;
   } catch {}
+  const savedBack = localStorage.getItem(OLED_BACK_KEY);
+  if (savedBack !== null) oledBackKeyIdx = Number(savedBack);
 
   renderBoard();
   startUgAnimation();
@@ -1334,7 +1363,14 @@ function renderBoard() {
       k.id = "key-" + pos.idx;
       const isEmpty = kc === "KC_NO" || kc === "KC_TRNS";
       const isCycleActive = oledSubMode === "keycycle" && pos.idx === oledKeyCycleIdx;
-      k.className = "key" + (isSel ? " sel" : "") + (isEmpty ? " empty" : "") + (isCycleActive ? " oled-key-active" : "");
+      const isBackKey     = pos.idx === oledBackKeyIdx;
+      const isAssigning   = oledAssigningBack;
+      k.className = "key"
+        + (isSel ? " sel" : "")
+        + (isEmpty ? " empty" : "")
+        + (isCycleActive ? " oled-key-active" : "")
+        + (isBackKey && !isAssigning ? " oled-back-key" : "")
+        + (isAssigning ? " oled-assigning" : "");
       k.style.cssText = `grid-row:${pos.row};grid-column:${pos.col}`;
       k.textContent = isEmpty ? "·" : kc.replace(/^KC_/, "");
       k.title = `Key ${pos.idx}: ${kc} · Click / drag to select · Selection opens LED settings`;
@@ -1354,6 +1390,25 @@ function flashBoard() {
 }
 
 function onKeyDown(idx) {
+  // Back-key assignment mode — next press sets the key, no LED selection.
+  if (oledAssigningBack) {
+    oledBackKeyIdx = idx;
+    oledAssigningBack = false;
+    localStorage.setItem(OLED_BACK_KEY, String(idx));
+    renderBoard();
+    if (document.getElementById("oled-pill").classList.contains("visible")) renderOledPill();
+    return;
+  }
+
+  // Back key pressed while in OLED sub-mode — exit to nav without touching LED selection.
+  if (oledBackKeyIdx === idx && oledSubMode !== "nav") {
+    oledSubMode = "nav";
+    oledKeyCycleIdx = 0;
+    updateOledDisplay();
+    renderBoard();
+    return;
+  }
+
   lastKeyClickTime = performance.now();
   keyClickTimes[idx] = performance.now();
   isDragging = true;
