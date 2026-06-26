@@ -65,8 +65,11 @@ let ugPalette     = [];
 let encoderMode   = "layer"; // "layer" | "scroll"
 
 // ── OLED state ────────────────────────────────────────────────────────────
-const OLED_CUSTOM_KEY = "kf-oled-custom";
-const OLED_CD_KEY     = "kf-oled-cd";
+const OLED_CUSTOM_KEY     = "kf-oled-custom";
+const OLED_CD_KEY         = "kf-oled-cd";
+// Max chars that fit on the 120px screen at each font size (Courier New, with 110px text area)
+const OLED_LAYER_NAME_MAX  = 16;   // 10px Courier ≈ 6px/char → ~18 fit; 16 is the enforced display limit
+const OLED_CUSTOM_TITLE_MAX = 14;  // 13px Courier ≈ 7.8px/char → ~14 fit
 
 let oledScreenIdx    = 0;
 let oledSubMode      = "nav";       // "nav" | "keycycle"
@@ -172,7 +175,7 @@ function renderOledScreenContent(screenEl) {
         const layers = getSavedLayers();
         const layer  = layers.find(l => l.id === screen.layerId);
         const idx    = String(layers.indexOf(layer) + 1).padStart(2, "0");
-        const name   = (layer?.name || "").toUpperCase().slice(0, 12);
+        const name   = (layer?.name || "").toUpperCase().slice(0, OLED_LAYER_NAME_MAX);
         screenEl.innerHTML = `<div class="oled-layer-screen">
           <div class="oled-lyr-idx">LAYER ${idx}</div>
           <div class="oled-lyr-name">${name}</div>
@@ -215,7 +218,7 @@ function renderOledScreenContent(screenEl) {
       if (screen.imageDataUrl) {
         screenEl.innerHTML = `<img class="oled-custom-img" src="${screen.imageDataUrl}" alt="" />`;
       } else {
-        const txt = (screen.title || "").toUpperCase().slice(0, 16);
+        const txt = (screen.title || "").toUpperCase().slice(0, OLED_CUSTOM_TITLE_MAX);
         screenEl.innerHTML = `<div class="oled-custom-text">${txt || "—"}</div>`;
       }
       break;
@@ -368,10 +371,11 @@ function renderOledPillContent() {
         <div class="oled-pill-section">
           <span class="pill-label">TITLE</span>
           <input class="oled-title-inp" id="oled-title-inp" type="text"
-            value="${layer?.name || ""}" placeholder="Layer name…" maxlength="24" />
+            value="${layer?.name || ""}" placeholder="Layer name…" maxlength="${OLED_LAYER_NAME_MAX}" />
         </div>
         <div class="oled-pill-hint">
           Press ↓ to enter key cycle mode — rotate CW/CCW to step through keys, press again to exit.
+          First ${OLED_LAYER_NAME_MAX} chars shown on OLED.
         </div>`;
       document.getElementById("oled-title-inp")?.addEventListener("input", (e) => {
         if (layer) { renameSavedLayer(layer.id, e.target.value); updateOledDisplay(); }
@@ -422,7 +426,7 @@ function renderOledPillContent() {
         <div class="oled-pill-section">
           <span class="pill-label">TITLE</span>
           <input class="oled-title-inp" id="oled-custom-title" type="text"
-            value="${screen.title || ""}" placeholder="Screen title…" maxlength="16" />
+            value="${screen.title || ""}" placeholder="Screen title…" maxlength="${OLED_CUSTOM_TITLE_MAX}" />
         </div>
         <div class="oled-pill-section oled-img-row">
           <div class="oled-img-thumb">${imgPreview}</div>
