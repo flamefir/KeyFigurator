@@ -1130,11 +1130,18 @@ async function init() {
   startOledAnim();
 
   // ── Saved Layers ──────────────────────────────────────────────────────────
-  const slWrap     = document.getElementById("sl-wrap");
-  const slDropdown = document.getElementById("sl-dropdown");
-  const slPlus     = document.getElementById("sl-plus");
-  const slNewRow   = document.getElementById("sl-new-row");
-  const slNewInput = document.getElementById("sl-new-input");
+  const slWrap       = document.getElementById("sl-wrap");
+  const slDropdown   = document.getElementById("sl-dropdown");
+  const slPlus       = document.getElementById("sl-plus");
+  const slNewRow     = document.getElementById("sl-new-row");
+  const slNewInput   = document.getElementById("sl-new-input");
+  const slImportFile = document.getElementById("sl-import-file");
+
+  slImportFile?.addEventListener("change", (e) => {
+    const file = e.target.files?.[0];
+    if (file) importLayer(file);
+    e.target.value = "";
+  });
 
   function openDropdown() {
     slDropdown.style.display = "flex"; // inline style survives CSS hover loss during drag
@@ -1551,6 +1558,41 @@ function deleteSavedLayer(id) {
   renderBoard();
 }
 
+function exportLayer(layer) {
+  const data = JSON.stringify({ ...layer, exportedAt: new Date().toISOString() }, null, 2);
+  const blob = new Blob([data], { type: "application/json" });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement("a");
+  a.href     = url;
+  a.download = `${layer.name.replace(/\s+/g, "-").toLowerCase()}-config.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function importLayer(file) {
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    try {
+      const data = JSON.parse(e.target.result);
+      if (!data.keymap || !data.leds) throw new Error("Invalid layer file");
+      const id = Date.now().toString();
+      const layers = getSavedLayers();
+      layers.push({
+        id,
+        name: data.name || "Imported",
+        keymap: data.keymap,
+        leds:   data.leds,
+        icons:  data.icons || Array(21).fill(""),
+      });
+      localStorage.setItem(LAYERS_KEY, JSON.stringify(layers));
+      renderSavedLayers();
+    } catch (err) {
+      alert("Could not import: " + err.message);
+    }
+  };
+  reader.readAsText(file);
+}
+
 function reorderLayers(srcId, dstId) {
   const layers = getSavedLayers();
   const srcIdx = layers.findIndex(l => l.id === srcId);
@@ -1617,6 +1659,12 @@ function renderSavedLayers() {
     name.className = "sl-item-name";
     name.textContent = layer.name;
 
+    const exp = document.createElement("button");
+    exp.className = "sl-exp";
+    exp.textContent = "↓";
+    exp.title = "Export as JSON";
+    exp.addEventListener("click", (e) => { e.stopPropagation(); exportLayer(layer); });
+
     const del = document.createElement("button");
     del.className = "sl-del";
     del.textContent = "✕";
@@ -1625,6 +1673,7 @@ function renderSavedLayers() {
 
     item.appendChild(idx);
     item.appendChild(name);
+    item.appendChild(exp);
     item.appendChild(del);
 
     // Switch on click

@@ -243,6 +243,21 @@ header {
 }
 .sl-del:hover { color: #c23b3b; }
 
+.sl-exp {
+  background: none; border: none; color: var(--muted);
+  padding: 2px 5px; cursor: pointer; font-size: 12px;
+  border-radius: 4px; flex-shrink: 0; line-height: 1;
+}
+.sl-exp:hover { color: var(--sel); }
+
+.sl-import-btn {
+  background: none; border: 1px solid var(--line);
+  color: var(--muted); padding: 3px 8px; cursor: pointer;
+  font-size: 13px; border-radius: 6px; flex-shrink: 0;
+  display: flex; align-items: center;
+}
+.sl-import-btn:hover { border-color: var(--sel); color: var(--sel); }
+
 /* ── Board wrapper ───────────────────────────────────────────────────────── */
 .board-wrap {
   position: relative;   /* pill positions against this */
