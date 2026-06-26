@@ -12,15 +12,18 @@
 
 * { box-sizing: border-box; }
 
+html { background: #0c0d10; }
+
 body {
   margin: 0;
   min-height: 100vh;
   display: flex;
   flex-direction: column;
   align-items: center;
-  justify-content: center;
+  justify-content: flex-start;
   gap: 10px;
-  padding: calc(var(--titlebar-h) + 16px) 20px 20px;
+  padding: calc(var(--titlebar-h) + 60px) 20px 40px;
+  overflow-y: auto;
   background: var(--bg);
   color: var(--txt);
   font: 14px/1.5 system-ui, sans-serif;
@@ -301,6 +304,48 @@ header {
   display: flex;
   animation: pill-appear 0.22s ease-out;
 }
+
+.key-pills {
+  position: absolute;
+  top: calc(100% + 12px);
+  left: 0; right: 0;
+  display: none;
+  flex-direction: column;
+  gap: 8px;
+  z-index: 10;
+}
+.key-pills.visible { display: flex; animation: pill-appear 0.22s ease-out; }
+
+.key-led-pill,
+.keycode-pill {
+  background: #1a1c22;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.oled-pill {
+  position: absolute;
+  top: calc(100% + 12px);
+  left: 0; right: 0;
+  display: none;
+  flex-direction: column;
+  background: #1a1c22;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  overflow: hidden;
+  z-index: 10;
+}
+.oled-pill.visible { display: flex; animation: pill-appear 0.22s ease-out; }
+
+.kl-count {
+  font-size: 11px;
+  color: var(--muted);
+  letter-spacing: 0.04em;
+  flex-shrink: 0;
+}
 .ug-main-row {
   display: flex;
   align-items: center;
@@ -342,6 +387,82 @@ header {
   border-top: 1px solid var(--line);
 }
 .ug-advanced.open { display: flex; }
+
+/* ── Color palette row ───────────────────────────────────────────────────── */
+.palette-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  padding-top: 4px;
+  border-top: 1px solid var(--line);
+}
+.palette-add {
+  width: 36px; height: 24px;
+  border: 2px solid var(--accent);
+  border-radius: 5px;
+  background: #000;
+  cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--accent);
+  font-size: 17px; line-height: 1; font-weight: 400;
+  flex-shrink: 0;
+  transition: background 0.15s;
+}
+.palette-add:hover { background: rgba(255,110,20,0.12); }
+.palette-add.at-max { opacity: 0.35; pointer-events: none; }
+.palette-swatch {
+  width: 36px; height: 24px;
+  border-radius: 5px;
+  border: 2px solid rgba(255,255,255,0.1);
+  cursor: pointer;
+  position: relative;
+  flex-shrink: 0;
+  transition: border-color 0.15s;
+}
+.palette-swatch:hover { border-color: rgba(255,255,255,0.55); }
+.ps-del {
+  position: absolute;
+  top: -7px; right: -7px;
+  width: 14px; height: 14px;
+  background: #2a2d35;
+  border: 1px solid #555;
+  border-radius: 50%;
+  font-size: 10px; line-height: 13px;
+  text-align: center;
+  color: #ccc;
+  display: none;
+  cursor: pointer;
+  z-index: 2;
+  user-select: none;
+}
+.palette-swatch:hover .ps-del { display: block; }
+.palette-row.disabled { opacity: 0.35; pointer-events: none; transition: opacity 0.2s; }
+
+/* ── Encoder rotation settings ───────────────────────────────────────────── */
+.encoder-section {
+  display: none;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 4px;
+  border-top: 1px solid var(--line);
+}
+.encoder-section.visible { display: flex; }
+.enc-opts { display: flex; gap: 6px; flex-wrap: wrap; }
+.enc-opt {
+  padding: 6px 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-weight: 700;
+  transition: border-color 0.15s, color 0.15s;
+}
+.enc-opt:hover { border-color: rgba(255,255,255,0.3); color: var(--text); }
+.enc-opt.active { border-color: var(--accent); color: var(--accent); }
 
 .ug-anims { display: flex; gap: 8px; flex-wrap: wrap; }
 
@@ -483,8 +604,6 @@ header {
   color: var(--sel);
   box-shadow: 0 0 14px rgba(255, 180, 84, 0.65), 0 0 28px rgba(255, 180, 84, 0.30);
 }
-.key.empty { opacity: 0.35; }
-
 /* ── Encoder knob ────────────────────────────────────────────────────────── */
 .encoder-knob {
   width: 100%;
@@ -516,12 +635,12 @@ header {
   display: flex;
   align-items: center;
   justify-content: center;
-  pointer-events: none;
   user-select: none;
 }
+.oled-screen { cursor: pointer; }
 .oled-screen {
-  width: 100px;
-  height: 100px;
+  width: 120px;
+  height: 120px;
   background: radial-gradient(ellipse at center, #08090e 55%, #04060a 100%);
   border-radius: 4px;
   border: 1px solid #1e222c;
@@ -536,7 +655,7 @@ header {
 .oled-layer {
   color: #ffb454;
   font-family: 'Courier New', monospace;
-  font-size: 18px;
+  font-size: 22px;
   font-weight: bold;
   letter-spacing: 0.05em;
   white-space: nowrap;
@@ -757,4 +876,283 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 50%; }
   50% {
     box-shadow: 0 0 18px rgba(255,122,30,.75), 0 0 38px rgba(255,122,30,.45), 0 0 60px rgba(255,122,30,.20);
   }
+}
+
+/* ── Encoder CW/CCW rotate buttons ───────────────────────────────────────── */
+.encoder-wrap {
+  position: relative;
+  display: grid;
+  place-items: center;
+}
+.encoder-wrap .encoder-knob { width: 100%; height: 100%; }
+
+.enc-rotate-btn {
+  position: absolute;
+  width: 20px; height: 20px;
+  border-radius: 50%;
+  background: rgba(20,22,28,0.92);
+  border: 1px solid rgba(255,255,255,0.18);
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 13px;
+  display: flex; align-items: center; justify-content: center;
+  z-index: 5;
+  padding: 0;
+  line-height: 1;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+.enc-rotate-btn:hover {
+  background: rgba(255,180,84,0.18);
+  color: var(--sel);
+  border-color: var(--sel);
+}
+.enc-cw  { bottom: -5px; right:  -6px; }
+.enc-ccw { bottom: -5px; left:   -6px; }
+
+/* ── OLED pill ───────────────────────────────────────────────────────────── */
+.oled-pill-nav {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 16px;
+}
+.oled-nav-btn {
+  width: 26px; height: 26px;
+  background: none;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 16px;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+  transition: border-color 0.12s, color 0.12s;
+  padding: 0;
+}
+.oled-nav-btn:hover { border-color: var(--sel); color: var(--sel); }
+
+.oled-screen-name-wrap {
+  flex: 1;
+  text-align: center;
+  font-size: 11px;
+  color: var(--txt);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.oled-enc-press {
+  background: none;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  padding: 4px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
+  transition: border-color 0.12s, color 0.12s;
+}
+.oled-enc-press:hover { border-color: var(--sel); color: var(--sel); }
+
+.oled-add-screen {
+  background: none;
+  border: 1px solid var(--amber);
+  border-radius: 8px;
+  color: var(--sel);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  padding: 4px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
+  transition: background 0.12s;
+}
+.oled-add-screen:hover { background: rgba(255,122,30,0.12); }
+
+.oled-pill-content {
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--line);
+}
+.oled-pill-section {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--line);
+}
+.oled-pill-hint {
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.5;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--line);
+}
+.oled-title-inp {
+  flex: 1;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  color: var(--txt);
+  padding: 5px 9px;
+  border-radius: 8px;
+  font-size: 12px;
+  font-family: 'Courier New', monospace;
+  min-width: 0;
+}
+.oled-title-inp:focus { outline: none; border-color: var(--muted); }
+
+/* Countdown H/M/S inputs */
+.oled-cd-setrow { justify-content: center; gap: 6px; }
+.oled-cd-field-lbl {
+  display: flex; flex-direction: column; align-items: center; gap: 3px;
+  font-size: 9px; letter-spacing: 0.1em; color: var(--muted); text-transform: uppercase;
+}
+.oled-cd-num {
+  width: 52px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  color: var(--txt);
+  padding: 4px;
+  border-radius: 6px;
+  font-size: 18px;
+  font-family: 'Courier New', monospace;
+  text-align: center;
+  -moz-appearance: textfield;
+}
+.oled-cd-num::-webkit-inner-spin-button,
+.oled-cd-num::-webkit-outer-spin-button { -webkit-appearance: none; }
+.oled-cd-sep { font-size: 20px; color: var(--muted); margin-top: 12px; }
+
+/* Image upload area */
+.oled-img-row { flex-wrap: wrap; gap: 8px; align-items: center; }
+.oled-img-thumb {
+  width: 56px; height: 56px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #000;
+  display: flex; align-items: center; justify-content: center;
+  overflow: hidden; flex-shrink: 0;
+}
+.oled-img-thumb img, .oled-img-preview { max-width: 100%; max-height: 100%; object-fit: contain; }
+.oled-img-placeholder { font-size: 9px; color: var(--muted); }
+.oled-upload-btn {
+  background: none;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--muted);
+  font-size: 11px;
+  padding: 6px 12px;
+  cursor: pointer;
+  transition: border-color 0.12s, color 0.12s;
+}
+.oled-upload-btn:hover { border-color: var(--sel); color: var(--sel); }
+.oled-img-clear {
+  background: none;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  color: var(--muted);
+  width: 24px; height: 24px;
+  cursor: pointer; font-size: 11px; flex-shrink: 0;
+}
+.oled-img-clear:hover { border-color: #c23b3b; color: #c23b3b; }
+
+.oled-action-btn {
+  background: none;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 5px 14px;
+  cursor: pointer;
+  transition: border-color 0.12s, color 0.12s;
+}
+.oled-action-btn:hover { border-color: var(--sel); color: var(--sel); }
+.oled-del-screen:hover { border-color: #c23b3b !important; color: #c23b3b !important; }
+
+/* ── OLED screen content types ───────────────────────────────────────────── */
+.oled-layer-screen {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 5px; width: 100%; height: 100%;
+}
+.oled-lyr-idx {
+  color: #ffb454;
+  font-family: 'Courier New', monospace;
+  font-size: 15px; font-weight: bold; letter-spacing: 0.04em;
+  text-shadow: 0 0 6px rgba(255,180,84,.9), 0 0 16px rgba(255,180,84,.5);
+}
+.oled-lyr-name {
+  color: #ffb454;
+  font-family: 'Courier New', monospace;
+  font-size: 10px; letter-spacing: 0.05em;
+  text-shadow: 0 0 5px rgba(255,180,84,.7);
+  max-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: center;
+}
+
+.oled-keycycle {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 5px; width: 100%; height: 100%;
+}
+.oled-kc-num {
+  color: rgba(255,180,84,0.45);
+  font-family: 'Courier New', monospace; font-size: 11px;
+}
+.oled-kc-val {
+  color: #ffb454;
+  font-family: 'Courier New', monospace; font-size: 18px; font-weight: bold;
+  text-shadow: 0 0 6px rgba(255,180,84,.9);
+  max-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: center;
+}
+
+.oled-timer-screen, .oled-countdown-screen {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 4px; width: 100%; height: 100%;
+}
+.oled-screen-lbl {
+  color: rgba(255,180,84,0.45);
+  font-family: 'Courier New', monospace; font-size: 9px; letter-spacing: 0.15em;
+}
+.oled-time-val {
+  color: #ffb454;
+  font-family: 'Courier New', monospace; font-size: 18px; font-weight: bold;
+  text-shadow: 0 0 6px rgba(255,180,84,.9), 0 0 16px rgba(255,180,84,.5);
+  letter-spacing: 0.04em;
+}
+.oled-screen-hint {
+  color: rgba(255,180,84,0.30);
+  font-family: 'Courier New', monospace; font-size: 8px; letter-spacing: 0.05em;
+  text-align: center; max-width: 110px;
+}
+.oled-cd-sel {
+  color: #ffffff;
+  text-shadow: 0 0 8px rgba(255,255,255,0.85);
+  text-decoration: underline;
+}
+
+@keyframes oled-flash { 0%,100% { opacity:1 } 50% { opacity:0.1 } }
+.oled-cd-flash { animation: oled-flash 0.45s ease-in-out infinite; }
+
+.oled-custom-img {
+  width: 120px; height: 120px;
+  object-fit: contain;
+  image-rendering: pixelated;
+}
+.oled-custom-text {
+  color: #ffb454;
+  font-family: 'Courier New', monospace; font-size: 13px; font-weight: bold;
+  text-shadow: 0 0 6px rgba(255,180,84,.9);
+  text-align: center; padding: 6px; word-break: break-all;
+}
+
+/* Key highlighted in OLED key-cycle mode */
+.key.oled-key-active {
+  border-color: #7ee8ff !important;
+  border-width: 2px;
+  color: #7ee8ff !important;
+  box-shadow: 0 0 14px rgba(126,232,255,0.65), 0 0 28px rgba(126,232,255,0.30) !important;
 }

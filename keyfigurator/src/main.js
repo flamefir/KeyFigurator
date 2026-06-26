@@ -37,7 +37,7 @@ const BOARD_POSITIONS = [
 
 let keymap = null;
 let selectedKeys = new Set();
-let keyLedColors = Array.from({ length: 21 }, () => "");
+let keyLedColors = Array.from({ length: 21 }, () => "#000000");
 let isDragging = false;
 let activeProfileId = null;
 let dragSrcId = null;
@@ -45,11 +45,52 @@ let dragSrcId = null;
 const UG_KEY          = "kf-underglow";
 const UG_CORNERS_KEY  = "kf-ug-corners";
 const UG_ADVANCED_KEY = "kf-ug-adv";
+const KL_ADVANCED_KEY = "kf-kl-adv";
+const KL_PALETTE_KEY  = "kf-kl-palette";
+const UG_PALETTE_KEY  = "kf-ug-palette";
+const ENC_KEY         = "kf-encoder";
+const ENCODER_IDX     = 20;
 
 let cornerColors  = ["#ff6e14", "#ff6e14", "#ff6e14", "#ff6e14"];
 let ugAnimation   = "breathe";
 let ugRate        = 128;
 let ugIntensity   = 180;
+
+let klAnimation   = "solid";
+let klRate        = 128;
+let klIntensity   = 180;
+
+let klPalette     = [];
+let ugPalette     = [];
+let encoderMode   = "layer"; // "layer" | "scroll"
+
+// ── OLED state ────────────────────────────────────────────────────────────
+const OLED_CUSTOM_KEY = "kf-oled-custom";
+const OLED_CD_KEY     = "kf-oled-cd";
+
+let oledScreenIdx    = 0;
+let oledSubMode      = "nav";       // "nav" | "keycycle"
+let oledKeyCycleIdx  = 0;
+
+let oledTimerRunning = false;
+let oledTimerStart   = 0;
+let oledTimerAcc     = 0;           // seconds accumulated before current start
+
+let oledCdH          = 0;
+let oledCdM          = 1;
+let oledCdS          = 0;
+let oledCdField      = "minutes";   // "hours" | "minutes" | "seconds"
+let oledCdRunning    = false;
+let oledCdStart      = 0;
+let oledCdAcc        = 0;
+let oledCdDone       = false;
+
+let oledFlashKeys    = false;
+let oledFlashStart   = 0;
+
+let oledCustomScreens = [];         // { id, type:"custom", title, imageDataUrl }
+let oledAnimFrame     = null;
+let oledLastTick      = 0;
 
 const ANIMATIONS = [
   { id: "solid",    label: "Solid"    },
@@ -59,6 +100,404 @@ const ANIMATIONS = [
   { id: "reactive", label: "Reactive" },
   { id: "sparkle",  label: "Sparkle"  },
 ];
+
+// ── OLED helpers ──────────────────────────────────────────────────────────
+function getOledScreens() {
+  return [
+    ...getSavedLayers().map(l => ({ type: "layer", layerId: l.id })),
+    { type: "timer" },
+    { type: "countdown" },
+    ...oledCustomScreens,
+  ];
+}
+
+function formatTime(secs) {
+  secs = Math.max(0, secs);
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  const s = Math.floor(secs % 60);
+  return h > 0
+    ? `${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}`
+    : `${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}`;
+}
+
+function getTimerElapsed() {
+  return oledTimerAcc + (oledTimerRunning ? (performance.now() - oledTimerStart) / 1000 : 0);
+}
+
+function getCdRemaining() {
+  const total = oledCdH * 3600 + oledCdM * 60 + oledCdS;
+  const elapsed = oledCdAcc + (oledCdRunning ? (performance.now() - oledCdStart) / 1000 : 0);
+  return Math.max(0, total - elapsed);
+}
+
+function saveOledCustomScreens() {
+  localStorage.setItem(OLED_CUSTOM_KEY, JSON.stringify(oledCustomScreens));
+}
+
+function readFileAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload  = e => resolve(e.target.result);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+function checkImageSize(dataUrl) {
+  return new Promise(resolve => {
+    const img = new Image();
+    img.onload  = () => resolve(img.width <= 128 && img.height <= 128);
+    img.onerror = () => resolve(false);
+    img.src = dataUrl;
+  });
+}
+
+function renderOledScreenContent(screenEl) {
+  const screens = getOledScreens();
+  if (!screens.length) { screenEl.innerHTML = ""; return; }
+  if (oledScreenIdx >= screens.length) oledScreenIdx = screens.length - 1;
+  const screen = screens[oledScreenIdx];
+
+  switch (screen.type) {
+    case "layer": {
+      if (oledSubMode === "keycycle") {
+        const kc   = keymap?.layers[0]?.keys[oledKeyCycleIdx] ?? "KC_NO";
+        const disp = kc.replace(/^KC_/, "");
+        screenEl.innerHTML = `<div class="oled-keycycle">
+          <div class="oled-kc-num">${String(oledKeyCycleIdx + 1).padStart(2,"0")}</div>
+          <div class="oled-kc-val">${disp}</div>
+        </div>`;
+      } else {
+        const layers = getSavedLayers();
+        const layer  = layers.find(l => l.id === screen.layerId);
+        const idx    = String(layers.indexOf(layer) + 1).padStart(2, "0");
+        const name   = (layer?.name || "").toUpperCase().slice(0, 12);
+        screenEl.innerHTML = `<div class="oled-layer-screen">
+          <div class="oled-lyr-idx">LAYER ${idx}</div>
+          <div class="oled-lyr-name">${name}</div>
+        </div>`;
+      }
+      break;
+    }
+    case "timer": {
+      const elapsed = getTimerElapsed();
+      screenEl.innerHTML = `<div class="oled-timer-screen">
+        <div class="oled-screen-lbl">TIMER</div>
+        <div class="oled-time-val">${formatTime(elapsed)}</div>
+        <div class="oled-screen-hint">${oledTimerRunning ? "↓ stop" : "↓ start"}</div>
+      </div>`;
+      break;
+    }
+    case "countdown": {
+      if (oledCdDone) {
+        screenEl.innerHTML = `<div class="oled-countdown-screen">
+          <div class="oled-screen-lbl">COUNTDOWN</div>
+          <div class="oled-time-val oled-cd-flash">00:00</div>
+          <div class="oled-screen-hint">↓ reset</div>
+        </div>`;
+      } else {
+        const sel = f => oledCdField === f && !oledCdRunning ? "oled-cd-sel" : "";
+        const timeDisplay = oledCdRunning
+          ? formatTime(getCdRemaining())
+          : `<span class="${sel("hours")}">${String(oledCdH).padStart(2,"0")}</span>`
+            + `:<span class="${sel("minutes")}">${String(oledCdM).padStart(2,"0")}</span>`
+            + `:<span class="${sel("seconds")}">${String(oledCdS).padStart(2,"0")}</span>`;
+        screenEl.innerHTML = `<div class="oled-countdown-screen">
+          <div class="oled-screen-lbl">COUNTDOWN</div>
+          <div class="oled-time-val">${timeDisplay}</div>
+          <div class="oled-screen-hint">${oledCdRunning ? "↓ stop" : "↓ cycle field · rotate to set"}</div>
+        </div>`;
+      }
+      break;
+    }
+    case "custom": {
+      if (screen.imageDataUrl) {
+        screenEl.innerHTML = `<img class="oled-custom-img" src="${screen.imageDataUrl}" alt="" />`;
+      } else {
+        const txt = (screen.title || "").toUpperCase().slice(0, 16);
+        screenEl.innerHTML = `<div class="oled-custom-text">${txt || "—"}</div>`;
+      }
+      break;
+    }
+  }
+}
+
+function updateOledDisplay() {
+  const screenEl = document.querySelector(".oled-screen");
+  if (screenEl) renderOledScreenContent(screenEl);
+  if (document.getElementById("oled-pill").classList.contains("visible")) {
+    renderOledPillNav();
+    renderOledPillContent();
+  }
+}
+
+function oledScreenNav(dir) {
+  if (oledCdDone) { oledCdDone = false; oledFlashKeys = false; oledCdAcc = 0; }
+  oledSubMode = "nav";
+  const screens = getOledScreens();
+  oledScreenIdx = (oledScreenIdx + dir + screens.length) % screens.length;
+  updateOledDisplay();
+}
+
+function onEncoderCW() {
+  const screens = getOledScreens();
+  const screen  = screens[oledScreenIdx];
+  if (oledSubMode === "keycycle") {
+    oledKeyCycleIdx = (oledKeyCycleIdx + 1) % 21;
+    updateOledDisplay(); renderBoard(); return;
+  }
+  if (screen?.type === "countdown" && !oledCdRunning && !oledCdDone) {
+    adjustCdField(1); return;
+  }
+  oledScreenNav(1);
+}
+
+function onEncoderCCW() {
+  const screens = getOledScreens();
+  const screen  = screens[oledScreenIdx];
+  if (oledSubMode === "keycycle") {
+    oledKeyCycleIdx = (oledKeyCycleIdx + 20) % 21;
+    updateOledDisplay(); renderBoard(); return;
+  }
+  if (screen?.type === "countdown" && !oledCdRunning && !oledCdDone) {
+    adjustCdField(-1); return;
+  }
+  oledScreenNav(-1);
+}
+
+function onEncoderPress() {
+  const screens = getOledScreens();
+  const screen  = screens[oledScreenIdx];
+
+  if (screen?.type === "layer") {
+    if (oledSubMode === "keycycle") {
+      oledSubMode = "nav"; oledKeyCycleIdx = 0;
+    } else {
+      oledSubMode = "keycycle"; oledKeyCycleIdx = 0;
+    }
+    updateOledDisplay(); renderBoard(); return;
+  }
+
+  if (screen?.type === "timer") {
+    if (oledTimerRunning) {
+      oledTimerAcc     = getTimerElapsed();
+      oledTimerRunning = false;
+    } else {
+      oledTimerStart   = performance.now();
+      oledTimerRunning = true;
+    }
+    updateOledDisplay(); return;
+  }
+
+  if (screen?.type === "countdown") {
+    if (oledCdDone) {
+      oledCdDone = false; oledCdRunning = false;
+      oledCdAcc  = 0;    oledFlashKeys = false;
+      updateOledDisplay(); renderBoard(); return;
+    }
+    if (oledCdRunning) {
+      oledCdAcc    += (performance.now() - oledCdStart) / 1000;
+      oledCdRunning = false;
+    } else {
+      const fields  = ["hours", "minutes", "seconds"];
+      const fi      = fields.indexOf(oledCdField);
+      if (fi < fields.length - 1) {
+        oledCdField = fields[fi + 1];
+      } else {
+        oledCdField   = "hours";
+        oledCdStart   = performance.now();
+        oledCdAcc     = 0;
+        oledCdRunning = true;
+        localStorage.setItem(OLED_CD_KEY, JSON.stringify({ h: oledCdH, m: oledCdM, s: oledCdS }));
+      }
+    }
+    updateOledDisplay(); return;
+  }
+}
+
+function adjustCdField(delta) {
+  switch (oledCdField) {
+    case "hours":   oledCdH = Math.max(0, Math.min(23, oledCdH + delta)); break;
+    case "minutes": oledCdM = Math.max(0, Math.min(59, oledCdM + delta)); break;
+    case "seconds": oledCdS = Math.max(0, Math.min(59, oledCdS + delta)); break;
+  }
+  updateOledDisplay();
+}
+
+function renderOledPillNav() {
+  const screens = getOledScreens();
+  const screen  = screens[oledScreenIdx] ?? {};
+  let name = "";
+  switch (screen.type) {
+    case "layer": {
+      const layer = getSavedLayers().find(l => l.id === screen.layerId);
+      const idx   = getSavedLayers().indexOf(layer) + 1;
+      name = `Layer ${String(idx).padStart(2,"0")}${oledSubMode === "keycycle" ? " — Key Cycle" : ""}`;
+      break;
+    }
+    case "timer":     name = "Timer";     break;
+    case "countdown": name = "Countdown"; break;
+    case "custom":    name = screen.title || "Custom Screen"; break;
+  }
+  const nameEl = document.getElementById("oled-screen-name");
+  if (nameEl) nameEl.textContent = `${oledScreenIdx + 1} / ${screens.length} — ${name}`;
+
+  const pressBtn = document.getElementById("oled-enc-press");
+  if (!pressBtn) return;
+  const labels = {
+    layer:     oledSubMode === "keycycle" ? "↓ Exit Cycle" : "↓ Key Cycle",
+    timer:     oledTimerRunning ? "↓ Stop" : "↓ Start",
+    countdown: oledCdDone ? "↓ Reset" : (oledCdRunning ? "↓ Stop" : "↓ Next Field / Start"),
+    custom:    "",
+  };
+  pressBtn.textContent = labels[screen.type] ?? "↓ Press";
+  pressBtn.style.display = screen.type === "custom" ? "none" : "";
+}
+
+function renderOledPillContent() {
+  const container = document.getElementById("oled-pill-content");
+  if (!container) return;
+  const screens = getOledScreens();
+  const screen  = screens[oledScreenIdx] ?? {};
+
+  switch (screen.type) {
+    case "layer": {
+      const layer = getSavedLayers().find(l => l.id === screen.layerId);
+      container.innerHTML = `
+        <div class="oled-pill-section">
+          <span class="pill-label">TITLE</span>
+          <input class="oled-title-inp" id="oled-title-inp" type="text"
+            value="${layer?.name || ""}" placeholder="Layer name…" maxlength="24" />
+        </div>
+        <div class="oled-pill-hint">
+          Press ↓ to enter key cycle mode — rotate CW/CCW to step through keys, press again to exit.
+        </div>`;
+      document.getElementById("oled-title-inp")?.addEventListener("input", (e) => {
+        if (layer) { renameSavedLayer(layer.id, e.target.value); updateOledDisplay(); }
+      });
+      break;
+    }
+    case "timer": {
+      container.innerHTML = `
+        <div class="oled-pill-section oled-pill-hint">
+          Press encoder ↓ to start / stop. Resets when you navigate away.
+        </div>
+        <div class="oled-pill-section">
+          <button class="oled-action-btn" id="oled-timer-reset">Reset Timer</button>
+        </div>`;
+      document.getElementById("oled-timer-reset")?.addEventListener("click", () => {
+        oledTimerRunning = false; oledTimerAcc = 0; updateOledDisplay();
+      });
+      break;
+    }
+    case "countdown": {
+      container.innerHTML = `
+        <div class="oled-pill-section oled-cd-setrow">
+          <label class="oled-cd-field-lbl">H
+            <input class="oled-cd-num" id="oled-cd-h" type="number" min="0" max="23" value="${oledCdH}" />
+          </label>
+          <span class="oled-cd-sep">:</span>
+          <label class="oled-cd-field-lbl">M
+            <input class="oled-cd-num" id="oled-cd-m" type="number" min="0" max="59" value="${oledCdM}" />
+          </label>
+          <span class="oled-cd-sep">:</span>
+          <label class="oled-cd-field-lbl">S
+            <input class="oled-cd-num" id="oled-cd-s" type="number" min="0" max="59" value="${oledCdS}" />
+          </label>
+        </div>
+        <div class="oled-pill-hint">
+          Rotate encoder to adjust selected field (underlined) · Press ↓ to cycle field, then start.
+        </div>`;
+      document.getElementById("oled-cd-h")?.addEventListener("input", (e) => { oledCdH = Math.max(0, Math.min(23, +e.target.value||0)); updateOledDisplay(); });
+      document.getElementById("oled-cd-m")?.addEventListener("input", (e) => { oledCdM = Math.max(0, Math.min(59, +e.target.value||0)); updateOledDisplay(); });
+      document.getElementById("oled-cd-s")?.addEventListener("input", (e) => { oledCdS = Math.max(0, Math.min(59, +e.target.value||0)); updateOledDisplay(); });
+      break;
+    }
+    case "custom": {
+      const imgPreview = screen.imageDataUrl
+        ? `<img class="oled-img-preview" src="${screen.imageDataUrl}" />`
+        : `<div class="oled-img-placeholder">No image</div>`;
+      container.innerHTML = `
+        <div class="oled-pill-section">
+          <span class="pill-label">TITLE</span>
+          <input class="oled-title-inp" id="oled-custom-title" type="text"
+            value="${screen.title || ""}" placeholder="Screen title…" maxlength="16" />
+        </div>
+        <div class="oled-pill-section oled-img-row">
+          <div class="oled-img-thumb">${imgPreview}</div>
+          <label class="oled-upload-btn">Upload Image / GIF
+            <input type="file" id="oled-img-upload" accept="image/*" style="display:none" />
+          </label>
+          ${screen.imageDataUrl ? `<button class="oled-img-clear" id="oled-img-clear">✕</button>` : ""}
+        </div>
+        <div class="oled-pill-hint">Max 128×128 px — larger images will be rejected.</div>
+        <div class="oled-pill-section">
+          <button class="oled-action-btn oled-del-screen" id="oled-del-screen">Delete Screen</button>
+        </div>`;
+      document.getElementById("oled-custom-title")?.addEventListener("input", (e) => {
+        screen.title = e.target.value; saveOledCustomScreens(); updateOledDisplay();
+      });
+      document.getElementById("oled-img-upload")?.addEventListener("change", async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        const url = await readFileAsDataUrl(file);
+        const ok  = await checkImageSize(url);
+        if (!ok) { alert("Image must be 128×128 pixels or smaller."); return; }
+        screen.imageDataUrl = url;
+        saveOledCustomScreens(); renderOledPillContent(); updateOledDisplay();
+      });
+      document.getElementById("oled-img-clear")?.addEventListener("click", () => {
+        screen.imageDataUrl = null; saveOledCustomScreens(); renderOledPillContent(); updateOledDisplay();
+      });
+      document.getElementById("oled-del-screen")?.addEventListener("click", () => {
+        oledCustomScreens = oledCustomScreens.filter(s => s.id !== screen.id);
+        saveOledCustomScreens();
+        oledScreenIdx = Math.max(0, oledScreenIdx - 1);
+        updateOledDisplay(); renderOledPillNav(); renderOledPillContent();
+      });
+      break;
+    }
+    default:
+      container.innerHTML = "";
+  }
+}
+
+function renderOledPill() {
+  renderOledPillNav();
+  renderOledPillContent();
+}
+
+function startOledAnim() {
+  if (oledAnimFrame) cancelAnimationFrame(oledAnimFrame);
+  oledAnimFrame = requestAnimationFrame(oledAnimTick);
+}
+
+function oledAnimTick(now) {
+  // Countdown completion
+  if (oledCdRunning && getCdRemaining() <= 0) {
+    oledCdRunning = false; oledCdDone = true;
+    oledFlashKeys = true;  oledFlashStart = performance.now();
+    updateOledDisplay(); flashBoard();
+  }
+
+  // Throttle live updates to ~4fps (timers only update per-second anyway)
+  const screens = getOledScreens();
+  const s       = screens[oledScreenIdx];
+  const live    = (s?.type === "timer" && oledTimerRunning)
+               || (s?.type === "countdown" && oledCdRunning);
+  if (live && now - oledLastTick > 250) {
+    oledLastTick = now;
+    const screenEl = document.querySelector(".oled-screen");
+    if (screenEl) renderOledScreenContent(screenEl);
+    if (document.getElementById("oled-pill").classList.contains("visible")
+        && (s.type === "timer" || s.type === "countdown")) {
+      renderOledPillContent();
+    }
+  }
+
+  oledAnimFrame = requestAnimationFrame(oledAnimTick);
+}
 
 function hexToRgbTriple(hex) {
   const r = parseInt(hex.slice(1, 3), 16);
@@ -102,6 +541,12 @@ function saveAdvancedState() {
   }));
 }
 
+function saveKlAdvancedState() {
+  localStorage.setItem(KL_ADVANCED_KEY, JSON.stringify({
+    animation: klAnimation, rate: klRate, intensity: klIntensity,
+  }));
+}
+
 function renderAnimChips() {
   const container = document.getElementById("ug-anims");
   if (!container) return;
@@ -113,14 +558,115 @@ function renderAnimChips() {
     preview.className = `ug-anim-preview ${anim.id}`;
     chip.appendChild(preview);
     chip.appendChild(document.createTextNode(anim.label));
-    chip.addEventListener("click", () => {
+    chip.addEventListener("click", (e) => {
+      e.stopPropagation();
       ugAnimation = anim.id;
-      ugAnimStart = 0; // restart cycle from t=0 for the new animation
+      ugAnimStart = 0;
       saveAdvancedState();
       renderAnimChips();
     });
     container.appendChild(chip);
   }
+}
+
+function updatePaletteDisabled() {
+  const off = klAnimation === "solid" || klAnimation === "rainbow";
+  document.getElementById("kl-palette").classList.toggle("disabled", off);
+}
+
+function renderEncoderOpts() {
+  document.querySelectorAll(".enc-opt").forEach(btn => {
+    btn.classList.toggle("active", btn.dataset.mode === encoderMode);
+  });
+}
+
+function renderPalette(containerId, palette, storageKey, onChange) {
+  const container = document.getElementById(containerId);
+  if (!container) return;
+  container.innerHTML = "";
+
+  const addEl = document.createElement("label");
+  addEl.className = "palette-add" + (palette.length >= 20 ? " at-max" : "");
+  addEl.title = palette.length >= 20 ? "Maximum 20 colors" : "Add color";
+  addEl.textContent = "+";
+  if (palette.length < 20) {
+    const addInp = document.createElement("input");
+    addInp.type = "color";
+    addInp.value = "#ff0000";
+    addInp.style.cssText = "position:absolute;opacity:0;width:0;height:0;pointer-events:none";
+    addInp.addEventListener("change", (e) => {
+      e.stopPropagation();
+      palette.push(e.target.value);
+      localStorage.setItem(storageKey, JSON.stringify(palette));
+      renderPalette(containerId, palette, storageKey, onChange);
+      onChange();
+    });
+    addEl.appendChild(addInp);
+  }
+  container.appendChild(addEl);
+
+  palette.forEach((color, i) => {
+    const swatch = document.createElement("label");
+    swatch.className = "palette-swatch";
+    swatch.style.background = color;
+    swatch.title = color;
+
+    const inp = document.createElement("input");
+    inp.type = "color";
+    inp.value = color;
+    inp.style.cssText = "position:absolute;opacity:0;width:0;height:0;pointer-events:none";
+    inp.addEventListener("input", (e) => {
+      e.stopPropagation();
+      palette[i] = e.target.value;
+      swatch.style.background = e.target.value;
+      onChange();
+    });
+    inp.addEventListener("change", (e) => {
+      e.stopPropagation();
+      palette[i] = e.target.value;
+      localStorage.setItem(storageKey, JSON.stringify(palette));
+      renderPalette(containerId, palette, storageKey, onChange);
+      onChange();
+    });
+    swatch.appendChild(inp);
+
+    const del = document.createElement("span");
+    del.className = "ps-del";
+    del.textContent = "×";
+    del.addEventListener("click", (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      palette.splice(i, 1);
+      localStorage.setItem(storageKey, JSON.stringify(palette));
+      renderPalette(containerId, palette, storageKey, onChange);
+      onChange();
+    });
+    swatch.appendChild(del);
+
+    container.appendChild(swatch);
+  });
+}
+
+function renderKlAnimChips() {
+  const container = document.getElementById("kl-anims");
+  if (!container) return;
+  container.innerHTML = "";
+  for (const anim of ANIMATIONS) {
+    const chip = document.createElement("button");
+    chip.className = "ug-anim-chip" + (klAnimation === anim.id ? " active" : "");
+    const preview = document.createElement("span");
+    preview.className = `ug-anim-preview ${anim.id}`;
+    chip.appendChild(preview);
+    chip.appendChild(document.createTextNode(anim.label));
+    chip.addEventListener("click", (e) => {
+      e.stopPropagation();
+      klAnimation = anim.id;
+      saveKlAdvancedState();
+      renderKlAnimChips();
+    });
+    container.appendChild(chip);
+  }
+  updatePaletteDisabled();
 }
 
 // ── Underglow animation engine ────────────────────────────────────────────
@@ -178,26 +724,29 @@ function buildBoardGlow(tl, tr, bl, br) {
 }
 
 function computeCornerStates(elapsed) {
-  const duration = 0.3 + (ugRate / 255) * 7.7;     // rate 0→0.3 s, rate 255→8 s
-  const t        = (elapsed % duration) / duration;  // 0→1 normalized cycle
+  const duration = 0.3 + (ugRate / 255) * 7.7;
+  const t        = (elapsed % duration) / duration;
   const maxOp    = 0.15 + (ugIntensity / 255) * 0.85;
+  // Non-rainbow animations use palette when set, otherwise fall back to corner pickers
+  const bases    = [0,1,2,3].map(i => ugPalette.length > 0 ? ugPalette[i % ugPalette.length] : cornerColors[i]);
 
   switch (ugAnimation) {
     case "solid":
-      return cornerColors.map(hex => {
+      return bases.map(hex => {
         const {r,g,b} = hexToRgb(hex); return { rgb:`${r},${g},${b}`, opacity: maxOp * 0.7 };
       });
 
     case "breathe": {
       const op = maxOp * (0.5 - 0.5 * Math.cos(t * Math.PI * 2));
-      return cornerColors.map(hex => {
+      return bases.map(hex => {
         const {r,g,b} = hexToRgb(hex); return { rgb:`${r},${g},${b}`, opacity: op };
       });
     }
 
     case "rainbow": {
+      // Rainbow ignores palette — uses corner pickers with per-corner hue shifting
       const hueOffset  = t * 360;
-      const phaseShift = [0, 90, 270, 180]; // TL, TR, BL, BR
+      const phaseShift = [0, 90, 270, 180];
       return cornerColors.map((hex, i) => ({
         rgb:     shiftHue(hex, hueOffset + phaseShift[i]),
         opacity: maxOp * 0.75,
@@ -205,8 +754,8 @@ function computeCornerStates(elapsed) {
     }
 
     case "wave": {
-      const phaseOff = [0, 0.25, 0.75, 0.5]; // clockwise: TL→TR→BR→BL
-      return cornerColors.map((hex, i) => {
+      const phaseOff = [0, 0.25, 0.75, 0.5];
+      return bases.map((hex, i) => {
         const {r,g,b} = hexToRgb(hex);
         const pt = (t + phaseOff[i]) % 1;
         return { rgb:`${r},${g},${b}`, opacity: maxOp * (0.5 - 0.5 * Math.cos(pt * Math.PI * 2)) };
@@ -216,7 +765,7 @@ function computeCornerStates(elapsed) {
     case "reactive": {
       const age = (performance.now() - lastKeyClickTime) / 1000;
       const op  = age < 0.8 ? maxOp * Math.pow(1 - age / 0.8, 1.5) : maxOp * 0.08;
-      return cornerColors.map(hex => {
+      return bases.map(hex => {
         const {r,g,b} = hexToRgb(hex); return { rgb:`${r},${g},${b}`, opacity: op };
       });
     }
@@ -224,7 +773,7 @@ function computeCornerStates(elapsed) {
     case "sparkle": {
       const freqs  = [2.3, 3.7, 1.9, 4.1];
       const phases = [0,   1.2, 2.5, 0.8];
-      return cornerColors.map((hex, i) => {
+      return bases.map((hex, i) => {
         const {r,g,b} = hexToRgb(hex);
         const v  = Math.sin(t * Math.PI * 2 * freqs[i] + phases[i]);
         return { rgb:`${r},${g},${b}`, opacity: maxOp * Math.max(0.04, Math.pow(Math.max(0, v), 2)) };
@@ -232,7 +781,7 @@ function computeCornerStates(elapsed) {
     }
 
     default:
-      return cornerColors.map(hex => {
+      return bases.map(hex => {
         const {r,g,b} = hexToRgb(hex); return { rgb:`${r},${g},${b}`, opacity: 0.5 };
       });
   }
@@ -265,6 +814,131 @@ function startUgAnimation() {
   if (ugAnimFrame) cancelAnimationFrame(ugAnimFrame);
   ugAnimStart = 0; // let first tick set the reference time
   ugAnimFrame = requestAnimationFrame(ugAnimTick);
+}
+
+// ── Key LED animation engine ─────────────────────────────────────────────
+
+let klAnimFrame   = null;
+let klAnimStart   = 0;
+let keyClickTimes = Array(21).fill(0);
+
+// Sparkle: stable per-key frequencies and phases so each key blinks independently
+const KL_SPARKLE_FREQS  = [2.3, 4.7, 3.1, 5.3, 2.7, 3.9, 4.3, 2.1, 3.7, 5.1,
+                            2.9, 4.1, 3.3, 5.7, 2.5, 4.5, 3.5, 5.9, 2.3, 4.9, 3.3];
+const KL_SPARKLE_PHASES = [0.10, 0.70, 0.30, 0.90, 0.50, 0.20, 0.80, 0.40, 0.60, 0.15,
+                            0.85, 0.35, 0.65, 0.25, 0.75, 0.45, 0.55, 0.05, 0.95, 0.12, 0.62];
+
+function computeKeyLedColor(idx, row, col, elapsed, isSel) {
+  const duration = 0.3 + (klRate / 255) * 7.7;
+  const t        = (elapsed % duration) / duration;
+  const maxOp    = 0.15 + (klIntensity / 255) * 0.85;
+  const ownColor = keyLedColors[idx] || "#000000";
+  // Palette: time-based — all selected keys advance through colors together each cycle
+  const usePalette = klPalette.length > 0 && isSel && klAnimation !== "solid" && klAnimation !== "rainbow";
+  const paletteIdx = usePalette ? Math.floor(elapsed / duration) % klPalette.length : 0;
+  const baseHex  = usePalette ? klPalette[paletteIdx] : ownColor;
+  const hasColor = baseHex && baseHex !== "#000000";
+
+  switch (klAnimation) {
+    case "solid": {
+      if (!hasColor) return null;
+      const { r, g, b } = hexToRgb(baseHex);
+      return { rgb: `${r},${g},${b}`, opacity: maxOp * 0.7 };
+    }
+
+    case "breathe": {
+      if (!hasColor) return null;
+      const op = maxOp * (0.5 - 0.5 * Math.cos(t * Math.PI * 2));
+      const { r, g, b } = hexToRgb(baseHex);
+      return { rgb: `${r},${g},${b}`, opacity: op };
+    }
+
+    case "rainbow": {
+      if (!isSel) return null;
+      const { r, g, b } = hslToRgb((t + idx / 21 * 0.3) % 1, 1, 0.5);
+      return { rgb: `${r},${g},${b}`, opacity: maxOp * 0.8 };
+    }
+
+    case "wave": {
+      if (!hasColor) return null;
+      const posOffset = (col - 1) / 4 * 0.4 + (row - 1) / 5 * 0.25;
+      const op = maxOp * (0.5 - 0.5 * Math.cos(((t + posOffset) % 1) * Math.PI * 2));
+      const { r, g, b } = hexToRgb(baseHex);
+      return { rgb: `${r},${g},${b}`, opacity: op };
+    }
+
+    case "reactive": {
+      const age = (performance.now() - keyClickTimes[idx]) / 1000;
+      if (age > 0.8) return null;
+      const op = maxOp * Math.pow(1 - age / 0.8, 1.5);
+      const { r, g, b } = hexToRgb(hasColor ? baseHex : "#ffffff");
+      return { rgb: `${r},${g},${b}`, opacity: op };
+    }
+
+    case "sparkle": {
+      if (!hasColor) return null;
+      const v  = Math.sin(t * Math.PI * 2 * KL_SPARKLE_FREQS[idx] + KL_SPARKLE_PHASES[idx] * Math.PI * 2);
+      const op = maxOp * Math.max(0, Math.pow(Math.max(0, v), 2));
+      const { r, g, b } = hexToRgb(baseHex);
+      return { rgb: `${r},${g},${b}`, opacity: op };
+    }
+
+    default: return null;
+  }
+}
+
+function klAnimTick(now) {
+  if (!klAnimStart) klAnimStart = now;
+  const elapsed = (now - klAnimStart) / 1000;
+
+  // Countdown-done: flash all key LEDs until encoder press resets
+  if (oledFlashKeys) {
+    const age    = (now - oledFlashStart) / 1000;
+    const flashOp = 0.35 + 0.35 * Math.sin(age * Math.PI * 5);
+    for (const pos of BOARD_POSITIONS) {
+      const el = document.getElementById("key-" + pos.idx);
+      if (!el) continue;
+      el.style.borderColor = `rgba(255,180,84,${flashOp.toFixed(3)})`;
+      el.style.boxShadow   = `0 0 14px rgba(255,180,84,${(flashOp * 0.8).toFixed(3)})`;
+      el.style.color       = "";
+    }
+    klAnimFrame = requestAnimationFrame(klAnimTick);
+    return;
+  }
+
+  for (const pos of BOARD_POSITIONS) {
+    const el = document.getElementById("key-" + pos.idx);
+    if (!el) continue;
+
+    const isSel  = selectedKeys.has(pos.idx);
+    const result = computeKeyLedColor(pos.idx, pos.row, pos.col, elapsed, isSel);
+
+    if (!result) {
+      el.style.borderColor = isSel ? "transparent" : "";
+      el.style.boxShadow   = isSel ? "none" : "";
+      el.style.color       = "";
+      continue;
+    }
+
+    const { rgb, opacity } = result;
+    if (isSel) {
+      el.style.borderColor = `rgba(${rgb},1)`;
+      el.style.boxShadow   = `0 0 14px rgba(${rgb},${Math.min(0.99, opacity * 1.5).toFixed(3)}), 0 0 28px rgba(${rgb},${(opacity * 0.8).toFixed(3)})`;
+      el.style.color       = `rgba(${rgb},1)`;
+    } else {
+      el.style.borderColor = `rgba(${rgb},${Math.min(0.99, opacity).toFixed(3)})`;
+      el.style.boxShadow   = `0 0 8px rgba(${rgb},${(opacity * 0.6).toFixed(3)})`;
+      el.style.color       = "";
+    }
+  }
+
+  klAnimFrame = requestAnimationFrame(klAnimTick);
+}
+
+function startKlAnimation() {
+  if (klAnimFrame) cancelAnimationFrame(klAnimFrame);
+  klAnimStart = 0;
+  klAnimFrame = requestAnimationFrame(klAnimTick);
 }
 
 // ── Window controls ────────────────────────────────────────────────────────
@@ -315,6 +989,37 @@ async function init() {
   document.getElementById("ug-rate").value      = ugRate;
   document.getElementById("ug-intensity").value = ugIntensity;
 
+  const savedKlAdv = localStorage.getItem(KL_ADVANCED_KEY);
+  if (savedKlAdv) try {
+    const a = JSON.parse(savedKlAdv);
+    klAnimation = a.animation ?? klAnimation;
+    klRate      = a.rate      ?? klRate;
+    klIntensity = a.intensity ?? klIntensity;
+  } catch {}
+  renderKlAnimChips();
+  document.getElementById("kl-rate").value      = klRate;
+  document.getElementById("kl-intensity").value = klIntensity;
+
+  const savedKlPalette = localStorage.getItem(KL_PALETTE_KEY);
+  if (savedKlPalette) try { klPalette = JSON.parse(savedKlPalette); } catch {}
+  renderPalette("kl-palette", klPalette, KL_PALETTE_KEY, () => {});
+
+  const savedUgPalette = localStorage.getItem(UG_PALETTE_KEY);
+  if (savedUgPalette) try { ugPalette = JSON.parse(savedUgPalette); } catch {}
+  renderPalette("ug-palette", ugPalette, UG_PALETTE_KEY, () => {});
+
+  const savedEnc = localStorage.getItem(ENC_KEY);
+  if (savedEnc) try { const e = JSON.parse(savedEnc); encoderMode = e.mode ?? encoderMode; } catch {}
+  renderEncoderOpts();
+  document.querySelectorAll(".enc-opt").forEach(btn => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      encoderMode = btn.dataset.mode;
+      localStorage.setItem(ENC_KEY, JSON.stringify({ mode: encoderMode }));
+      renderEncoderOpts();
+    });
+  });
+
   keymap = await invoke("get_keymap");
 
   // Seed Layer 01 if this is a fresh install with no saved layers
@@ -329,8 +1034,17 @@ async function init() {
   activeProfileId = bootLayer.id;
   await invoke("set_keymap", { map: keymap });
 
+  // Restore OLED custom screens + countdown settings
+  try { oledCustomScreens = JSON.parse(localStorage.getItem(OLED_CUSTOM_KEY) || "[]"); } catch {}
+  try {
+    const c = JSON.parse(localStorage.getItem(OLED_CD_KEY) || "{}");
+    oledCdH = c.h ?? 0; oledCdM = c.m ?? 1; oledCdS = c.s ?? 0;
+  } catch {}
+
   renderBoard();
-  startUgAnimation(); // start the 60fps underglow loop
+  startUgAnimation();
+  startKlAnimation();
+  startOledAnim();
 
   // ── Saved Layers ──────────────────────────────────────────────────────────
   const slWrap     = document.getElementById("sl-wrap");
@@ -403,8 +1117,9 @@ async function init() {
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
       selectedKeys.clear();
-      closePill();
+      closeKeyLedPill();
       closeUnderglowPill();
+      closeOledPill();
       renderBoard();
     }
   });
@@ -412,23 +1127,24 @@ async function init() {
   // ── Underglow ring click ───────────────────────────────────────────────────
   document.getElementById("board-ring").addEventListener("click", (e) => {
     if (e.target.closest(".key, .encoder-knob, .oled-panel, .ug-corner")) return;
-    const ugPill = document.getElementById("underglow-pill");
-    const isOpen = ugPill.classList.contains("visible");
-    selectedKeys.clear();
-    closePill();
+    const isOpen = document.getElementById("underglow-pill").classList.contains("visible");
     if (isOpen) {
       closeUnderglowPill();
     } else {
       openUnderglowPill();
-      renderBoard();
     }
   });
 
-  // ── Close underglow when clicking outside board-ring or pill ──────────────
+  // ── Close pills when clicking outside board-ring / pill ──────────────────
   document.addEventListener("click", (e) => {
-    if (!document.getElementById("underglow-pill").classList.contains("visible")) return;
-    if (e.target.closest("#board-ring, #underglow-pill")) return;
+    if (e.target.closest("#board-ring, #underglow-pill, #key-pills, #oled-pill")) return;
     closeUnderglowPill();
+    if (document.getElementById("key-pills").classList.contains("visible")) {
+      selectedKeys.clear();
+      closeKeyLedPill();
+      renderBoard();
+    }
+    closeOledPill();
   });
 
   // ── Corner LED pickers (board-ring pips + main-row inline buttons) ───────
@@ -455,7 +1171,38 @@ async function init() {
     inp.addEventListener("blur",  () => btn.classList.remove("selected"));
   }
 
-  // ── Advanced toggle ───────────────────────────────────────────────────────
+  // ── Key LED Advanced toggle ────────────────────────────────────────────────
+  document.getElementById("kl-adv-btn").addEventListener("click", (e) => {
+    e.stopPropagation();
+    const adv     = document.getElementById("kl-advanced");
+    const arrow   = document.getElementById("kl-adv-arrow");
+    const btn     = document.getElementById("kl-adv-btn");
+    const opening = !adv.classList.contains("open");
+    adv.classList.toggle("open", opening);
+    btn.classList.toggle("open", opening);
+    arrow.textContent = opening ? "▾" : "▸";
+  });
+
+  document.getElementById("kl-rate").addEventListener("input", (e) => {
+    klRate = Number(e.target.value); saveKlAdvancedState();
+  });
+  document.getElementById("kl-intensity").addEventListener("input", (e) => {
+    klIntensity = Number(e.target.value); saveKlAdvancedState();
+  });
+
+  // ── Keycode Advanced toggle ────────────────────────────────────────────────
+  document.getElementById("kc-adv-btn").addEventListener("click", (e) => {
+    e.stopPropagation();
+    const adv     = document.getElementById("kc-advanced");
+    const arrow   = document.getElementById("kc-adv-arrow");
+    const btn     = document.getElementById("kc-adv-btn");
+    const opening = !adv.classList.contains("open");
+    adv.classList.toggle("open", opening);
+    btn.classList.toggle("open", opening);
+    arrow.textContent = opening ? "▾" : "▸";
+  });
+
+  // ── Underglow Advanced toggle ─────────────────────────────────────────────
   document.getElementById("ug-adv-btn").addEventListener("click", (e) => {
     e.stopPropagation();
     const adv     = document.getElementById("ug-advanced");
@@ -479,17 +1226,39 @@ async function init() {
     applyUnderglowHex(e.target.value);
   });
 
-  document.getElementById("pill-color").addEventListener("input", (e) => {
+  document.getElementById("kl-color").addEventListener("input", (e) => {
+    klAnimation = "solid";
+    saveKlAdvancedState();
+    renderKlAnimChips();
     for (const idx of selectedKeys) keyLedColors[idx] = e.target.value;
     renderBoard();
   });
 
-  document.getElementById("pill-kc").addEventListener("keydown", (e) => {
+  document.getElementById("kl-kc").addEventListener("keydown", (e) => {
     if (e.key === "Enter") {
       const val = e.target.value.trim() || "KC_NO";
       for (const idx of selectedKeys) keymap.layers[0].keys[idx] = val;
       renderBoard();
     }
+  });
+
+  // ── OLED pill controls ────────────────────────────────────────────────────
+  document.getElementById("oled-nav-prev").addEventListener("click", (e) => {
+    e.stopPropagation(); oledScreenNav(-1); renderOledPill();
+  });
+  document.getElementById("oled-nav-next").addEventListener("click", (e) => {
+    e.stopPropagation(); oledScreenNav(1); renderOledPill();
+  });
+  document.getElementById("oled-enc-press").addEventListener("click", (e) => {
+    e.stopPropagation(); onEncoderPress(); renderOledPill();
+  });
+  document.getElementById("oled-add-screen").addEventListener("click", (e) => {
+    e.stopPropagation();
+    oledCustomScreens.push({ id: Date.now().toString(), type: "custom", title: "New Screen", imageDataUrl: null });
+    saveOledCustomScreens();
+    const screens = getOledScreens();
+    oledScreenIdx = screens.length - 1;
+    updateOledDisplay(); renderOledPill();
   });
 }
 
@@ -504,13 +1273,22 @@ function renderBoard() {
     ? String(layers.indexOf(active) + 1).padStart(2, "0")
     : "--";
 
-  const oled = document.createElement("div");
-  oled.className = "oled-panel";
-  oled.innerHTML = `
-    <div class="oled-screen">
-      <span class="oled-layer">LAYER ${activeIdx}</span>
-    </div>`;
-  el.appendChild(oled);
+  const oledPanel = document.createElement("div");
+  oledPanel.className = "oled-panel";
+  const oledScreen = document.createElement("div");
+  oledScreen.className = "oled-screen";
+  renderOledScreenContent(oledScreen);
+  oledPanel.appendChild(oledScreen);
+  oledPanel.addEventListener("click", (e) => {
+    if (!e.target.closest(".oled-screen")) return;
+    e.stopPropagation();
+    selectedKeys.clear();
+    closeKeyLedPill();
+    closeUnderglowPill();
+    renderBoard();
+    openOledPill();
+  });
+  el.appendChild(oledPanel);
 
   for (const pos of BOARD_POSITIONS) {
     const kc = keymap.layers[0].keys[pos.idx] ?? "KC_NO";
@@ -518,23 +1296,40 @@ function renderBoard() {
     const ledColor = keyLedColors[pos.idx];
 
     if (pos.type === "encoder") {
+      const encWrap = document.createElement("div");
+      encWrap.className = "encoder-wrap";
+      encWrap.style.cssText = `grid-row:${pos.row};grid-column:${pos.col}`;
+
       const enc = document.createElement("button");
+      enc.id = "key-" + pos.idx;
       enc.className = "encoder-knob" + (isSel ? " sel" : "");
-      enc.style.cssText = `grid-row:${pos.row};grid-column:${pos.col}`;
       enc.textContent = "◉";
       enc.addEventListener("mousedown", (e) => { e.preventDefault(); onKeyDown(pos.idx); });
       enc.addEventListener("mouseenter", () => onKeyEnter(pos.idx));
-      el.appendChild(enc);
+      encWrap.appendChild(enc);
+
+      const cwBtn = document.createElement("button");
+      cwBtn.className = "enc-rotate-btn enc-cw";
+      cwBtn.textContent = "↻";
+      cwBtn.title = "Rotate CW";
+      cwBtn.addEventListener("click", (e) => { e.stopPropagation(); onEncoderCW(); });
+      encWrap.appendChild(cwBtn);
+
+      const ccwBtn = document.createElement("button");
+      ccwBtn.className = "enc-rotate-btn enc-ccw";
+      ccwBtn.textContent = "↺";
+      ccwBtn.title = "Rotate CCW";
+      ccwBtn.addEventListener("click", (e) => { e.stopPropagation(); onEncoderCCW(); });
+      encWrap.appendChild(ccwBtn);
+
+      el.appendChild(encWrap);
     } else {
       const k = document.createElement("button");
+      k.id = "key-" + pos.idx;
       const isEmpty = kc === "KC_NO" || kc === "KC_TRNS";
-      k.className = "key" + (isSel ? " sel" : "") + (isEmpty ? " empty" : "");
+      const isCycleActive = oledSubMode === "keycycle" && pos.idx === oledKeyCycleIdx;
+      k.className = "key" + (isSel ? " sel" : "") + (isEmpty ? " empty" : "") + (isCycleActive ? " oled-key-active" : "");
       k.style.cssText = `grid-row:${pos.row};grid-column:${pos.col}`;
-      if (isSel && ledColor) {
-        k.style.borderColor = ledColor;
-        k.style.boxShadow = `0 0 14px ${ledColor}cc, 0 0 28px ${ledColor}66`;
-        k.style.color = ledColor;
-      }
       k.textContent = isEmpty ? "·" : kc.replace(/^KC_/, "");
       k.addEventListener("mousedown", (e) => { e.preventDefault(); onKeyDown(pos.idx); });
       k.addEventListener("mouseenter", () => onKeyEnter(pos.idx));
@@ -552,31 +1347,41 @@ function flashBoard() {
 }
 
 function onKeyDown(idx) {
-  lastKeyClickTime = performance.now(); // drives the reactive animation
+  lastKeyClickTime = performance.now();
+  keyClickTimes[idx] = performance.now();
   isDragging = true;
   selectedKeys.clear();
   selectedKeys.add(idx);
-  syncPillInputs();
+  closeUnderglowPill();
+  closeOledPill();
+  syncKeyLedPill();
   renderBoard();
-  openPill();
+  openKeyLedPill();
 }
 
 function onKeyEnter(idx) {
   if (!isDragging) return;
   selectedKeys.add(idx);
-  syncPillInputs();
+  syncKeyLedPill();
   renderBoard();
 }
 
-function syncPillInputs() {
-  if (selectedKeys.size === 1) {
+function syncKeyLedPill() {
+  const n          = selectedKeys.size;
+  const encOnly    = n === 1 && selectedKeys.has(ENCODER_IDX);
+  document.getElementById("kl-count").textContent = encOnly ? "encoder" : n === 1 ? "1 key" : `${n} keys`;
+  document.getElementById("encoder-section").classList.toggle("visible", encOnly);
+  if (n === 1) {
     const [idx] = selectedKeys;
     const kc = keymap.layers[0].keys[idx] ?? "KC_NO";
-    document.getElementById("pill-kc").value = kc === "KC_NO" ? "" : kc;
+    document.getElementById("kl-kc").value = kc === "KC_NO" ? "" : kc;
     const col = keyLedColors[idx];
-    if (col) document.getElementById("pill-color").value = col;
+    document.getElementById("kl-color").value = col || "#000000";
   } else {
-    document.getElementById("pill-kc").value = "";
+    document.getElementById("kl-kc").value = "";
+    const colors = [...selectedKeys].map(i => keyLedColors[i]).filter(c => c && c !== "#000000");
+    document.getElementById("kl-color").value =
+      (colors.length && colors.every(c => c === colors[0])) ? colors[0] : "#000000";
   }
 }
 
@@ -614,7 +1419,7 @@ function deleteSavedLayer(id) {
     // No layers left — blank the device: all KC_NO, all LEDs off
     activeProfileId = null;
     keymap = { layers: keymap.layers.map(() => ({ keys: Array(21).fill("KC_NO") })) };
-    keyLedColors = Array(21).fill("");
+    keyLedColors = Array(21).fill("#000000");
     invoke("set_keymap", { map: keymap });
     invoke("set_leds", { leds: { colors: Array(21).fill({ r: 0, g: 0, b: 0 }) } });
   }
@@ -640,7 +1445,7 @@ async function switchToLayer(id) {
   keyLedColors = [...layer.leds];
   activeProfileId = id;
   selectedKeys.clear();
-  closePill();
+  closeKeyLedPill();
   renderBoard();
   flashBoard();
   await invoke("set_keymap", { map: keymap });
@@ -657,10 +1462,10 @@ async function switchToLayer(id) {
 
 function switchToBlankLayer() {
   keymap = { layers: Array.from({ length: 4 }, () => ({ keys: Array(21).fill("KC_NO") })) };
-  keyLedColors = Array.from({ length: 21 }, () => "");
+  keyLedColors = Array.from({ length: 21 }, () => "#000000");
   activeProfileId = null;
   selectedKeys.clear();
-  closePill();
+  closeKeyLedPill();
   renderBoard();
   flashBoard();
 }
@@ -678,7 +1483,7 @@ function renderSavedLayers() {
   for (const [i, layer] of layers.entries()) {
     const item = document.createElement("div");
     item.className = "sl-item" + (layer.id === activeProfileId ? " active-profile" : "");
-    item.setAttribute("draggable", "true");
+    item.dataset.layerId = layer.id;
 
     const idx = document.createElement("span");
     idx.className = "sl-item-idx";
@@ -701,49 +1506,84 @@ function renderSavedLayers() {
     // Switch on click
     item.addEventListener("click", () => switchToLayer(layer.id));
 
-    // Drag to reorder
-    item.addEventListener("dragstart", (e) => {
+    // Drag to reorder — mouse-event based because WebView2 (Tauri/Windows) intercepts
+    // the HTML5 dragover event at the OS level for file-drop, so drag/drop never fires.
+    item.addEventListener("mousedown", (e) => {
+      if (e.target.closest(".sl-del")) return;
+      e.preventDefault();
+
       dragSrcId = layer.id;
-      e.dataTransfer.effectAllowed = "move";
       item.classList.add("dragging");
-      // inline style already set by openDropdown(); remains visible even when :hover is stripped
-    });
-    item.addEventListener("dragend", () => {
-      dragSrcId = null;
-      item.classList.remove("dragging");
-      list.querySelectorAll(".drag-over").forEach(el => el.classList.remove("drag-over"));
-      // if pointer left the wrap during drag, close now that drag is done
-      setTimeout(() => {
-        const wrap = document.getElementById("sl-wrap");
-        if (!wrap.matches(":hover")) {
-          document.getElementById("sl-dropdown").style.display = "";
-          document.getElementById("sl-new-row").classList.remove("open");
-          document.getElementById("sl-new-input").classList.remove("error");
+
+      const rect = item.getBoundingClientRect();
+      const offsetY = e.clientY - rect.top;
+
+      const ghost = item.cloneNode(true);
+      Object.assign(ghost.style, {
+        position: "fixed", pointerEvents: "none", zIndex: "9999",
+        opacity: "0.85", width: rect.width + "px",
+        left: rect.left + "px", top: (e.clientY - offsetY) + "px",
+        margin: "0", borderRadius: "8px",
+        background: "rgba(255,180,84,0.15)",
+        boxShadow: "0 4px 16px rgba(0,0,0,0.4)",
+      });
+      document.body.appendChild(ghost);
+
+      const onMove = (me) => {
+        ghost.style.top = (me.clientY - offsetY) + "px";
+        ghost.style.visibility = "hidden";
+        const target = document.elementFromPoint(me.clientX, me.clientY)?.closest("[data-layer-id]");
+        ghost.style.visibility = "";
+        list.querySelectorAll(".drag-over").forEach(el => el.classList.remove("drag-over"));
+        if (target && target.dataset.layerId !== layer.id) target.classList.add("drag-over");
+      };
+
+      const onUp = (ue) => {
+        document.removeEventListener("mousemove", onMove);
+        document.removeEventListener("mouseup", onUp);
+        ghost.remove();
+        item.classList.remove("dragging");
+        list.querySelectorAll(".drag-over").forEach(el => el.classList.remove("drag-over"));
+
+        const target = document.elementFromPoint(ue.clientX, ue.clientY)?.closest("[data-layer-id]");
+        if (target && target.dataset.layerId !== layer.id) {
+          reorderLayers(layer.id, target.dataset.layerId);
+          renderSavedLayers();
         }
-      }, 0);
-    });
-    item.addEventListener("dragover", (e) => {
-      e.preventDefault();
-      e.dataTransfer.dropEffect = "move";
-      if (layer.id !== dragSrcId) item.classList.add("drag-over");
-    });
-    item.addEventListener("dragleave", () => item.classList.remove("drag-over"));
-    item.addEventListener("drop", (e) => {
-      e.preventDefault();
-      item.classList.remove("drag-over");
-      if (!dragSrcId || dragSrcId === layer.id) return;
-      reorderLayers(dragSrcId, layer.id);
-      renderSavedLayers();
+
+        dragSrcId = null;
+        setTimeout(() => {
+          if (dragSrcId || document.getElementById("sl-wrap").matches(":hover")) return;
+          closeDropdown();
+        }, 0);
+      };
+
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", onUp);
     });
 
     list.appendChild(item);
   }
 }
 
-function openPill()  { document.getElementById("settings-pill").classList.add("visible"); }
-function closePill() { document.getElementById("settings-pill").classList.remove("visible"); }
+function openKeyLedPill()  { document.getElementById("key-pills").classList.add("visible"); }
+function closeKeyLedPill() {
+  document.getElementById("key-pills").classList.remove("visible");
+  document.getElementById("kl-advanced").classList.remove("open");
+  document.getElementById("kl-adv-btn").classList.remove("open");
+  document.getElementById("kl-adv-arrow").textContent = "▸";
+  document.getElementById("kc-advanced").classList.remove("open");
+  document.getElementById("kc-adv-btn").classList.remove("open");
+  document.getElementById("kc-adv-arrow").textContent = "▸";
+}
+function openOledPill()    { document.getElementById("oled-pill").classList.add("visible"); renderOledPill(); }
+function closeOledPill()   { document.getElementById("oled-pill").classList.remove("visible"); }
 
 function openUnderglowPill() {
+  selectedKeys.clear();
+  closeKeyLedPill();
+  closeOledPill();
+  renderBoard();
   document.getElementById("underglow-pill").classList.add("visible");
   document.getElementById("board-ring").classList.add("ug-active");
 }

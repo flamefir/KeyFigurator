@@ -13,8 +13,8 @@
     "windows": [
       {
         "title": "KeyFigurator Pro",
-        "width": 1000, "height": 780,
-        "minWidth": 420, "minHeight": 760,
+        "width": 1000, "height": 1100,
+        "minWidth": 420, "minHeight": 1060,
         "decorations": false,
         "shadow": true
       }

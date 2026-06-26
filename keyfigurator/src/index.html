@@ -87,19 +87,60 @@
               <input type="range" id="ug-intensity" min="0" max="255" value="180" />
             </label>
           </div>
+          <div class="palette-row" id="ug-palette"></div>
         </div>
       </div>
-      <div class="settings-pill" id="settings-pill">
-        <div class="pill-section">
-          <span class="pill-label">LED</span>
-          <input type="color" id="pill-color" value="#ff7a1e" title="Key LED color" />
-          <input type="range" id="pill-bright" class="pill-bright" min="0" max="255" value="180" title="Brightness" />
+      <div class="key-pills" id="key-pills">
+        <div class="key-led-pill" id="key-led-pill">
+          <div class="ug-main-row">
+            <span class="pill-label">KEY LED</span>
+            <input type="color" id="kl-color" value="#000000" title="Set LED color for selected keys" />
+            <span class="kl-count" id="kl-count">1 key</span>
+            <button class="ug-adv-btn" id="kl-adv-btn">Advanced <span id="kl-adv-arrow">▸</span></button>
+          </div>
+          <div class="ug-advanced" id="kl-advanced">
+            <div class="ug-anims" id="kl-anims"></div>
+            <div class="ug-sliders">
+              <label class="ug-slider-row">
+                <span class="pill-label">RATE</span>
+                <input type="range" id="kl-rate" min="0" max="255" value="128" />
+              </label>
+              <label class="ug-slider-row">
+                <span class="pill-label">INTENSITY</span>
+                <input type="range" id="kl-intensity" min="0" max="255" value="180" />
+              </label>
+            </div>
+            <div class="palette-row" id="kl-palette"></div>
+            <div class="encoder-section" id="encoder-section">
+              <span class="pill-label" style="font-size:10px;letter-spacing:0.1em">ENCODER ROTATION</span>
+              <div class="enc-opts">
+                <button class="enc-opt" data-mode="layer">Layer Cycle</button>
+                <button class="enc-opt" data-mode="scroll">Mouse Scroll</button>
+              </div>
+            </div>
+          </div>
         </div>
-        <div class="pill-sep"></div>
-        <div class="pill-section">
-          <span class="pill-label">MACRO</span>
-          <input type="text" id="pill-kc" class="pill-kc" placeholder="KC_A · MO(1) · HOST(0)…" />
+        <div class="keycode-pill" id="keycode-pill">
+          <div class="ug-main-row">
+            <span class="pill-label">KEYCODE</span>
+            <input type="text" id="kl-kc" class="pill-kc" placeholder="KC_A · MO(1) · HOST(0)…" />
+            <button class="ug-adv-btn" id="kc-adv-btn">Advanced <span id="kc-adv-arrow">▸</span></button>
+          </div>
+          <div class="ug-advanced" id="kc-advanced">
+            <span style="color:var(--muted);font-size:12px">Macro &amp; HOST(n) settings — coming soon</span>
+          </div>
         </div>
+      </div>
+      <div class="oled-pill" id="oled-pill">
+        <div class="oled-pill-nav">
+          <span class="pill-label">OLED</span>
+          <button class="oled-nav-btn" id="oled-nav-prev">‹</button>
+          <span class="oled-screen-name-wrap"><span id="oled-screen-name">—</span></span>
+          <button class="oled-nav-btn" id="oled-nav-next">›</button>
+          <button class="oled-enc-press" id="oled-enc-press">↓ Press</button>
+          <button class="oled-add-screen" id="oled-add-screen">+ Screen</button>
+        </div>
+        <div class="oled-pill-content" id="oled-pill-content"></div>
       </div>
     </div>
 
