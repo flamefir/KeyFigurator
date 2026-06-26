@@ -13,7 +13,8 @@ mod runner;
 use hid::{HidTransport, MockHid};
 use model::{HostBinding, KeyMap, LedState};
 use std::sync::Mutex;
-use tauri::State;
+use tauri::{Manager, State};
+use tauri::window::Color;
 
 /// Shared app state. `transport` is a trait object so it can be Mock or Real.
 struct AppState {
@@ -91,6 +92,14 @@ fn main() {
     };
 
     tauri::Builder::default()
+        .setup(|app| {
+            // Match native window background to the app's dark theme (#0c0d10) so that
+            // resize events don't flash white before the WebView repaints.
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.set_background_color(Some(Color(12, 13, 16, 255)));
+            }
+            Ok(())
+        })
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             is_connected,
