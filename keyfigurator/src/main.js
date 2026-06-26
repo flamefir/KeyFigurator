@@ -1282,7 +1282,7 @@ async function init() {
   });
 
   // ── Keycode Advanced toggle ────────────────────────────────────────────────
-  document.getElementById("kc-adv-btn").addEventListener("click", (e) => {
+  document.getElementById("kc-adv-btn").addEventListener("click", async (e) => {
     e.stopPropagation();
     const adv     = document.getElementById("kc-advanced");
     const arrow   = document.getElementById("kc-adv-arrow");
@@ -1291,6 +1291,15 @@ async function init() {
     adv.classList.toggle("open", opening);
     btn.classList.toggle("open", opening);
     arrow.textContent = opening ? "▾" : "▸";
+    if (opening) await renderHostBindings();
+  });
+
+  document.getElementById("hb-add").addEventListener("click", async () => {
+    const bindings = await invoke("get_bindings");
+    const maxIdx   = bindings.reduce((m, b) => Math.max(m, b.index), -1);
+    bindings.push({ index: maxIdx + 1, label: "New Command", command: ["echo", "hello"], cwd: null });
+    await invoke("set_bindings", { bindings });
+    await renderHostBindings();
   });
 
   // ── Underglow Advanced toggle ─────────────────────────────────────────────
@@ -1767,6 +1776,67 @@ function closeUnderglowPill() {
   document.getElementById("ug-advanced").classList.remove("open");
   document.getElementById("ug-adv-btn").classList.remove("open");
   document.getElementById("ug-adv-arrow").textContent = "▸";
+}
+
+async function renderHostBindings() {
+  const list     = document.getElementById("hb-list");
+  const outputEl = document.getElementById("hb-output");
+  if (!list) return;
+  const bindings = await invoke("get_bindings");
+  list.innerHTML = "";
+
+  for (const b of bindings) {
+    const row = document.createElement("div");
+    row.className = "hb-row";
+    row.innerHTML = `
+      <span class="hb-idx">HOST(${b.index})</span>
+      <input class="hb-label"   value="${b.label}"                placeholder="Label" />
+      <input class="hb-cmd"     value="${b.command.join(" ")}"    placeholder="git commit -am wip" />
+      <input class="hb-cwd"     value="${b.cwd || ""}"            placeholder="Working dir (optional)" />
+      <button class="hb-run"  title="Run now and show output">▶</button>
+      <button class="hb-del"  title="Delete">✕</button>`;
+
+    const save = async () => {
+      const label   = row.querySelector(".hb-label").value;
+      const cmdStr  = row.querySelector(".hb-cmd").value.trim();
+      const cwd     = row.querySelector(".hb-cwd").value.trim() || null;
+      const updated = bindings.map(x => x.index === b.index
+        ? { ...x, label, command: cmdStr.split(/\s+/), cwd }
+        : x);
+      await invoke("set_bindings", { bindings: updated });
+    };
+
+    row.querySelector(".hb-label").addEventListener("change", save);
+    row.querySelector(".hb-cmd").addEventListener("change", save);
+    row.querySelector(".hb-cwd").addEventListener("change", save);
+
+    row.querySelector(".hb-run").addEventListener("click", async () => {
+      await save();
+      const runBtn = row.querySelector(".hb-run");
+      runBtn.disabled = true;
+      try {
+        const result = await invoke("run_binding", { index: b.index });
+        outputEl.textContent = result;
+        outputEl.style.display = "";
+      } catch (err) {
+        outputEl.textContent = "Error: " + err;
+        outputEl.style.display = "";
+      }
+      runBtn.disabled = false;
+    });
+
+    row.querySelector(".hb-del").addEventListener("click", async () => {
+      const updated = bindings.filter(x => x.index !== b.index);
+      await invoke("set_bindings", { bindings: updated });
+      await renderHostBindings();
+    });
+
+    list.appendChild(row);
+  }
+
+  if (bindings.length === 0) {
+    list.innerHTML = `<div class="hb-empty">No bindings yet — add one with the button below.</div>`;
+  }
 }
 
 async function applyActiveProfileToBoard() {

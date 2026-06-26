@@ -134,7 +134,13 @@
             <button class="ug-adv-btn" id="kc-adv-btn">Advanced <span id="kc-adv-arrow">▸</span></button>
           </div>
           <div class="ug-advanced" id="kc-advanced">
-            <span style="color:var(--muted);font-size:12px">Macro &amp; HOST(n) settings — coming soon</span>
+            <div class="hb-header">
+              <span class="pill-label">HOST BINDINGS</span>
+              <span class="hb-hint">Triggered by HOST(n) keycodes — each binding runs a shell command on the host.</span>
+            </div>
+            <div id="hb-list"></div>
+            <button class="hb-add-btn" id="hb-add">+ Add Binding</button>
+            <div class="hb-output" id="hb-output" style="display:none"></div>
           </div>
         </div>
       </div>

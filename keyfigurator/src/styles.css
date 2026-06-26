@@ -791,6 +791,42 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 50%; }
 }
 .pill-icon:focus { outline: none; border-color: var(--muted); }
 
+/* ── Host Bindings editor ────────────────────────────────────────────────── */
+.hb-header { display: flex; flex-direction: column; gap: 2px; margin-bottom: 6px; }
+.hb-hint { color: var(--muted); font-size: 10px; }
+.hb-row {
+  display: grid;
+  grid-template-columns: 70px 1fr 1fr auto auto auto;
+  gap: 5px; align-items: center;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--line);
+}
+.hb-idx { color: var(--amber); font-family: monospace; font-size: 11px; }
+.hb-label, .hb-cmd, .hb-cwd {
+  background: var(--bg); border: 1px solid var(--line); color: var(--txt);
+  padding: 3px 6px; border-radius: 5px; font-size: 11px;
+  font-family: 'Courier New', monospace; min-width: 0;
+}
+.hb-label:focus, .hb-cmd:focus, .hb-cwd:focus { outline: none; border-color: var(--muted); }
+.hb-run, .hb-del {
+  background: none; border: none; color: var(--muted);
+  padding: 2px 5px; cursor: pointer; border-radius: 4px; font-size: 12px;
+}
+.hb-run:hover:not(:disabled) { color: #7ee8ff; }
+.hb-del:hover { color: #c23b3b; }
+.hb-add-btn {
+  margin-top: 8px; background: none; border: 1px dashed var(--line);
+  color: var(--muted); border-radius: 6px; padding: 4px 10px;
+  font-size: 11px; cursor: pointer; width: 100%;
+}
+.hb-add-btn:hover { border-color: var(--sel); color: var(--sel); }
+.hb-output {
+  margin-top: 8px; background: rgba(0,0,0,0.3); border-radius: 6px;
+  padding: 8px; font-family: monospace; font-size: 10px;
+  color: var(--txt); white-space: pre-wrap; max-height: 120px; overflow-y: auto;
+}
+.hb-empty { color: var(--muted); font-size: 11px; text-align: center; padding: 6px 0; }
+
 /* ── Saved Boards — breathing orange pill + hover dropdown ───────────────── */
 .saved-boards-wrap {
   margin-left: auto;
