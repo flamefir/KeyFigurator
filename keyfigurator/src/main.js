@@ -104,6 +104,20 @@ let oledCustomScreens = [];         // { id, type:"custom", title, imageDataUrl 
 let oledAnimFrame     = null;
 let oledLastTick      = 0;
 
+// ── Keycode palette ────────────────────────────────────────────────────────
+const KC_CATEGORIES = [
+  { label: "Letters", keys: "A B C D E F G H I J K L M N O P Q R S T U V W X Y Z".split(" ").map(k => "KC_" + k) },
+  { label: "Numbers", keys: ["KC_1","KC_2","KC_3","KC_4","KC_5","KC_6","KC_7","KC_8","KC_9","KC_0"] },
+  { label: "F-Keys",  keys: Array.from({length:12}, (_,i) => `KC_F${i+1}`) },
+  { label: "Modifiers", keys: ["KC_LCTL","KC_RCTL","KC_LSFT","KC_RSFT","KC_LALT","KC_RALT","KC_LGUI","KC_RGUI","KC_MEH","KC_HYPR"] },
+  { label: "Nav",     keys: ["KC_UP","KC_DOWN","KC_LEFT","KC_RIGHT","KC_HOME","KC_END","KC_PGUP","KC_PGDN","KC_INS","KC_DEL","KC_BSPC","KC_ENTER","KC_ESC","KC_TAB","KC_SPACE"] },
+  { label: "Symbols", keys: ["KC_MINS","KC_EQL","KC_LBRC","KC_RBRC","KC_BSLS","KC_SCLN","KC_QUOT","KC_GRV","KC_COMM","KC_DOT","KC_SLSH"] },
+  { label: "Media",   keys: ["KC_MPLY","KC_MNXT","KC_MPRV","KC_MSTP","KC_VOLU","KC_VOLD","KC_MUTE","KC_BRIU","KC_BRID"] },
+  { label: "Layers",  keys: ["MO(1)","MO(2)","MO(3)","TG(1)","TG(2)","DF(0)","DF(1)","TO(0)","TO(1)","OSL(1)"] },
+  { label: "Misc",    keys: ["KC_NO","KC_TRNS","KC_PSCR","KC_SLCK","KC_PAUS","KC_CAPS","KC_NLCK","KC_APP","RESET","QK_BOOT"] },
+];
+const KC_ALL_FLAT = KC_CATEGORIES.flatMap(c => c.keys);
+
 const ANIMATIONS = [
   { id: "solid",    label: "Solid"    },
   { id: "breathe",  label: "Breathe"  },
@@ -1291,8 +1305,10 @@ async function init() {
     adv.classList.toggle("open", opening);
     btn.classList.toggle("open", opening);
     arrow.textContent = opening ? "▾" : "▸";
-    if (opening) await renderHostBindings();
+    if (opening) { renderKcPalette(); await renderHostBindings(); }
   });
+
+  document.getElementById("kc-search").addEventListener("input", (e) => renderKcPalette(e.target.value));
 
   document.getElementById("hb-add").addEventListener("click", async () => {
     const bindings = await invoke("get_bindings");
@@ -1776,6 +1792,48 @@ function closeUnderglowPill() {
   document.getElementById("ug-advanced").classList.remove("open");
   document.getElementById("ug-adv-btn").classList.remove("open");
   document.getElementById("ug-adv-arrow").textContent = "▸";
+}
+
+function renderKcPalette(filter = "") {
+  const list = document.getElementById("kc-palette-list");
+  if (!list) return;
+  const q = filter.trim().toUpperCase();
+
+  list.innerHTML = "";
+  const cats = q
+    ? [{ label: "Results", keys: KC_ALL_FLAT.filter(k => k.toUpperCase().includes(q)) }]
+    : KC_CATEGORIES;
+
+  for (const cat of cats) {
+    if (!cat.keys.length) continue;
+    const section = document.createElement("div");
+    section.className = "kc-cat";
+    const lbl = document.createElement("div");
+    lbl.className = "kc-cat-lbl";
+    lbl.textContent = cat.label;
+    section.appendChild(lbl);
+    const chips = document.createElement("div");
+    chips.className = "kc-chips";
+    for (const kc of cat.keys) {
+      const chip = document.createElement("button");
+      chip.className = "kc-chip";
+      chip.textContent = kc.replace(/^KC_/, "");
+      chip.title = kc;
+      chip.addEventListener("click", () => {
+        const inp = document.getElementById("kl-kc");
+        if (inp) inp.value = kc;
+        for (const idx of selectedKeys) keymap.layers[0].keys[idx] = kc;
+        renderBoard();
+      });
+      chips.appendChild(chip);
+    }
+    section.appendChild(chips);
+    list.appendChild(section);
+  }
+
+  if (q && !cats[0].keys.length) {
+    list.innerHTML = `<div class="kc-no-results">No keycodes matching "${filter}"</div>`;
+  }
 }
 
 async function renderHostBindings() {

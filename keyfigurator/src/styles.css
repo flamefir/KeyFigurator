@@ -791,6 +791,27 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 50%; }
 }
 .pill-icon:focus { outline: none; border-color: var(--muted); }
 
+/* ── Keycode palette ─────────────────────────────────────────────────────── */
+.kc-palette-wrap { margin-bottom: 10px; }
+.kc-search {
+  width: 100%; box-sizing: border-box;
+  background: var(--bg); border: 1px solid var(--line); color: var(--txt);
+  padding: 5px 9px; border-radius: 8px; font-size: 11px; margin-bottom: 6px;
+}
+.kc-search:focus { outline: none; border-color: var(--muted); }
+.kc-palette-list { max-height: 200px; overflow-y: auto; }
+.kc-cat { margin-bottom: 8px; }
+.kc-cat-lbl { color: var(--muted); font-size: 9px; letter-spacing: 0.1em; text-transform: uppercase; margin-bottom: 4px; }
+.kc-chips { display: flex; flex-wrap: wrap; gap: 3px; }
+.kc-chip {
+  background: var(--cell); border: 1px solid var(--line);
+  color: var(--txt); padding: 2px 6px; border-radius: 5px;
+  font-size: 10px; font-family: 'Courier New', monospace; cursor: pointer;
+  transition: border-color 0.1s, color 0.1s;
+}
+.kc-chip:hover { border-color: var(--sel); color: var(--sel); }
+.kc-no-results { color: var(--muted); font-size: 11px; padding: 4px 0; }
+
 /* ── Host Bindings editor ────────────────────────────────────────────────── */
 .hb-header { display: flex; flex-direction: column; gap: 2px; margin-bottom: 6px; }
 .hb-hint { color: var(--muted); font-size: 10px; }
