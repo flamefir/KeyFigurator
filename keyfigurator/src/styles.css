@@ -1,5 +1,5 @@
 :root {
-  --bg:    #16171d;
+  --bg:    #1c1d24;
   --panel: #1d2026;
   --line:  #2c3038;
   --txt:   #e6e8eb;
@@ -12,7 +12,7 @@
 
 * { box-sizing: border-box; }
 
-html { background: #16171d; }
+html { background: #1c1d24; }
 
 body {
   margin: 0;
@@ -96,16 +96,16 @@ header {
   border: 1px solid var(--line);
   color: var(--muted);
   border-radius: 20px;
-  font-size: 12px;
-  padding: 4px 12px;
+  font-size: 14px;
+  padding: 5px 14px;
   cursor: pointer;
   transition: border-color 0.15s, color 0.15s;
 }
 .save-board-btn:hover:not(:disabled) { border-color: var(--sel); color: var(--sel); }
 .save-board-btn:disabled { opacity: 0.5; cursor: default; }
 .pill {
-  font-size: 12px;
-  padding: 4px 10px;
+  font-size: 14px;
+  padding: 5px 12px;
   border: 1px solid var(--line);
   border-radius: 20px;
   color: var(--muted);
@@ -611,6 +611,7 @@ header {
 
 /* ── Key caps ────────────────────────────────────────────────────────────── */
 .key {
+  position: relative;
   width: 100%;
   height: 100%;
   background: var(--panel);
@@ -634,8 +635,39 @@ header {
   box-shadow: 0 0 14px rgba(255, 180, 84, 0.65), 0 0 28px rgba(255, 180, 84, 0.30);
   transition: none; /* JS animation drives selected keys at 60fps — CSS transition causes flicker */
 }
+/* Selection indicator dot — top-right corner of each selected key */
+.key.sel::after {
+  content: '';
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--sel);
+  box-shadow: 0 0 6px rgba(255, 180, 84, 0.9), 0 0 12px rgba(255, 180, 84, 0.5);
+  pointer-events: none;
+  z-index: 2;
+}
+/* Brief flash overlay on key selection — fades independently of JS-driven border */
+@keyframes key-select-flash {
+  0%   { opacity: 0.85; }
+  100% { opacity: 0; }
+}
+.key.sel-flash::before {
+  content: '';
+  position: absolute;
+  top: -2px; right: -2px; bottom: -2px; left: -2px;
+  border-radius: 9px;
+  border: 2px solid rgba(255, 210, 130, 0.95);
+  box-shadow: 0 0 18px rgba(255, 180, 84, 0.8), inset 0 0 10px rgba(255, 180, 84, 0.25);
+  animation: key-select-flash 0.35s ease-out forwards;
+  pointer-events: none;
+  z-index: 3;
+}
 /* ── Encoder knob ────────────────────────────────────────────────────────── */
 .encoder-knob {
+  position: relative;
   width: 100%;
   height: 100%;
   border-radius: 50%;
@@ -654,6 +686,19 @@ header {
   border-color: var(--sel);
   box-shadow: 0 0 12px rgba(255, 180, 84, 0.6), 0 0 24px rgba(255, 180, 84, 0.3);
   color: var(--sel);
+}
+.encoder-knob.sel::after {
+  content: '';
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--sel);
+  box-shadow: 0 0 6px rgba(255, 180, 84, 0.9), 0 0 12px rgba(255, 180, 84, 0.5);
+  pointer-events: none;
+  z-index: 2;
 }
 
 /* ── OLED: metallic-gray surround + inner screen ─────────────────────────── */

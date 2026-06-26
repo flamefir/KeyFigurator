@@ -40,6 +40,7 @@ let selectedKeys = new Set();
 let keyLedColors  = Array.from({ length: 21 }, () => "#000000");
 let keyIconLabels = Array(21).fill("");   // optional per-key icon/emoji (max 2 chars)
 let isDragging = false;
+let dragStartPos = null;
 let activeProfileId = null;
 let dragSrcId = null;
 
@@ -593,6 +594,7 @@ function buildTooltipHTML(idx) {
 
 function showKeyTooltip(idx, el) {
   if (isDragging || oledAssigningBack) return;
+  if (selectedKeys.has(idx) && document.getElementById("key-pills").classList.contains("visible")) return;
   const tt = document.getElementById("key-tooltip");
   if (!tt) return;
 
@@ -616,6 +618,13 @@ function showKeyTooltip(idx, el) {
 
 function hideKeyTooltip() {
   document.getElementById("key-tooltip")?.classList.remove("visible");
+}
+
+function flashKey(idx) {
+  const el = document.getElementById("key-" + idx);
+  if (!el) return;
+  el.classList.add("sel-flash");
+  el.addEventListener("animationend", () => el.classList.remove("sel-flash"), { once: true });
 }
 
 function hexToRgbTriple(hex) {
@@ -1284,8 +1293,17 @@ async function init() {
     renderBoard();
   });
 
-  document.addEventListener("mouseup", () => { isDragging = false; });
-  window.addEventListener("blur", () => { isDragging = false; });
+  document.addEventListener("mousedown", (e) => {
+    dragStartPos = { x: e.clientX, y: e.clientY };
+  });
+  document.addEventListener("mousemove", (e) => {
+    if (!dragStartPos || isDragging) return;
+    const dx = e.clientX - dragStartPos.x;
+    const dy = e.clientY - dragStartPos.y;
+    if (dx * dx + dy * dy > 25) isDragging = true; // 5px threshold
+  });
+  document.addEventListener("mouseup", () => { isDragging = false; dragStartPos = null; });
+  window.addEventListener("blur", () => { isDragging = false; dragStartPos = null; });
 
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
@@ -1299,7 +1317,7 @@ async function init() {
 
   // ── Underglow ring click ───────────────────────────────────────────────────
   document.getElementById("board-ring").addEventListener("click", (e) => {
-    if (e.target.closest(".key, .encoder-knob, .oled-panel, .ug-corner")) return;
+    if (e.target.closest(".key, .encoder-knob, .oled-panel, .ug-corner, .board")) return;
     const isOpen = document.getElementById("underglow-pill").classList.contains("visible");
     if (isOpen) {
       closeUnderglowPill();
@@ -1466,9 +1484,10 @@ function renderBoard() {
 
   const oledPanel = document.createElement("div");
   oledPanel.className = "oled-panel";
-  oledPanel.title = "Click to open OLED designer";
+  oledPanel.title = "";
   const oledScreen = document.createElement("div");
   oledScreen.className = "oled-screen";
+  oledScreen.title = "Click to open OLED designer";
   renderOledScreenContent(oledScreen);
   oledPanel.appendChild(oledScreen);
   oledPanel.addEventListener("click", (e) => {
@@ -1494,6 +1513,7 @@ function renderBoard() {
 
       const enc = document.createElement("button");
       enc.id = "key-" + pos.idx;
+      enc.title = "";
       enc.className = "encoder-knob" + (isSel ? " sel" : "");
       enc.textContent = "◉";
       enc.addEventListener("mousedown", (e) => { e.preventDefault(); onKeyDown(pos.idx); });
@@ -1519,6 +1539,7 @@ function renderBoard() {
     } else {
       const k = document.createElement("button");
       k.id = "key-" + pos.idx;
+      k.title = "";
       const isEmpty = kc === "KC_NO" || kc === "KC_TRNS";
       const isCycleActive = oledSubMode === "keycycle" && pos.idx === oledKeyCycleIdx;
       const isBackKey     = pos.idx === oledBackKeyIdx;
@@ -1571,7 +1592,6 @@ function onKeyDown(idx) {
   hideKeyTooltip();
   lastKeyClickTime = performance.now();
   keyClickTimes[idx] = performance.now();
-  isDragging = true;
   selectedKeys.clear();
   selectedKeys.add(idx);
   loadKeyAnimState(idx);
@@ -1580,6 +1600,7 @@ function onKeyDown(idx) {
   syncKeyLedPill();
   renderBoard();
   openKeyLedPill();
+  flashKey(idx);
 }
 
 function onKeyEnter(idx) {
@@ -1588,6 +1609,7 @@ function onKeyEnter(idx) {
   selectedKeys.add(idx);
   syncKeyLedPill();
   renderBoard();
+  flashKey(idx);
 }
 
 function syncKeyLedPill() {
