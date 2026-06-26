@@ -39,7 +39,12 @@ let keymap = null;
 let selectedKeys = new Set();
 let keyLedColors  = Array.from({ length: 21 }, () => "#000000");
 let keyIconLabels = Array(21).fill("");   // optional per-key icon/emoji (max 2 chars)
+let keyIconImages = Array(21).fill(null); // optional per-key image data URL
+let keySelectionOrder = [];              // order in which keys were selected (for snake anim)
 let isDragging = false;
+let wasDragging = false;
+let dragFromKey = false;
+let clickStartedInKeyPill = false;
 let dragStartPos = null;
 let activeProfileId = null;
 let dragSrcId = null;
@@ -66,6 +71,7 @@ let klPalette     = [];
 let ugPalette     = [];
 
 const KL_PER_KEY  = "kf-kl-perkey";
+const KL_ICONS_KEY = "kf-kl-icons";
 const mkKeyAnim   = () => ({ animation: "solid", rate: 128, intensity: 180, palette: [] });
 let keyAnimStates = Array.from({ length: 21 }, mkKeyAnim);
 let encoderMode   = "layer"; // "layer" | "scroll"
@@ -99,7 +105,6 @@ let oledFlashKeys    = false;
 let oledFlashStart   = 0;
 
 let oledBackKeyIdx     = null;       // physical key index assigned as OLED back/escape; null = unassigned
-let oledAssigningBack  = false;      // true while waiting for the user to press a key to assign
 
 let oledCustomScreens = [];         // { id, type:"custom", title, imageDataUrl }
 let oledAnimFrame     = null;
@@ -119,13 +124,16 @@ const KC_CATEGORIES = [
 ];
 const KC_ALL_FLAT = KC_CATEGORIES.flatMap(c => c.keys);
 
+// noCycle: disables Cycle Colors palette when active
+// keyOnly: excluded from underglow chip list (selection-order anim)
 const ANIMATIONS = [
-  { id: "solid",    label: "Solid"    },
-  { id: "breathe",  label: "Breathe"  },
-  { id: "rainbow",  label: "Rainbow"  },
-  { id: "wave",     label: "Wave"     },
-  { id: "reactive", label: "Reactive" },
-  { id: "sparkle",  label: "Sparkle"  },
+  { id: "solid",    label: "Solid",    noCycle: true              },
+  { id: "rainbow",  label: "Rainbow",  noCycle: true              },
+  { id: "snake",    label: "Snake",    noCycle: true, keyOnly: true },
+  { id: "breathe",  label: "Breathe"                              },
+  { id: "wave",     label: "Wave"                                  },
+  { id: "reactive", label: "Reactive"                             },
+  { id: "sparkle",  label: "Sparkle"                              },
 ];
 
 // ── OLED helpers ──────────────────────────────────────────────────────────
@@ -459,9 +467,9 @@ function renderOledPillContent() {
           <label class="oled-upload-btn">Upload Image / GIF
             <input type="file" id="oled-img-upload" accept="image/*" style="display:none" />
           </label>
+          <span class="oled-img-notice">max 128×128</span>
           ${screen.imageDataUrl ? `<button class="oled-img-clear" id="oled-img-clear">✕</button>` : ""}
         </div>
-        <div class="oled-pill-hint">Max 128×128 px — larger images will be rejected.</div>
         <div class="oled-pill-section">
           <button class="oled-action-btn oled-del-screen" id="oled-del-screen">Delete Screen</button>
         </div>`;
@@ -492,28 +500,6 @@ function renderOledPillContent() {
       container.innerHTML = "";
   }
 
-  // ── Shared footer: back-key assignment ──────────────────────────────────
-  const footer = document.createElement("div");
-  footer.className = "oled-pill-section oled-back-row";
-  const backLabel = oledBackKeyIdx !== null ? `Key ${oledBackKeyIdx}` : "None";
-  const assignLabel = oledAssigningBack ? "Press a key…" : "Set";
-  footer.innerHTML = `
-    <span class="pill-label">BACK KEY</span>
-    <span class="oled-back-val">${backLabel}</span>
-    <button class="oled-action-btn oled-set-back" id="oled-set-back">${assignLabel}</button>
-    ${oledBackKeyIdx !== null ? `<button class="oled-action-btn oled-del-screen" id="oled-clear-back">Clear</button>` : ""}`;
-  container.appendChild(footer);
-
-  document.getElementById("oled-set-back")?.addEventListener("click", () => {
-    oledAssigningBack = !oledAssigningBack;
-    renderOledPillContent();
-  });
-  document.getElementById("oled-clear-back")?.addEventListener("click", () => {
-    oledBackKeyIdx = null;
-    oledAssigningBack = false;
-    localStorage.removeItem(OLED_BACK_KEY);
-    renderBoard(); renderOledPillContent();
-  });
 }
 
 function renderOledPill() {
@@ -584,6 +570,13 @@ function buildTooltipHTML(idx) {
     </div>`;
   }
 
+  if (oledBackKeyIdx === idx) {
+    html += `<div class="ktt-row">
+      <span class="ktt-label">ROLE</span>
+      <span class="ktt-val">OLED back / escape</span>
+    </div>`;
+  }
+
   html += `<div class="ktt-row">
     <span class="ktt-label">KEY</span>
     <span class="ktt-val ktt-muted">#${idx}</span>
@@ -593,7 +586,7 @@ function buildTooltipHTML(idx) {
 }
 
 function showKeyTooltip(idx, el) {
-  if (isDragging || oledAssigningBack) return;
+  if (isDragging) return;
   if (selectedKeys.has(idx) && document.getElementById("key-pills").classList.contains("visible")) return;
   const tt = document.getElementById("key-tooltip");
   if (!tt) return;
@@ -702,7 +695,7 @@ function renderAnimChips() {
   const container = document.getElementById("ug-anims");
   if (!container) return;
   container.innerHTML = "";
-  for (const anim of ANIMATIONS) {
+  for (const anim of ANIMATIONS.filter(a => !a.keyOnly)) {
     const chip = document.createElement("button");
     chip.className = "ug-anim-chip" + (ugAnimation === anim.id ? " active" : "");
     const preview = document.createElement("span");
@@ -721,7 +714,7 @@ function renderAnimChips() {
 }
 
 function updatePaletteDisabled() {
-  const off = klAnimation === "solid" || klAnimation === "rainbow";
+  const off = ANIMATIONS.find(a => a.id === klAnimation)?.noCycle ?? false;
   document.getElementById("kl-palette").classList.toggle("disabled", off);
 }
 
@@ -802,21 +795,28 @@ function renderKlAnimChips() {
   const container = document.getElementById("kl-anims");
   if (!container) return;
   container.innerHTML = "";
-  for (const anim of ANIMATIONS) {
-    const chip = document.createElement("button");
-    chip.className = "ug-anim-chip" + (klAnimation === anim.id ? " active" : "");
-    const preview = document.createElement("span");
-    preview.className = `ug-anim-preview ${anim.id}`;
-    chip.appendChild(preview);
-    chip.appendChild(document.createTextNode(anim.label));
-    chip.addEventListener("click", (e) => {
-      e.stopPropagation();
-      klAnimation = anim.id;
-      saveKlAdvancedState();
-      renderKlAnimChips();
-    });
-    container.appendChild(chip);
-  }
+  const makeRow = (anims) => {
+    const row = document.createElement("div");
+    row.className = "kl-anim-row";
+    for (const anim of anims) {
+      const chip = document.createElement("button");
+      chip.className = "ug-anim-chip" + (klAnimation === anim.id ? " active" : "");
+      const preview = document.createElement("span");
+      preview.className = `ug-anim-preview ${anim.id}`;
+      chip.appendChild(preview);
+      chip.appendChild(document.createTextNode(anim.label));
+      chip.addEventListener("click", (e) => {
+        e.stopPropagation();
+        klAnimation = anim.id;
+        saveKlAdvancedState();
+        renderKlAnimChips();
+      });
+      row.appendChild(chip);
+    }
+    return row;
+  };
+  container.appendChild(makeRow(ANIMATIONS.filter(a =>  a.noCycle)));
+  container.appendChild(makeRow(ANIMATIONS.filter(a => !a.noCycle)));
   updatePaletteDisabled();
 }
 
@@ -1034,6 +1034,22 @@ function computeKeyLedColor(idx, row, col, elapsed, isSel) {
       return { rgb: `${r},${g},${b}`, opacity: op };
     }
 
+    case "snake": {
+      if (!isSel || keySelectionOrder.length === 0) return null;
+      const N = keySelectionOrder.length;
+      const speed = 1.5 + (klRate / 255) * 8.5;
+      const tailLen = Math.max(2, Math.ceil(N * 0.5));
+      const headPos = Math.floor(elapsed * speed) % N;
+      const myPos = keySelectionOrder.indexOf(idx);
+      if (myPos === -1) return null;
+      const dist = (headPos - myPos + N) % N;
+      if (dist >= tailLen) return null;
+      const snakeIntensity = Math.pow(1 - dist / tailLen, 0.6);
+      const snakeCol = (ownColor && ownColor !== "#000000") ? ownColor : "#ffb454";
+      const { r: sr, g: sg, b: sb } = hexToRgb(snakeCol);
+      return { rgb: `${sr},${sg},${sb}`, opacity: maxOp * snakeIntensity };
+    }
+
     default: return null;
   }
 }
@@ -1201,8 +1217,10 @@ async function init() {
 
   // Always boot into the first saved layer
   const bootLayer = getSavedLayers()[0];
-  keymap       = structuredClone(bootLayer.keymap);
-  keyLedColors = [...bootLayer.leds];
+  keymap         = structuredClone(bootLayer.keymap);
+  keyLedColors   = [...bootLayer.leds];
+  keyIconLabels  = bootLayer.icons ? [...bootLayer.icons] : Array(21).fill("");
+  keyIconImages  = bootLayer.iconImages ? [...bootLayer.iconImages] : Array(21).fill(null);
   activeProfileId = bootLayer.id;
   await invoke("set_keymap", { map: keymap });
 
@@ -1295,18 +1313,21 @@ async function init() {
 
   document.addEventListener("mousedown", (e) => {
     dragStartPos = { x: e.clientX, y: e.clientY };
+    dragFromKey  = !!e.target.closest(".key, .encoder-knob");
+    clickStartedInKeyPill = !!e.target.closest("#key-pills");
   });
   document.addEventListener("mousemove", (e) => {
-    if (!dragStartPos || isDragging) return;
+    if (!dragStartPos || isDragging || !dragFromKey) return;
     const dx = e.clientX - dragStartPos.x;
     const dy = e.clientY - dragStartPos.y;
     if (dx * dx + dy * dy > 25) isDragging = true; // 5px threshold
   });
-  document.addEventListener("mouseup", () => { isDragging = false; dragStartPos = null; });
-  window.addEventListener("blur", () => { isDragging = false; dragStartPos = null; });
+  document.addEventListener("mouseup", () => { wasDragging = isDragging; isDragging = false; dragStartPos = null; dragFromKey = false; });
+  window.addEventListener("blur", () => { wasDragging = false; isDragging = false; dragStartPos = null; dragFromKey = false; });
 
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
+      keySelectionOrder = [];
       selectedKeys.clear();
       closeKeyLedPill();
       closeUnderglowPill();
@@ -1328,9 +1349,12 @@ async function init() {
 
   // ── Close pills when clicking outside board-ring / pill ──────────────────
   document.addEventListener("click", (e) => {
+    if (wasDragging) { wasDragging = false; return; }
+    if (clickStartedInKeyPill) { clickStartedInKeyPill = false; return; }
     if (e.target.closest("#board-ring, #underglow-pill, #key-pills, #oled-pill")) return;
     closeUnderglowPill();
     if (document.getElementById("key-pills").classList.contains("visible")) {
+      keySelectionOrder = [];
       selectedKeys.clear();
       closeKeyLedPill();
       renderBoard();
@@ -1391,7 +1415,11 @@ async function init() {
     adv.classList.toggle("open", opening);
     btn.classList.toggle("open", opening);
     arrow.textContent = opening ? "▾" : "▸";
-    if (opening) { renderKcPalette(); await renderHostBindings(); }
+    if (opening) {
+      renderKcPalette();
+      await renderHostBindings();
+      if (selectedKeys.size === 1) updateIconPreview([...selectedKeys][0]);
+    }
   });
 
   document.getElementById("kc-search").addEventListener("input", (e) => renderKcPalette(e.target.value));
@@ -1416,6 +1444,22 @@ async function init() {
     arrow.textContent = opening ? "▾" : "▸";
   });
 
+  // ── Back key assignment ───────────────────────────────────────────────────
+  document.getElementById("kc-back-assign").addEventListener("click", () => {
+    const [idx] = selectedKeys;
+    if (idx === undefined) return;
+    oledBackKeyIdx = idx;
+    localStorage.setItem(OLED_BACK_KEY, String(idx));
+    updateBackKeyRow();
+    renderBoard();
+  });
+  document.getElementById("kc-back-clear").addEventListener("click", () => {
+    oledBackKeyIdx = null;
+    localStorage.removeItem(OLED_BACK_KEY);
+    updateBackKeyRow();
+    renderBoard();
+  });
+
   // ── Animation rate + intensity ────────────────────────────────────────────
   document.getElementById("ug-rate").addEventListener("input", (e) => {
     ugRate = Number(e.target.value); saveAdvancedState();
@@ -1429,9 +1473,6 @@ async function init() {
   });
 
   document.getElementById("kl-color").addEventListener("input", (e) => {
-    klAnimation = "solid";
-    saveKlAdvancedState();
-    renderKlAnimChips();
     for (const idx of selectedKeys) keyLedColors[idx] = e.target.value;
     renderBoard();
   });
@@ -1447,7 +1488,33 @@ async function init() {
   document.getElementById("kl-icon").addEventListener("input", (e) => {
     const val = [...e.target.value].slice(0, 2).join(""); // safe emoji-aware slice
     e.target.value = val;
-    for (const idx of selectedKeys) keyIconLabels[idx] = val;
+    for (const idx of selectedKeys) {
+      keyIconLabels[idx] = val;
+      if (val) keyIconImages[idx] = null; // text replaces image
+    }
+    if (selectedKeys.size === 1) updateIconPreview([...selectedKeys][0]);
+    renderBoard();
+  });
+
+  document.getElementById("kl-icon-file")?.addEventListener("change", async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const url = await readFileAsDataUrl(file);
+    const ok  = await checkImageSize(url);
+    if (!ok) { alert("Image must be 128×128 pixels or smaller."); e.target.value = ""; return; }
+    for (const idx of selectedKeys) {
+      keyIconImages[idx] = url;
+      keyIconLabels[idx] = "";
+    }
+    document.getElementById("kl-icon").value = "";
+    if (selectedKeys.size === 1) updateIconPreview([...selectedKeys][0]);
+    renderBoard();
+    e.target.value = "";
+  });
+
+  document.getElementById("kc-icon-clear")?.addEventListener("click", () => {
+    for (const idx of selectedKeys) keyIconImages[idx] = null;
+    if (selectedKeys.size === 1) updateIconPreview([...selectedKeys][0]);
     renderBoard();
   });
 
@@ -1543,16 +1610,22 @@ function renderBoard() {
       const isEmpty = kc === "KC_NO" || kc === "KC_TRNS";
       const isCycleActive = oledSubMode === "keycycle" && pos.idx === oledKeyCycleIdx;
       const isBackKey     = pos.idx === oledBackKeyIdx;
-      const isAssigning   = oledAssigningBack;
       k.className = "key"
         + (isSel ? " sel" : "")
         + (isEmpty ? " empty" : "")
         + (isCycleActive ? " oled-key-active" : "")
-        + (isBackKey && !isAssigning ? " oled-back-key" : "")
-        + (isAssigning ? " oled-assigning" : "");
+        + (isBackKey ? " oled-back-key" : "");
       k.style.cssText = `grid-row:${pos.row};grid-column:${pos.col}`;
       const icon = keyIconLabels[pos.idx];
-      k.textContent = icon || (isEmpty ? "·" : kc.replace(/^KC_/, ""));
+      const imgSrc = keyIconImages[pos.idx];
+      if (imgSrc) {
+        const imgEl = document.createElement("img");
+        imgEl.src = imgSrc;
+        imgEl.className = "key-icon-img";
+        k.appendChild(imgEl);
+      } else {
+        k.textContent = icon || (isEmpty ? "·" : kc.replace(/^KC_/, ""));
+      }
       k.addEventListener("mousedown", (e) => { e.preventDefault(); onKeyDown(pos.idx); });
       k.addEventListener("mouseenter", (e) => { onKeyEnter(pos.idx); showKeyTooltip(pos.idx, e.currentTarget); });
       k.addEventListener("mouseleave", hideKeyTooltip);
@@ -1570,16 +1643,6 @@ function flashBoard() {
 }
 
 function onKeyDown(idx) {
-  // Back-key assignment mode — next press sets the key, no LED selection.
-  if (oledAssigningBack) {
-    oledBackKeyIdx = idx;
-    oledAssigningBack = false;
-    localStorage.setItem(OLED_BACK_KEY, String(idx));
-    renderBoard();
-    if (document.getElementById("oled-pill").classList.contains("visible")) renderOledPill();
-    return;
-  }
-
   // Back key pressed while in OLED sub-mode — exit to nav without touching LED selection.
   if (oledBackKeyIdx === idx && oledSubMode !== "nav") {
     oledSubMode = "nav";
@@ -1592,6 +1655,7 @@ function onKeyDown(idx) {
   hideKeyTooltip();
   lastKeyClickTime = performance.now();
   keyClickTimes[idx] = performance.now();
+  keySelectionOrder = [idx];
   selectedKeys.clear();
   selectedKeys.add(idx);
   loadKeyAnimState(idx);
@@ -1607,9 +1671,24 @@ function onKeyEnter(idx) {
   if (!isDragging) return;
   if (selectedKeys.has(idx)) return; // already selected — skip re-render to avoid cascade
   selectedKeys.add(idx);
+  keySelectionOrder.push(idx);
   syncKeyLedPill();
   renderBoard();
   flashKey(idx);
+}
+
+function updateBackKeyRow() {
+  const row = document.getElementById("kc-back-row");
+  if (!row) return;
+  const n = selectedKeys.size;
+  const single = n === 1 && !selectedKeys.has(ENCODER_IDX);
+  document.getElementById("kc-layer-events").style.display = single ? "" : "none";
+  if (!single) return;
+  const [idx] = selectedKeys;
+  const isBack = oledBackKeyIdx === idx;
+  document.getElementById("kc-back-val").textContent = isBack ? `Key ${idx}` : "—";
+  document.getElementById("kc-back-assign").style.display = isBack ? "none" : "";
+  document.getElementById("kc-back-clear").style.display  = isBack ? "" : "none";
 }
 
 function syncKeyLedPill() {
@@ -1624,13 +1703,27 @@ function syncKeyLedPill() {
     document.getElementById("kl-icon").value = keyIconLabels[idx] || "";
     const col = keyLedColors[idx];
     document.getElementById("kl-color").value = col || "#000000";
+    updateIconPreview(idx);
   } else {
     document.getElementById("kl-kc").value   = "";
     document.getElementById("kl-icon").value = "";
     const colors = [...selectedKeys].map(i => keyLedColors[i]).filter(c => c && c !== "#000000");
     document.getElementById("kl-color").value =
       (colors.length && colors.every(c => c === colors[0])) ? colors[0] : "#000000";
+    updateIconPreview(null);
   }
+  updateBackKeyRow();
+}
+
+function updateIconPreview(idx) {
+  const wrap = document.getElementById("kc-icon-thumb-wrap");
+  const thumb = document.getElementById("kc-icon-thumb");
+  const clearBtn = document.getElementById("kc-icon-clear");
+  if (!wrap) return;
+  const src = (idx !== null && idx !== undefined) ? keyIconImages[idx] : null;
+  wrap.style.display = src ? "" : "none";
+  if (thumb) thumb.src = src || "";
+  if (clearBtn) clearBtn.style.display = src ? "" : "none";
 }
 
 // ── Saved Layers storage ───────────────────────────────────────────────────
@@ -1644,7 +1737,7 @@ function getSavedLayers() {
 function saveCurrentAsLayer(name) {
   const layers = getSavedLayers();
   const id = Date.now().toString();
-  layers.push({ id, name, keymap: structuredClone(keymap), leds: [...keyLedColors], icons: [...keyIconLabels] });
+  layers.push({ id, name, keymap: structuredClone(keymap), leds: [...keyLedColors], icons: [...keyIconLabels], iconImages: [...keyIconImages] });
   localStorage.setItem(LAYERS_KEY, JSON.stringify(layers));
   activeProfileId = id;
 }
@@ -1700,7 +1793,8 @@ function importLayer(file) {
         name: data.name || "Imported",
         keymap: data.keymap,
         leds:   data.leds,
-        icons:  data.icons || Array(21).fill(""),
+        icons:      data.icons || Array(21).fill(""),
+        iconImages: data.iconImages || Array(21).fill(null),
       });
       localStorage.setItem(LAYERS_KEY, JSON.stringify(layers));
       renderSavedLayers();
@@ -1727,7 +1821,9 @@ async function switchToLayer(id) {
   keymap = structuredClone(layer.keymap);
   keyLedColors   = [...layer.leds];
   keyIconLabels  = layer.icons ? [...layer.icons] : Array(21).fill("");
+  keyIconImages  = layer.iconImages ? [...layer.iconImages] : Array(21).fill(null);
   activeProfileId = id;
+  keySelectionOrder = [];
   selectedKeys.clear();
   closeKeyLedPill();
   renderBoard();
@@ -1747,7 +1843,9 @@ async function switchToLayer(id) {
 function switchToBlankLayer() {
   keymap = { layers: Array.from({ length: 4 }, () => ({ keys: Array(21).fill("KC_NO") })) };
   keyLedColors = Array.from({ length: 21 }, () => "#000000");
+  keyIconImages = Array(21).fill(null);
   activeProfileId = null;
+  keySelectionOrder = [];
   selectedKeys.clear();
   closeKeyLedPill();
   renderBoard();
@@ -1871,6 +1969,7 @@ function openOledPill()    { document.getElementById("oled-pill").classList.add(
 function closeOledPill()   { document.getElementById("oled-pill").classList.remove("visible"); }
 
 function openUnderglowPill() {
+  keySelectionOrder = [];
   selectedKeys.clear();
   closeKeyLedPill();
   closeOledPill();

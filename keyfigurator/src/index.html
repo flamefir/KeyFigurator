@@ -104,7 +104,7 @@
             <button class="ug-adv-btn" id="kl-adv-btn">Advanced <span id="kl-adv-arrow">▸</span></button>
           </div>
           <div class="ug-advanced" id="kl-advanced">
-            <div class="ug-anims" id="kl-anims"></div>
+            <div class="kl-anims" id="kl-anims"></div>
             <div class="ug-sliders">
               <label class="ug-slider-row">
                 <span class="pill-label">RATE</span>
@@ -115,6 +115,7 @@
                 <input type="range" id="kl-intensity" min="0" max="255" value="180" />
               </label>
             </div>
+            <span class="pill-label" style="font-size:9px;letter-spacing:0.1em;padding:4px 0 0">CYCLE COLORS</span>
             <div class="palette-row" id="kl-palette"></div>
             <div class="encoder-section" id="encoder-section">
               <span class="pill-label" style="font-size:10px;letter-spacing:0.1em">ENCODER ROTATION</span>
@@ -129,14 +130,36 @@
           <div class="ug-main-row">
             <span class="pill-label">KEYCODE</span>
             <input type="text" id="kl-kc" class="pill-kc" placeholder="KC_A · MO(1) · HOST(0)…" />
-            <input type="text" id="kl-icon" class="pill-icon" placeholder="⌘" maxlength="2"
-              title="Optional icon shown on keycap (emoji or 2-char label)" />
             <button class="ug-adv-btn" id="kc-adv-btn">Advanced <span id="kc-adv-arrow">▸</span></button>
           </div>
           <div class="ug-advanced" id="kc-advanced">
+            <div class="kc-icon-wrap">
+              <div class="kc-icon-row">
+                <span class="pill-label">ICON</span>
+                <input type="text" id="kl-icon" class="pill-icon" placeholder="⌘" maxlength="2" />
+                <label class="kc-icon-upload-btn">
+                  Upload GIF / PNG
+                  <input type="file" id="kl-icon-file" accept="image/*" style="display:none" />
+                </label>
+                <span class="kc-icon-notice">max 128×128</span>
+                <button class="kc-icon-clear" id="kc-icon-clear" style="display:none">✕</button>
+              </div>
+              <div class="kc-icon-thumb-wrap" id="kc-icon-thumb-wrap" style="display:none">
+                <img class="kc-icon-thumb" id="kc-icon-thumb" src="" alt="" />
+              </div>
+            </div>
             <div class="kc-palette-wrap">
               <input id="kc-search" class="kc-search" placeholder="Search keycodes…" />
               <div id="kc-palette-list" class="kc-palette-list"></div>
+            </div>
+            <div class="kc-layer-events" id="kc-layer-events">
+              <span class="pill-label">LAYER EVENTS</span>
+              <div class="kc-back-row" id="kc-back-row">
+                <span class="kc-back-label">Back key</span>
+                <span class="kc-back-val" id="kc-back-val">—</span>
+                <button class="oled-action-btn" id="kc-back-assign">Set</button>
+                <button class="oled-action-btn oled-del-screen" id="kc-back-clear" style="display:none">Clear</button>
+              </div>
             </div>
             <div class="hb-header">
               <span class="pill-label">HOST BINDINGS</span>

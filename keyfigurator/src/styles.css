@@ -493,7 +493,9 @@ header {
 .enc-opt:hover { border-color: rgba(255,255,255,0.3); color: var(--text); }
 .enc-opt.active { border-color: var(--accent); color: var(--accent); }
 
-.ug-anims { display: flex; gap: 8px; flex-wrap: wrap; }
+.ug-anims  { display: flex; gap: 8px; flex-wrap: wrap; }
+.kl-anims  { display: flex; flex-direction: column; gap: 6px; }
+.kl-anim-row { display: flex; flex-wrap: wrap; gap: 6px; }
 
 .ug-anim-chip {
   display: flex;
@@ -526,12 +528,14 @@ header {
 .ug-anim-preview.wave     { animation: anim-wave     1.8s ease-in-out infinite; overflow: hidden; }
 .ug-anim-preview.reactive { animation: anim-reactive 1.4s ease-out    infinite; }
 .ug-anim-preview.sparkle  { animation: anim-sparkle  2s   ease-in-out infinite; }
+.ug-anim-preview.snake    { animation: anim-snake    1.6s linear      infinite; background-size: 200% 100%; background-image: linear-gradient(90deg, transparent 0%, rgba(var(--ug-color),1) 40%, rgba(var(--ug-color),1) 60%, transparent 100%); }
 
 @keyframes anim-breathe  { 0%,100%{opacity:.2} 50%{opacity:1} }
 @keyframes anim-rainbow  { from{filter:hue-rotate(0deg)} to{filter:hue-rotate(360deg)} }
 @keyframes anim-wave     { 0%,100%{opacity:.15;transform:scaleX(.1)} 50%{opacity:1;transform:scaleX(1)} }
 @keyframes anim-reactive { 0%,100%{opacity:.1} 6%{opacity:1} 20%{opacity:.1} }
 @keyframes anim-sparkle  { 0%,100%{opacity:.1} 18%{opacity:.9} 38%{opacity:.15} 62%{opacity:.85} 80%{opacity:.2} }
+@keyframes anim-snake    { from{background-position:200% 0} to{background-position:-200% 0} }
 
 .ug-sliders { display: flex; flex-direction: column; gap: 8px; }
 .ug-slider-row {
@@ -857,6 +861,12 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 50%; }
 }
 .kc-chip:hover { border-color: var(--sel); color: var(--sel); }
 .kc-no-results { color: var(--muted); font-size: 11px; padding: 4px 0; }
+
+/* ── Layer Events (Keycode pill) ─────────────────────────────────────────── */
+.kc-layer-events { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; }
+.kc-back-row { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
+.kc-back-label { color: var(--muted); font-size: 11px; min-width: 56px; }
+.kc-back-val { color: var(--sel); font-family: monospace; font-size: 12px; min-width: 40px; }
 
 /* ── Host Bindings editor ────────────────────────────────────────────────── */
 .hb-header { display: flex; flex-direction: column; gap: 2px; margin-bottom: 6px; }
@@ -1381,4 +1391,81 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 50%; }
   border-radius: 50%;
   border: 1px solid rgba(255,255,255,0.22);
   flex-shrink: 0;
+}
+
+/* ── Key icon image (shown on keycap when image is uploaded) ─────────────── */
+.key-icon-img {
+  max-width: 38px;
+  max-height: 38px;
+  object-fit: contain;
+  pointer-events: none;
+  border-radius: 3px;
+}
+
+/* ── Icon upload section (inside kc-advanced) ────────────────────────────── */
+.kc-icon-wrap {
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 8px;
+  margin-bottom: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.kc-icon-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.kc-icon-upload-btn {
+  background: none;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--muted);
+  font-size: 11px;
+  padding: 4px 10px;
+  cursor: pointer;
+  transition: border-color 0.12s, color 0.12s;
+  white-space: nowrap;
+}
+.kc-icon-upload-btn:hover { border-color: var(--sel); color: var(--sel); }
+.kc-icon-notice {
+  font-size: 10px;
+  color: var(--muted);
+  opacity: 0.6;
+  white-space: nowrap;
+}
+.kc-icon-clear {
+  background: none;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  color: var(--muted);
+  width: 22px;
+  height: 22px;
+  cursor: pointer;
+  font-size: 11px;
+  flex-shrink: 0;
+  transition: border-color 0.12s, color 0.12s;
+}
+.kc-icon-clear:hover { border-color: #c23b3b; color: #c23b3b; }
+.kc-icon-thumb-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+}
+.kc-icon-thumb {
+  max-width: 48px;
+  max-height: 48px;
+  object-fit: contain;
+  border-radius: 4px;
+  border: 1px solid var(--line);
+}
+
+/* ── Compact OLED image notice ───────────────────────────────────────────── */
+.oled-img-notice {
+  font-size: 10px;
+  color: var(--muted);
+  opacity: 0.6;
+  white-space: nowrap;
 }
