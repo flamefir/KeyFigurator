@@ -62,6 +62,10 @@ let klIntensity   = 180;
 
 let klPalette     = [];
 let ugPalette     = [];
+
+const KL_PER_KEY  = "kf-kl-perkey";
+const mkKeyAnim   = () => ({ animation: "solid", rate: 128, intensity: 180, palette: [] });
+let keyAnimStates = Array.from({ length: 21 }, mkKeyAnim);
 let encoderMode   = "layer"; // "layer" | "scroll"
 
 // ── OLED state ────────────────────────────────────────────────────────────
@@ -576,6 +580,29 @@ function saveKlAdvancedState() {
   localStorage.setItem(KL_ADVANCED_KEY, JSON.stringify({
     animation: klAnimation, rate: klRate, intensity: klIntensity,
   }));
+  saveCurrentKeyAnimState();
+}
+
+function saveCurrentKeyAnimState() {
+  for (const idx of selectedKeys) {
+    keyAnimStates[idx] = { animation: klAnimation, rate: klRate, intensity: klIntensity, palette: [...klPalette] };
+  }
+  localStorage.setItem(KL_PER_KEY, JSON.stringify(keyAnimStates));
+}
+
+function loadKeyAnimState(idx) {
+  const s = keyAnimStates[idx] ?? mkKeyAnim();
+  klAnimation = s.animation;
+  klRate      = s.rate;
+  klIntensity = s.intensity;
+  klPalette   = [...s.palette];
+  const rateEl = document.getElementById("kl-rate");
+  const intEl  = document.getElementById("kl-intensity");
+  if (rateEl) rateEl.value = klRate;
+  if (intEl)  intEl.value  = klIntensity;
+  renderKlAnimChips();
+  updatePaletteDisabled();
+  renderPalette("kl-palette", klPalette, KL_PALETTE_KEY, saveCurrentKeyAnimState);
 }
 
 function renderAnimChips() {
@@ -1033,7 +1060,13 @@ async function init() {
 
   const savedKlPalette = localStorage.getItem(KL_PALETTE_KEY);
   if (savedKlPalette) try { klPalette = JSON.parse(savedKlPalette); } catch {}
-  renderPalette("kl-palette", klPalette, KL_PALETTE_KEY, () => {});
+  renderPalette("kl-palette", klPalette, KL_PALETTE_KEY, saveCurrentKeyAnimState);
+
+  const savedPerKey = localStorage.getItem(KL_PER_KEY);
+  if (savedPerKey) try {
+    const loaded = JSON.parse(savedPerKey);
+    if (Array.isArray(loaded) && loaded.length === 21) keyAnimStates = loaded;
+  } catch {}
 
   const savedUgPalette = localStorage.getItem(UG_PALETTE_KEY);
   if (savedUgPalette) try { ugPalette = JSON.parse(savedUgPalette); } catch {}
@@ -1414,6 +1447,7 @@ function onKeyDown(idx) {
   isDragging = true;
   selectedKeys.clear();
   selectedKeys.add(idx);
+  loadKeyAnimState(idx);
   closeUnderglowPill();
   closeOledPill();
   syncKeyLedPill();
