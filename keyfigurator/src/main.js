@@ -37,7 +37,8 @@ const BOARD_POSITIONS = [
 
 let keymap = null;
 let selectedKeys = new Set();
-let keyLedColors = Array.from({ length: 21 }, () => "#000000");
+let keyLedColors  = Array.from({ length: 21 }, () => "#000000");
+let keyIconLabels = Array(21).fill("");   // optional per-key icon/emoji (max 2 chars)
 let isDragging = false;
 let activeProfileId = null;
 let dragSrcId = null;
@@ -175,8 +176,10 @@ function renderOledScreenContent(screenEl) {
       if (oledSubMode === "keycycle") {
         const kc   = keymap?.layers[0]?.keys[oledKeyCycleIdx] ?? "KC_NO";
         const disp = kc.replace(/^KC_/, "");
+        const icon = keyIconLabels[oledKeyCycleIdx] || "";
         screenEl.innerHTML = `<div class="oled-keycycle">
           <div class="oled-kc-num">${String(oledKeyCycleIdx + 1).padStart(2,"0")}</div>
+          ${icon ? `<div class="oled-kc-icon">${icon}</div>` : ""}
           <div class="oled-kc-val">${disp}</div>
         </div>`;
       } else {
@@ -1308,6 +1311,13 @@ async function init() {
     }
   });
 
+  document.getElementById("kl-icon").addEventListener("input", (e) => {
+    const val = [...e.target.value].slice(0, 2).join(""); // safe emoji-aware slice
+    e.target.value = val;
+    for (const idx of selectedKeys) keyIconLabels[idx] = val;
+    renderBoard();
+  });
+
   // ── OLED pill controls ────────────────────────────────────────────────────
   document.getElementById("oled-nav-prev").addEventListener("click", (e) => {
     e.stopPropagation(); oledScreenNav(-1); renderOledPill();
@@ -1405,8 +1415,9 @@ function renderBoard() {
         + (isBackKey && !isAssigning ? " oled-back-key" : "")
         + (isAssigning ? " oled-assigning" : "");
       k.style.cssText = `grid-row:${pos.row};grid-column:${pos.col}`;
-      k.textContent = isEmpty ? "·" : kc.replace(/^KC_/, "");
-      k.title = `Key ${pos.idx}: ${kc} · Click / drag to select · Selection opens LED settings`;
+      const icon = keyIconLabels[pos.idx];
+      k.textContent = icon || (isEmpty ? "·" : kc.replace(/^KC_/, ""));
+      k.title = `Key ${pos.idx}: ${kc}${icon ? ` [${icon}]` : ""} · Click / drag to select · Selection opens LED settings`;
       k.addEventListener("mousedown", (e) => { e.preventDefault(); onKeyDown(pos.idx); });
       k.addEventListener("mouseenter", () => onKeyEnter(pos.idx));
       el.appendChild(k);
@@ -1470,11 +1481,13 @@ function syncKeyLedPill() {
   if (n === 1) {
     const [idx] = selectedKeys;
     const kc = keymap.layers[0].keys[idx] ?? "KC_NO";
-    document.getElementById("kl-kc").value = kc === "KC_NO" ? "" : kc;
+    document.getElementById("kl-kc").value   = kc === "KC_NO" ? "" : kc;
+    document.getElementById("kl-icon").value = keyIconLabels[idx] || "";
     const col = keyLedColors[idx];
     document.getElementById("kl-color").value = col || "#000000";
   } else {
-    document.getElementById("kl-kc").value = "";
+    document.getElementById("kl-kc").value   = "";
+    document.getElementById("kl-icon").value = "";
     const colors = [...selectedKeys].map(i => keyLedColors[i]).filter(c => c && c !== "#000000");
     document.getElementById("kl-color").value =
       (colors.length && colors.every(c => c === colors[0])) ? colors[0] : "#000000";
@@ -1492,7 +1505,7 @@ function getSavedLayers() {
 function saveCurrentAsLayer(name) {
   const layers = getSavedLayers();
   const id = Date.now().toString();
-  layers.push({ id, name, keymap: structuredClone(keymap), leds: [...keyLedColors] });
+  layers.push({ id, name, keymap: structuredClone(keymap), leds: [...keyLedColors], icons: [...keyIconLabels] });
   localStorage.setItem(LAYERS_KEY, JSON.stringify(layers));
   activeProfileId = id;
 }
@@ -1538,7 +1551,8 @@ async function switchToLayer(id) {
   const layer = getSavedLayers().find(l => l.id === id);
   if (!layer) return;
   keymap = structuredClone(layer.keymap);
-  keyLedColors = [...layer.leds];
+  keyLedColors   = [...layer.leds];
+  keyIconLabels  = layer.icons ? [...layer.icons] : Array(21).fill("");
   activeProfileId = id;
   selectedKeys.clear();
   closeKeyLedPill();

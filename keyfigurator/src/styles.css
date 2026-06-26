@@ -749,6 +749,19 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 50%; }
 }
 .pill-kc:focus { outline: none; border-color: var(--muted); }
 
+.pill-icon {
+  width: 40px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  color: var(--txt);
+  padding: 5px 6px;
+  border-radius: 8px;
+  font-size: 14px;
+  text-align: center;
+  flex-shrink: 0;
+}
+.pill-icon:focus { outline: none; border-color: var(--muted); }
+
 /* ── Saved Boards — breathing orange pill + hover dropdown ───────────────── */
 .saved-boards-wrap {
   margin-left: auto;
@@ -1111,6 +1124,11 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 50%; }
   font-family: 'Courier New', monospace; font-size: 18px; font-weight: bold;
   text-shadow: 0 0 6px rgba(255,180,84,.9);
   max-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: center;
+}
+.oled-kc-icon {
+  font-size: 22px;
+  line-height: 1;
+  filter: drop-shadow(0 0 4px rgba(255,180,84,0.7));
 }
 
 .oled-timer-screen, .oled-countdown-screen {
