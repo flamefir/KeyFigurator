@@ -1039,6 +1039,7 @@ async function init() {
   });
 
   const connected = await invoke("is_connected");
+  _wasConnected   = connected;
   const connPill = document.getElementById("conn");
   connPill.textContent = connected ? "● connected (mock)" : "○ no device";
   connPill.classList.toggle("ok", connected);
@@ -1768,4 +1769,34 @@ function closeUnderglowPill() {
   document.getElementById("ug-adv-arrow").textContent = "▸";
 }
 
-init();
+async function applyActiveProfileToBoard() {
+  if (!keymap || !activeProfileId) return;
+  const colors = keyLedColors.map(hex => {
+    const { r, g, b } = hexToRgb(hex || "#000000");
+    return { r, g, b };
+  });
+  await invoke("set_keymap", { map: keymap });
+  await invoke("set_leds", { leds: { colors } });
+}
+
+let _wasConnected = false;
+
+async function pollConnection() {
+  try {
+    const connected = await invoke("is_connected");
+    const connPill  = document.getElementById("conn");
+    if (connPill) {
+      connPill.textContent = connected ? "● connected" : "○ no device";
+      connPill.classList.toggle("ok", connected);
+    }
+    if (connected && !_wasConnected) {
+      await applyActiveProfileToBoard();
+    }
+    _wasConnected = connected;
+  } catch {}
+}
+
+init().then(() => {
+  _wasConnected = true; // init already applied the profile; don't re-push on first poll
+  setInterval(pollConnection, 3000);
+});
