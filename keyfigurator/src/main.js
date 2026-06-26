@@ -1279,6 +1279,7 @@ function renderBoard() {
 
   const oledPanel = document.createElement("div");
   oledPanel.className = "oled-panel";
+  oledPanel.title = "Click to open OLED designer";
   const oledScreen = document.createElement("div");
   oledScreen.className = "oled-screen";
   renderOledScreenContent(oledScreen);
@@ -1308,6 +1309,7 @@ function renderBoard() {
       enc.id = "key-" + pos.idx;
       enc.className = "encoder-knob" + (isSel ? " sel" : "");
       enc.textContent = "◉";
+      enc.title = "Click to select encoder LED · ↻/↺ to rotate · OLED ↓ Press to enter screen sub-mode";
       enc.addEventListener("mousedown", (e) => { e.preventDefault(); onKeyDown(pos.idx); });
       enc.addEventListener("mouseenter", () => onKeyEnter(pos.idx));
       encWrap.appendChild(enc);
@@ -1335,6 +1337,7 @@ function renderBoard() {
       k.className = "key" + (isSel ? " sel" : "") + (isEmpty ? " empty" : "") + (isCycleActive ? " oled-key-active" : "");
       k.style.cssText = `grid-row:${pos.row};grid-column:${pos.col}`;
       k.textContent = isEmpty ? "·" : kc.replace(/^KC_/, "");
+      k.title = `Key ${pos.idx}: ${kc} · Click / drag to select · Selection opens LED settings`;
       k.addEventListener("mousedown", (e) => { e.preventDefault(); onKeyDown(pos.idx); });
       k.addEventListener("mouseenter", () => onKeyEnter(pos.idx));
       el.appendChild(k);

@@ -38,7 +38,7 @@
     </header>
 
     <div class="board-wrap">
-      <div class="board-ring" id="board-ring">
+      <div class="board-ring" id="board-ring" title="Click anywhere on the ring to open Underglow settings">
         <div class="board" id="board"></div>
         <!-- Corner underglow LED pickers (one per corner) -->
         <div class="ug-corner ug-tl" id="ug-c0" title="Top-left LED"><span class="ug-dot"></span><input type="color" class="ug-corner-inp" value="#ff6e14" /></div>
@@ -134,11 +134,11 @@
       <div class="oled-pill" id="oled-pill">
         <div class="oled-pill-nav">
           <span class="pill-label">OLED</span>
-          <button class="oled-nav-btn" id="oled-nav-prev">‹</button>
+          <button class="oled-nav-btn" id="oled-nav-prev" title="Previous screen">‹</button>
           <span class="oled-screen-name-wrap"><span id="oled-screen-name">—</span></span>
-          <button class="oled-nav-btn" id="oled-nav-next">›</button>
-          <button class="oled-enc-press" id="oled-enc-press">↓ Press</button>
-          <button class="oled-add-screen" id="oled-add-screen">+ Screen</button>
+          <button class="oled-nav-btn" id="oled-nav-next" title="Next screen">›</button>
+          <button class="oled-enc-press" id="oled-enc-press" title="Simulate encoder press — enters/exits sub-mode for current screen">↓ Press</button>
+          <button class="oled-add-screen" id="oled-add-screen" title="Add a custom text or image screen">+ Screen</button>
         </div>
         <div class="oled-pill-content" id="oled-pill-content"></div>
       </div>
