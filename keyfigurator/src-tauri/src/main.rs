@@ -58,6 +58,16 @@ fn set_leds(state: State<AppState>, leds: LedState) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn eeprom_commit(state: State<AppState>) -> Result<(), String> {
+    state
+        .transport
+        .lock()
+        .unwrap()
+        .eeprom_commit()
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn get_bindings(state: State<AppState>) -> Vec<HostBinding> {
     state.bindings.lock().unwrap().clone()
 }
@@ -106,6 +116,7 @@ fn main() {
             get_keymap,
             set_keymap,
             set_leds,
+            eeprom_commit,
             get_bindings,
             set_bindings,
             run_binding,

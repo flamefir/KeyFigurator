@@ -21,7 +21,8 @@ pub enum Cmd {
     GetKeymap = 0x10,
     SetKeymap = 0x11,
     SetLeds = 0x20,
-    RunHostCmd = 0x30, // board -> host: "run this bound command" (git, shell, ...)
+    RunHostCmd = 0x30,   // board -> host: "run this bound command" (git, shell, ...)
+    EepromCommit = 0x40, // host -> board: persist RAM state to EEPROM
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -39,6 +40,7 @@ pub trait HidTransport: Send + Sync {
     fn get_keymap(&mut self) -> Result<KeyMap, HidError>;
     fn set_keymap(&mut self, map: &KeyMap) -> Result<(), HidError>;
     fn set_leds(&mut self, leds: &LedState) -> Result<(), HidError>;
+    fn eeprom_commit(&mut self) -> Result<(), HidError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -83,6 +85,9 @@ impl HidTransport for MockHid {
         self.leds = leds.clone();
         Ok(())
     }
+    fn eeprom_commit(&mut self) -> Result<(), HidError> {
+        Ok(()) // mock: already in EEPROM (there is no real EEPROM)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -123,6 +128,10 @@ impl HidTransport for RealHid {
         Err(HidError::NotConnected)
     }
     fn set_leds(&mut self, _leds: &LedState) -> Result<(), HidError> {
+        Err(HidError::NotConnected)
+    }
+    fn eeprom_commit(&mut self) -> Result<(), HidError> {
+        // TODO: send Cmd::EepromCommit packet when boards arrive
         Err(HidError::NotConnected)
     }
 }

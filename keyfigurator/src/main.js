@@ -1024,6 +1024,20 @@ async function init() {
   document.getElementById("btn-max").onclick   = winToggleMax;
   document.getElementById("btn-close").onclick = winClose;
 
+  document.getElementById("btn-save-board").addEventListener("click", async () => {
+    const btn = document.getElementById("btn-save-board");
+    btn.textContent = "Saving…";
+    btn.disabled = true;
+    try {
+      await invoke("eeprom_commit");
+      btn.textContent = "Saved ✓";
+      setTimeout(() => { btn.textContent = "Save to Board"; btn.disabled = false; }, 1500);
+    } catch {
+      btn.textContent = "No Board";
+      setTimeout(() => { btn.textContent = "Save to Board"; btn.disabled = false; }, 1500);
+    }
+  });
+
   const connected = await invoke("is_connected");
   const connPill = document.getElementById("conn");
   connPill.textContent = connected ? "● connected (mock)" : "○ no device";
