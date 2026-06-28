@@ -54,30 +54,25 @@
       <div class="underglow-pill" id="underglow-pill">
         <div class="ug-main-row">
           <span class="pill-label">UNDERGLOW</span>
-          <input type="color" id="underglow-color" value="#ff6e14" title="Set all corners" />
-          <!-- Per-corner selectors inline — click opens native picker at button position -->
           <div class="ug-c-row">
-            <label class="ug-c-btn" id="ug-cb-0" title="Top-left LED">
+            <button class="ug-c-btn selected" id="ug-cb-0" title="Top-left LED">
               <span class="ug-c-dot"></span>
               <span class="ug-c-lbl">TL</span>
-              <input type="color" class="ug-c-inp" id="ug-ci-0" value="#ff6e14" />
-            </label>
-            <label class="ug-c-btn" id="ug-cb-1" title="Top-right LED">
+            </button>
+            <button class="ug-c-btn selected" id="ug-cb-1" title="Top-right LED">
               <span class="ug-c-dot"></span>
               <span class="ug-c-lbl">TR</span>
-              <input type="color" class="ug-c-inp" id="ug-ci-1" value="#ff6e14" />
-            </label>
-            <label class="ug-c-btn" id="ug-cb-2" title="Bottom-left LED">
+            </button>
+            <button class="ug-c-btn selected" id="ug-cb-2" title="Bottom-left LED">
               <span class="ug-c-dot"></span>
               <span class="ug-c-lbl">BL</span>
-              <input type="color" class="ug-c-inp" id="ug-ci-2" value="#ff6e14" />
-            </label>
-            <label class="ug-c-btn" id="ug-cb-3" title="Bottom-right LED">
+            </button>
+            <button class="ug-c-btn selected" id="ug-cb-3" title="Bottom-right LED">
               <span class="ug-c-dot"></span>
               <span class="ug-c-lbl">BR</span>
-              <input type="color" class="ug-c-inp" id="ug-ci-3" value="#ff6e14" />
-            </label>
+            </button>
           </div>
+          <input type="color" id="underglow-color" value="#ff6e14" title="Set color for selected corners" />
           <button class="ug-adv-btn" id="ug-adv-btn">Advanced <span id="ug-adv-arrow">▸</span></button>
         </div>
         <div class="ug-advanced" id="ug-advanced">
@@ -92,6 +87,7 @@
               <input type="range" id="ug-intensity" min="0" max="255" value="180" />
             </label>
           </div>
+          <span class="pill-label" style="font-size:9px;letter-spacing:0.1em;padding:4px 0 0">CYCLE COLORS</span>
           <div class="palette-row" id="ug-palette"></div>
         </div>
       </div>
@@ -99,7 +95,7 @@
         <div class="key-led-pill" id="key-led-pill">
           <div class="ug-main-row">
             <span class="pill-label">KEY LED</span>
-            <input type="color" id="kl-color" value="#000000" title="Set LED color for selected keys" />
+            <input type="color" id="kl-color" value="#ffffff" title="Set LED color for selected keys" />
             <span class="kl-count" id="kl-count">1 key</span>
             <button class="ug-adv-btn" id="kl-adv-btn">Advanced <span id="kl-adv-arrow">▸</span></button>
           </div>

@@ -8,6 +8,9 @@
   --amber: #ff7a1e;
   --titlebar-h: 32px;
   --ug-color: 255, 110, 20; /* underglow RGB — changed via JS/localStorage */
+  --kl-color: 255, 255, 255;       /* key LED color — changed via JS */
+  --kl-cycle-color: 255, 255, 255; /* key LED cycle color — first palette entry or key LED color */
+  --kl-anim-dur: 4.2s;             /* key LED animation duration — driven by rate slider */
 }
 
 * { box-sizing: border-box; }
@@ -517,18 +520,30 @@ header {
 .ug-anim-chip.active { border-color: var(--sel); color: var(--sel); }
 .ug-anim-chip:hover:not(.active) { border-color: var(--txt); color: var(--txt); }
 
-.ug-anim-preview {
+.ug-anim-preview,
+.kl-anim-preview,
+.kl-cycle-preview {
   width: 36px;
   height: 8px;
   border-radius: 4px;
-  background: rgba(var(--ug-color), 1);
 }
-.ug-anim-preview.breathe  { animation: anim-breathe  2.4s ease-in-out infinite; }
-.ug-anim-preview.rainbow  { animation: anim-rainbow  3s   linear      infinite; }
-.ug-anim-preview.wave     { animation: anim-wave     1.8s ease-in-out infinite; overflow: hidden; }
-.ug-anim-preview.reactive { animation: anim-reactive 1.4s ease-out    infinite; }
-.ug-anim-preview.sparkle  { animation: anim-sparkle  2s   ease-in-out infinite; }
-.ug-anim-preview.snake    { animation: anim-snake    1.6s linear      infinite; background-size: 200% 100%; background-image: linear-gradient(90deg, transparent 0%, rgba(var(--ug-color),1) 40%, rgba(var(--ug-color),1) 60%, transparent 100%); }
+.ug-anim-preview   { background: rgba(var(--ug-color),       1); }
+.kl-anim-preview   { background: rgba(var(--kl-color),       1); }
+.kl-cycle-preview  { background: rgba(var(--kl-cycle-color), 1); }
+
+.ug-anim-preview.breathe,  .kl-anim-preview.breathe  { animation: anim-breathe  2.4s ease-in-out infinite; }
+.ug-anim-preview.rainbow,  .kl-anim-preview.rainbow,  .kl-cycle-preview.rainbow  { animation: anim-rainbow  3s   linear      infinite; background: #ff0000; }
+.ug-anim-preview.wave,     .kl-anim-preview.wave     { animation: anim-wave     1.8s ease-in-out infinite; overflow: hidden; }
+.ug-anim-preview.reactive, .kl-anim-preview.reactive { animation: anim-reactive 1.4s ease-out    infinite; }
+.ug-anim-preview.sparkle,  .kl-anim-preview.sparkle  { animation: anim-sparkle  2s   ease-in-out infinite; }
+/* Row 2 cycle previews follow the rate slider via --kl-anim-dur */
+.kl-cycle-preview.breathe  { animation: anim-breathe  var(--kl-anim-dur) ease-in-out infinite; }
+.kl-cycle-preview.wave     { animation: anim-wave     var(--kl-anim-dur) ease-in-out infinite; overflow: hidden; }
+.kl-cycle-preview.reactive { animation: anim-reactive var(--kl-anim-dur) ease-out    infinite; }
+.kl-cycle-preview.sparkle  { animation: anim-sparkle  var(--kl-anim-dur) ease-in-out infinite; }
+.ug-anim-preview.snake { animation: anim-snake 1.6s linear infinite; background-size: 200% 100%; background-image: linear-gradient(90deg, transparent 0%, rgba(var(--ug-color),1) 40%, rgba(var(--ug-color),1) 60%, transparent 100%); }
+.kl-anim-preview.snake  { animation: anim-snake 1.6s linear infinite; background-size: 200% 100%; background-image: linear-gradient(90deg, transparent 0%, rgba(var(--kl-color),1) 40%, rgba(var(--kl-color),1) 60%, transparent 100%); }
+.kl-cycle-preview.snake { animation: anim-snake 1.6s linear infinite; background-size: 200% 100%; background-image: linear-gradient(90deg, transparent 0%, rgba(var(--kl-cycle-color),1) 40%, rgba(var(--kl-cycle-color),1) 60%, transparent 100%); }
 
 @keyframes anim-breathe  { 0%,100%{opacity:.2} 50%{opacity:1} }
 @keyframes anim-rainbow  { from{filter:hue-rotate(0deg)} to{filter:hue-rotate(360deg)} }
@@ -583,17 +598,6 @@ header {
   color: var(--muted);
   text-transform: uppercase;
 }
-/* Transparent color input fills the entire label area — clicking opens native picker */
-.ug-c-inp {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  opacity: 0;
-  cursor: pointer;
-  border: none;
-  padding: 0;
-}
 
 /* ── Physical board ──────────────────────────────────────────────────────── */
 .board {
@@ -605,12 +609,8 @@ header {
   background: #1a1c22;
   border: 1px solid var(--line);
   border-radius: 16px;
-  /* Underglow: controlled by --ug-color CSS variable (set from JS/localStorage) */
-  box-shadow:
-    0 18px 70px rgba(var(--ug-color), 0.50),
-    0  8px 30px rgba(var(--ug-color), 0.28),
-    -10px 6px 30px rgba(var(--ug-color), 0.16),
-     10px 6px 30px rgba(var(--ug-color), 0.16);
+  /* Underglow set entirely by JS via buildBoardGlow() */
+  box-shadow: 0 8px 32px rgba(0,0,0,0.55);
 }
 
 /* ── Key caps ────────────────────────────────────────────────────────────── */

@@ -37,7 +37,7 @@ const BOARD_POSITIONS = [
 
 let keymap = null;
 let selectedKeys = new Set();
-let keyLedColors  = Array.from({ length: 21 }, () => "#000000");
+let keyLedColors  = Array.from({ length: 21 }, () => "#ffffff");
 let keyIconLabels = Array(21).fill("");   // optional per-key icon/emoji (max 2 chars)
 let keyIconImages = Array(21).fill(null); // optional per-key image data URL
 let keySelectionOrder = [];              // order in which keys were selected (for snake anim)
@@ -58,7 +58,9 @@ const UG_PALETTE_KEY  = "kf-ug-palette";
 const ENC_KEY         = "kf-encoder";
 const ENCODER_IDX     = 20;
 
-let cornerColors  = ["#ff6e14", "#ff6e14", "#ff6e14", "#ff6e14"];
+let cornerColors    = ["#ff6e14", "#ff6e14", "#ff6e14", "#ff6e14"];
+let selectedCorners = new Set([0, 1, 2, 3]);
+const UG_SELECTED_KEY = "kf-ug-selected";
 let ugAnimation   = "breathe";
 let ugRate        = 128;
 let ugIntensity   = 180;
@@ -543,7 +545,7 @@ function buildTooltipHTML(idx) {
   const kc    = keymap?.layers[0]?.keys[idx] ?? "KC_NO";
   const kcDisp = (kc === "KC_NO" || kc === "KC_TRNS") ? null : kc.replace(/^KC_/, "");
   const led   = keyLedColors[idx];
-  const hasLed = led && led !== "#000000";
+  const hasLed = !!led;
   const icon  = keyIconLabels[idx];
   const anim  = (keyAnimStates[idx] ?? mkKeyAnim()).animation;
   const layer = getSavedLayers().find(l => l.id === activeProfileId);
@@ -630,30 +632,50 @@ function hexToRgbTriple(hex) {
 function applyCornerColors() {
   for (let i = 0; i < 4; i++) {
     const hex = cornerColors[i];
-    // Board-ring corner pip
     const corner = document.getElementById(`ug-c${i}`);
     if (corner) {
       corner.querySelector(".ug-dot").style.background = hex;
       corner.querySelector(".ug-corner-inp").value     = hex;
     }
-    // Main-row inline button dot
-    const btn = document.getElementById(`ug-cb-${i}`);
-    if (btn) {
-      btn.querySelector(".ug-c-dot").style.background = hex;
-      btn.querySelector(".ug-c-inp").value            = hex;
-    }
   }
+  updateCornerButtons();
+  updateUgColorSwatch();
+}
+
+function updateCornerButtons() {
+  for (let i = 0; i < 4; i++) {
+    const btn = document.getElementById(`ug-cb-${i}`);
+    if (!btn) continue;
+    btn.classList.toggle("selected", selectedCorners.has(i));
+    btn.querySelector(".ug-c-dot").style.background = cornerColors[i];
+  }
+}
+
+function updateUgColorSwatch() {
+  const sel = [...selectedCorners];
+  if (sel.length === 0) return;
+  const colors  = sel.map(i => cornerColors[i]);
+  const allSame = colors.every(c => c === colors[0]);
+  const inp = document.getElementById("underglow-color");
+  if (inp) inp.value = allSame ? colors[0] : "#000000";
 }
 
 function applyUnderglowHex(hex) {
   document.documentElement.style.setProperty("--ug-color", hexToRgbTriple(hex));
   const inp = document.getElementById("underglow-color");
   if (inp) inp.value = hex;
-  localStorage.setItem(UG_KEY, hex);
-  // Sync all 4 corner LEDs to the chosen color
-  cornerColors = [hex, hex, hex, hex];
+  for (const i of (selectedCorners.size > 0 ? selectedCorners : new Set([0,1,2,3]))) {
+    cornerColors[i] = hex;
+  }
   localStorage.setItem(UG_CORNERS_KEY, JSON.stringify(cornerColors));
   applyCornerColors();
+  // Picking a color directly means "set this color" — force Solid
+  if (ugAnimation !== "solid") {
+    ugAnimation = "solid";
+    ugAnimStart = 0;
+    saveAdvancedState();
+    renderAnimChips();
+  }
 }
 
 function saveAdvancedState() {
@@ -674,6 +696,16 @@ function saveCurrentKeyAnimState() {
     keyAnimStates[idx] = { animation: klAnimation, rate: klRate, intensity: klIntensity, palette: [...klPalette] };
   }
   localStorage.setItem(KL_PER_KEY, JSON.stringify(keyAnimStates));
+  updateKlColorVars();
+}
+
+function updateKlColorVars() {
+  const hex = document.getElementById("kl-color")?.value || "#ffffff";
+  document.documentElement.style.setProperty("--kl-color", hexToRgbTriple(hex));
+  const cycleHex = klPalette.length > 0 ? klPalette[0] : hex;
+  document.documentElement.style.setProperty("--kl-cycle-color", hexToRgbTriple(cycleHex));
+  const dur = (0.3 + (klRate / 255) * 7.7).toFixed(2);
+  document.documentElement.style.setProperty("--kl-anim-dur", dur + "s");
 }
 
 function loadKeyAnimState(idx) {
@@ -689,33 +721,48 @@ function loadKeyAnimState(idx) {
   renderKlAnimChips();
   updatePaletteDisabled();
   renderPalette("kl-palette", klPalette, KL_PALETTE_KEY, saveCurrentKeyAnimState);
+  updateKlColorVars();
 }
 
 function renderAnimChips() {
   const container = document.getElementById("ug-anims");
   if (!container) return;
   container.innerHTML = "";
-  for (const anim of ANIMATIONS.filter(a => !a.keyOnly)) {
-    const chip = document.createElement("button");
-    chip.className = "ug-anim-chip" + (ugAnimation === anim.id ? " active" : "");
-    const preview = document.createElement("span");
-    preview.className = `ug-anim-preview ${anim.id}`;
-    chip.appendChild(preview);
-    chip.appendChild(document.createTextNode(anim.label));
-    chip.addEventListener("click", (e) => {
-      e.stopPropagation();
-      ugAnimation = anim.id;
-      ugAnimStart = 0;
-      saveAdvancedState();
-      renderAnimChips();
-    });
-    container.appendChild(chip);
-  }
+  const eligible = ANIMATIONS.filter(a => !a.keyOnly);
+  const makeRow = (anims) => {
+    const row = document.createElement("div");
+    row.className = "kl-anim-row";
+    for (const anim of anims) {
+      const chip = document.createElement("button");
+      chip.className = "ug-anim-chip" + (ugAnimation === anim.id ? " active" : "");
+      const preview = document.createElement("span");
+      preview.className = `ug-anim-preview ${anim.id}`;
+      chip.appendChild(preview);
+      chip.appendChild(document.createTextNode(anim.label));
+      chip.addEventListener("click", (e) => {
+        e.stopPropagation();
+        ugAnimation = anim.id;
+        ugAnimStart = 0;
+        saveAdvancedState();
+        renderAnimChips();
+      });
+      row.appendChild(chip);
+    }
+    return row;
+  };
+  container.appendChild(makeRow(eligible.filter(a =>  a.noCycle)));
+  container.appendChild(makeRow(eligible.filter(a => !a.noCycle)));
+  updateUgPaletteDisabled();
 }
 
 function updatePaletteDisabled() {
   const off = ANIMATIONS.find(a => a.id === klAnimation)?.noCycle ?? false;
   document.getElementById("kl-palette").classList.toggle("disabled", off);
+}
+
+function updateUgPaletteDisabled() {
+  const off = ANIMATIONS.find(a => a.id === ugAnimation)?.noCycle ?? false;
+  document.getElementById("ug-palette").classList.toggle("disabled", off);
 }
 
 function renderEncoderOpts() {
@@ -795,14 +842,14 @@ function renderKlAnimChips() {
   const container = document.getElementById("kl-anims");
   if (!container) return;
   container.innerHTML = "";
-  const makeRow = (anims) => {
+  const makeRow = (anims, previewClass) => {
     const row = document.createElement("div");
     row.className = "kl-anim-row";
     for (const anim of anims) {
       const chip = document.createElement("button");
       chip.className = "ug-anim-chip" + (klAnimation === anim.id ? " active" : "");
       const preview = document.createElement("span");
-      preview.className = `ug-anim-preview ${anim.id}`;
+      preview.className = `${previewClass} ${anim.id}`;
       chip.appendChild(preview);
       chip.appendChild(document.createTextNode(anim.label));
       chip.addEventListener("click", (e) => {
@@ -815,8 +862,8 @@ function renderKlAnimChips() {
     }
     return row;
   };
-  container.appendChild(makeRow(ANIMATIONS.filter(a =>  a.noCycle)));
-  container.appendChild(makeRow(ANIMATIONS.filter(a => !a.noCycle)));
+  container.appendChild(makeRow(ANIMATIONS.filter(a =>  a.noCycle), "kl-anim-preview"));
+  container.appendChild(makeRow(ANIMATIONS.filter(a => !a.noCycle), "kl-cycle-preview"));
   updatePaletteDisabled();
 }
 
@@ -864,13 +911,32 @@ let ugAnimFrame = null;
 let ugAnimStart = 0;
 let lastKeyClickTime = 0;
 
-function buildBoardGlow(tl, tr, bl, br) {
-  const f = (c, scale) => `rgba(${c.rgb},${Math.min(0.99, c.opacity * scale).toFixed(3)})`;
-  return [
-    `0 20px 70px ${f(bl, 0.55)}`,   `0 20px 70px ${f(br, 0.55)}`,
-    `-14px 6px 40px ${f(tl, 0.38)}`, `-14px 6px 40px ${f(bl, 0.38)}`,
-    `14px 6px 40px ${f(tr, 0.38)}`,  `14px 6px 40px ${f(br, 0.38)}`,
-    `0 -12px 48px ${f(tl, 0.22)}`,  `0 -12px 48px ${f(tr, 0.22)}`,
+function applyCornerGlow(tl, tr, bl, br) {
+  // Radial gradients on the board-ring: each corner is a point source that fades to
+  // transparent at ~60% of the way across, so colors only blend near the midpoints.
+  const ring = document.getElementById("board-ring");
+  if (ring) {
+    const rg = (c, pos, scale) =>
+      `radial-gradient(ellipse at ${pos}, rgba(${c.rgb},${Math.min(0.99, c.opacity * scale).toFixed(3)}) 0%, transparent 58%)`;
+    ring.style.background = [
+      rg(tl, "top left",     0.85),
+      rg(tr, "top right",    0.85),
+      rg(bl, "bottom left",  0.90),
+      rg(br, "bottom right", 0.90),
+    ].join(", ");
+  }
+
+  // Outer halo: box-shadow on the board spills beyond the ring into the dark background.
+  // Corner-biased offsets keep each colour near its corner; large blur creates the fade.
+  const board = document.getElementById("board");
+  const h = (c, scale) => `rgba(${c.rgb},${Math.min(0.99, c.opacity * scale).toFixed(3)})`;
+  if (board) board.style.boxShadow = [
+    // Outer halo — large blur, zero spread, low opacity so it fades smoothly into the background
+    `-28px -14px 200px 0px ${h(tl, 0.85)}`,
+    ` 28px -14px 200px 0px ${h(tr, 0.85)}`,
+    `-28px  28px 220px 0px ${h(bl, 0.90)}`,
+    ` 28px  28px 220px 0px ${h(br, 0.90)}`,
+    `0 8px 32px rgba(0,0,0,0.55)`,
   ].join(", ");
 }
 
@@ -878,12 +944,14 @@ function computeCornerStates(elapsed) {
   const duration = 0.3 + (ugRate / 255) * 7.7;
   const t        = (elapsed % duration) / duration;
   const maxOp    = 0.15 + (ugIntensity / 255) * 0.85;
-  // Non-rainbow animations use palette when set, otherwise fall back to corner pickers
-  const bases    = [0,1,2,3].map(i => ugPalette.length > 0 ? ugPalette[i % ugPalette.length] : cornerColors[i]);
+  // Palette: time-based — all corners advance through colors together each cycle
+  const usePalette = ugPalette.length > 0 && ugAnimation !== "solid" && ugAnimation !== "rainbow";
+  const paletteIdx = usePalette ? Math.floor(elapsed / duration) % ugPalette.length : -1;
+  const bases      = [0,1,2,3].map(i => paletteIdx >= 0 ? ugPalette[paletteIdx] : cornerColors[i]);
 
   switch (ugAnimation) {
     case "solid":
-      return bases.map(hex => {
+      return cornerColors.map(hex => {
         const {r,g,b} = hexToRgb(hex); return { rgb:`${r},${g},${b}`, opacity: maxOp * 0.7 };
       });
 
@@ -943,9 +1011,7 @@ function ugAnimTick(now) {
   const elapsed = (now - ugAnimStart) / 1000;
   const [tl, tr, bl, br] = computeCornerStates(elapsed);
 
-  // Board glow — CSS @keyframes (flash) overrides inline style automatically while active
-  const board = document.getElementById("board");
-  if (board) board.style.boxShadow = buildBoardGlow(tl, tr, bl, br);
+  applyCornerGlow(tl, tr, bl, br);
 
   // Keep --ug-color current so flash keyframes and anim-preview chips track the animation
   document.documentElement.style.setProperty("--ug-color", tl.rgb);
@@ -980,17 +1046,23 @@ const KL_SPARKLE_PHASES = [0.10, 0.70, 0.30, 0.90, 0.50, 0.20, 0.80, 0.40, 0.60,
                             0.85, 0.35, 0.65, 0.25, 0.75, 0.45, 0.55, 0.05, 0.95, 0.12, 0.62];
 
 function computeKeyLedColor(idx, row, col, elapsed, isSel) {
-  const duration = 0.3 + (klRate / 255) * 7.7;
-  const t        = (elapsed % duration) / duration;
-  const maxOp    = 0.15 + (klIntensity / 255) * 0.85;
-  const ownColor = keyLedColors[idx] || "#000000";
-  // Palette: time-based — all selected keys advance through colors together each cycle
-  const usePalette = klPalette.length > 0 && isSel && klAnimation !== "solid" && klAnimation !== "rainbow";
-  const paletteIdx = usePalette ? Math.floor(elapsed / duration) % klPalette.length : 0;
-  const baseHex  = usePalette ? klPalette[paletteIdx] : ownColor;
-  const hasColor = baseHex && baseHex !== "#000000";
+  // Selected keys use the live panel state; deselected keys use their own stored state
+  const s = isSel
+    ? { animation: klAnimation, rate: klRate, intensity: klIntensity, palette: klPalette }
+    : (keyAnimStates[idx] ?? mkKeyAnim());
+  const { animation, rate, intensity, palette } = s;
 
-  switch (klAnimation) {
+  const duration = 0.3 + (rate / 255) * 7.7;
+  const t        = (elapsed % duration) / duration;
+  const maxOp    = 0.15 + (intensity / 255) * 0.85;
+  const ownColor = keyLedColors[idx] || "#ffffff";
+  // Palette cycling is a group effect — only active while the key is selected
+  const usePalette = palette.length > 0 && isSel && animation !== "solid" && animation !== "rainbow";
+  const paletteIdx = usePalette ? Math.floor(elapsed / duration) % palette.length : 0;
+  const baseHex  = usePalette ? palette[paletteIdx] : ownColor;
+  const hasColor = !!baseHex;
+
+  switch (animation) {
     case "solid": {
       if (!hasColor) return null;
       const { r, g, b } = hexToRgb(baseHex);
@@ -1005,7 +1077,6 @@ function computeKeyLedColor(idx, row, col, elapsed, isSel) {
     }
 
     case "rainbow": {
-      if (!isSel) return null;
       const { r, g, b } = hslToRgb((t + idx / 21 * 0.3) % 1, 1, 0.5);
       return { rgb: `${r},${g},${b}`, opacity: maxOp * 0.8 };
     }
@@ -1020,7 +1091,12 @@ function computeKeyLedColor(idx, row, col, elapsed, isSel) {
 
     case "reactive": {
       const age = (performance.now() - keyClickTimes[idx]) / 1000;
-      if (age > 0.8) return null;
+      if (age > 0.8) {
+        // Idle: show dim solid glow so the key doesn't go dark when deselected
+        if (!hasColor) return null;
+        const { r, g, b } = hexToRgb(baseHex);
+        return { rgb: `${r},${g},${b}`, opacity: maxOp * 0.5 };
+      }
       const op = maxOp * Math.pow(1 - age / 0.8, 1.5);
       const { r, g, b } = hexToRgb(hasColor ? baseHex : "#ffffff");
       return { rgb: `${r},${g},${b}`, opacity: op };
@@ -1035,9 +1111,15 @@ function computeKeyLedColor(idx, row, col, elapsed, isSel) {
     }
 
     case "snake": {
-      if (!isSel || keySelectionOrder.length === 0) return null;
+      // Snake is a group animation — only runs while the key is part of the active selection;
+      // when deselected, fall back to a dim solid glow so the key's color is still visible
+      if (!isSel || keySelectionOrder.length === 0) {
+        if (!hasColor) return null;
+        const { r, g, b } = hexToRgb(ownColor);
+        return { rgb: `${r},${g},${b}`, opacity: maxOp * 0.6 };
+      }
       const N = keySelectionOrder.length;
-      const speed = 1.5 + (klRate / 255) * 8.5;
+      const speed = 1.5 + (rate / 255) * 8.5;
       const tailLen = Math.max(2, Math.ceil(N * 0.5));
       const headPos = Math.floor(elapsed * speed) % N;
       const myPos = keySelectionOrder.indexOf(idx);
@@ -1045,7 +1127,7 @@ function computeKeyLedColor(idx, row, col, elapsed, isSel) {
       const dist = (headPos - myPos + N) % N;
       if (dist >= tailLen) return null;
       const snakeIntensity = Math.pow(1 - dist / tailLen, 0.6);
-      const snakeCol = (ownColor && ownColor !== "#000000") ? ownColor : "#ffb454";
+      const snakeCol = ownColor || "#ffffff";
       const { r: sr, g: sg, b: sb } = hexToRgb(snakeCol);
       return { rgb: `${sr},${sg},${sb}`, opacity: maxOp * snakeIntensity };
     }
@@ -1151,14 +1233,14 @@ async function init() {
   connPill.classList.toggle("ok", connected);
 
   // Restore underglow + corner + advanced settings from localStorage
-  const savedUg = localStorage.getItem(UG_KEY);
-  if (savedUg) {
-    document.documentElement.style.setProperty("--ug-color", hexToRgbTriple(savedUg));
-    const ugInp = document.getElementById("underglow-color");
-    if (ugInp) ugInp.value = savedUg;
-  }
   const savedCorners = localStorage.getItem(UG_CORNERS_KEY);
   if (savedCorners) try { cornerColors = JSON.parse(savedCorners); } catch {}
+  const savedUgSelected = localStorage.getItem(UG_SELECTED_KEY);
+  if (savedUgSelected) try {
+    const arr = JSON.parse(savedUgSelected);
+    selectedCorners = new Set(arr.filter(i => i >= 0 && i < 4));
+  } catch {}
+  document.documentElement.style.setProperty("--ug-color", hexToRgbTriple(cornerColors[0]));
   applyCornerColors();
   const savedAdv = localStorage.getItem(UG_ADVANCED_KEY);
   if (savedAdv) try {
@@ -1362,28 +1444,27 @@ async function init() {
     closeOledPill();
   });
 
-  // ── Corner LED pickers (board-ring pips + main-row inline buttons) ───────
-  function onCornerColorChange(i, hex) {
-    cornerColors[i] = hex;
-    localStorage.setItem(UG_CORNERS_KEY, JSON.stringify(cornerColors));
-    applyCornerColors();
-    if (cornerColors.every(c => c === hex)) applyUnderglowHex(hex);
-  }
-
+  // ── Corner LED pickers (board-ring pips + main-row selection toggles) ────
   for (let i = 0; i < 4; i++) {
-    // Board-ring pip (visual indicator + alternative picker)
+    // Board-ring pip — opens native color picker, updates individual corner
     const corner = document.getElementById(`ug-c${i}`);
     const pip    = corner.querySelector(".ug-corner-inp");
     corner.addEventListener("click", (e) => { e.stopPropagation(); pip.click(); });
-    pip.addEventListener("input", (e) => onCornerColorChange(i, e.target.value));
+    pip.addEventListener("input", (e) => {
+      cornerColors[i] = e.target.value;
+      localStorage.setItem(UG_CORNERS_KEY, JSON.stringify(cornerColors));
+      applyCornerColors();
+    });
 
-    // Main-row inline button — transparent input overlays the button,
-    // so clicking anywhere on the button opens the native color picker.
-    const btn = document.getElementById(`ug-cb-${i}`);
-    const inp = document.getElementById(`ug-ci-${i}`);
-    inp.addEventListener("input", (e) => onCornerColorChange(i, e.target.value));
-    inp.addEventListener("focus", () => btn.classList.add("selected"));
-    inp.addEventListener("blur",  () => btn.classList.remove("selected"));
+    // Main-row button — toggle corner selection
+    document.getElementById(`ug-cb-${i}`).addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (selectedCorners.has(i)) selectedCorners.delete(i);
+      else selectedCorners.add(i);
+      localStorage.setItem(UG_SELECTED_KEY, JSON.stringify([...selectedCorners]));
+      updateCornerButtons();
+      updateUgColorSwatch();
+    });
   }
 
   // ── Key LED Advanced toggle ────────────────────────────────────────────────
@@ -1474,6 +1555,7 @@ async function init() {
 
   document.getElementById("kl-color").addEventListener("input", (e) => {
     for (const idx of selectedKeys) keyLedColors[idx] = e.target.value;
+    updateKlColorVars();
     renderBoard();
   });
 
@@ -1655,25 +1737,37 @@ function onKeyDown(idx) {
   hideKeyTooltip();
   lastKeyClickTime = performance.now();
   keyClickTimes[idx] = performance.now();
+
+  // Deselect previously selected keys without a full board rebuild
+  for (const prev of selectedKeys) {
+    const prevEl = document.getElementById("key-" + prev);
+    if (prevEl) prevEl.classList.remove("sel");
+  }
+
   keySelectionOrder = [idx];
   selectedKeys.clear();
   selectedKeys.add(idx);
+
+  const el = document.getElementById("key-" + idx);
+  if (el) el.classList.add("sel");
+
   loadKeyAnimState(idx);
   closeUnderglowPill();
   closeOledPill();
   syncKeyLedPill();
-  renderBoard();
   openKeyLedPill();
   flashKey(idx);
 }
 
 function onKeyEnter(idx) {
   if (!isDragging) return;
-  if (selectedKeys.has(idx)) return; // already selected — skip re-render to avoid cascade
+  if (selectedKeys.has(idx)) return;
   selectedKeys.add(idx);
   keySelectionOrder.push(idx);
+  // Toggle class directly — no full board rebuild needed during drag
+  const el = document.getElementById("key-" + idx);
+  if (el) el.classList.add("sel");
   syncKeyLedPill();
-  renderBoard();
   flashKey(idx);
 }
 
@@ -1702,16 +1796,17 @@ function syncKeyLedPill() {
     document.getElementById("kl-kc").value   = kc === "KC_NO" ? "" : kc;
     document.getElementById("kl-icon").value = keyIconLabels[idx] || "";
     const col = keyLedColors[idx];
-    document.getElementById("kl-color").value = col || "#000000";
+    document.getElementById("kl-color").value = col || "#ffffff";
     updateIconPreview(idx);
   } else {
     document.getElementById("kl-kc").value   = "";
     document.getElementById("kl-icon").value = "";
-    const colors = [...selectedKeys].map(i => keyLedColors[i]).filter(c => c && c !== "#000000");
+    const colors = [...selectedKeys].map(i => keyLedColors[i]).filter(c => !!c);
     document.getElementById("kl-color").value =
-      (colors.length && colors.every(c => c === colors[0])) ? colors[0] : "#000000";
+      (colors.length && colors.every(c => c === colors[0])) ? colors[0] : "#ffffff";
     updateIconPreview(null);
   }
+  updateKlColorVars();
   updateBackKeyRow();
 }
 
@@ -1760,7 +1855,7 @@ function deleteSavedLayer(id) {
     // No layers left — blank the device: all KC_NO, all LEDs off
     activeProfileId = null;
     keymap = { layers: keymap.layers.map(() => ({ keys: Array(21).fill("KC_NO") })) };
-    keyLedColors = Array(21).fill("#000000");
+    keyLedColors = Array(21).fill("#ffffff");
     invoke("set_keymap", { map: keymap });
     invoke("set_leds", { leds: { colors: Array(21).fill({ r: 0, g: 0, b: 0 }) } });
   }
@@ -1842,7 +1937,7 @@ async function switchToLayer(id) {
 
 function switchToBlankLayer() {
   keymap = { layers: Array.from({ length: 4 }, () => ({ keys: Array(21).fill("KC_NO") })) };
-  keyLedColors = Array.from({ length: 21 }, () => "#000000");
+  keyLedColors = Array.from({ length: 21 }, () => "#ffffff");
   keyIconImages = Array(21).fill(null);
   activeProfileId = null;
   keySelectionOrder = [];
@@ -2091,7 +2186,7 @@ async function renderHostBindings() {
 async function applyActiveProfileToBoard() {
   if (!keymap || !activeProfileId) return;
   const colors = keyLedColors.map(hex => {
-    const { r, g, b } = hexToRgb(hex || "#000000");
+    const { r, g, b } = hexToRgb(hex || "#ffffff");
     return { r, g, b };
   });
   await invoke("set_keymap", { map: keymap });
