@@ -142,8 +142,6 @@ const ANIMATIONS = [
 function getOledScreens() {
   return [
     ...getSavedLayers().map(l => ({ type: "layer", layerId: l.id })),
-    { type: "timer" },
-    { type: "countdown" },
     ...oledCustomScreens,
   ];
 }
@@ -250,12 +248,30 @@ function renderOledScreenContent(screenEl) {
       }
       break;
     }
+    case "datetime": {
+      const now  = new Date();
+      const time = now.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+      const date = now.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
+      screenEl.innerHTML = `<div class="oled-datetime-screen">
+        <div class="oled-dt-time">${time}</div>
+        <div class="oled-dt-date">${date}</div>
+      </div>`;
+      break;
+    }
     case "custom": {
       if (screen.imageDataUrl) {
         screenEl.innerHTML = `<img class="oled-custom-img" src="${screen.imageDataUrl}" alt="" />`;
       } else {
-        const txt = (screen.title || "").toUpperCase().slice(0, OLED_CUSTOM_TITLE_MAX);
-        screenEl.innerHTML = `<div class="oled-custom-text">${txt || "—"}</div>`;
+        const title = (screen.title || "").toUpperCase().slice(0, OLED_CUSTOM_TITLE_MAX);
+        const body  = screen.body || "";
+        if (body) {
+          screenEl.innerHTML = `<div class="oled-custom-screen">
+            ${title ? `<div class="oled-custom-screen-title">${title}</div>` : ""}
+            <div class="oled-custom-screen-body">${body}</div>
+          </div>`;
+        } else {
+          screenEl.innerHTML = `<div class="oled-custom-text">${title || "—"}</div>`;
+        }
       }
       break;
     }
@@ -265,9 +281,13 @@ function renderOledScreenContent(screenEl) {
 function updateOledDisplay() {
   const screenEl = document.querySelector(".oled-screen");
   if (screenEl) renderOledScreenContent(screenEl);
-  if (document.getElementById("oled-pill").classList.contains("visible")) {
+  const pill = document.getElementById("oled-pill");
+  if (pill.classList.contains("visible")) {
     renderOledPillNav();
-    renderOledPillContent();
+    // Don't rebuild pill content while user is typing — it would destroy the focused element
+    if (!pill.querySelector("input:focus, textarea:focus")) {
+      renderOledPillContent();
+    }
   }
 }
 
@@ -276,6 +296,8 @@ function oledScreenNav(dir) {
   oledSubMode = "nav";
   const screens = getOledScreens();
   oledScreenIdx = (oledScreenIdx + dir + screens.length) % screens.length;
+  const screen = screens[oledScreenIdx];
+  if (screen?.type === "layer") switchToLayer(screen.layerId, { silent: true });
   updateOledDisplay();
 }
 
@@ -375,8 +397,9 @@ function renderOledPillNav() {
       name = `Layer ${String(idx).padStart(2,"0")}${oledSubMode === "keycycle" ? " — Key Cycle" : ""}`;
       break;
     }
-    case "timer":     name = "Timer";     break;
-    case "countdown": name = "Countdown"; break;
+    case "timer":     name = "Timer";       break;
+    case "countdown": name = "Countdown";   break;
+    case "datetime":  name = "Date & Time"; break;
     case "custom":    name = screen.title || "Custom Screen"; break;
   }
   const nameEl = document.getElementById("oled-screen-name");
@@ -389,9 +412,10 @@ function renderOledPillNav() {
     timer:     oledTimerRunning ? "↓ Stop" : "↓ Start",
     countdown: oledCdDone ? "↓ Reset" : (oledCdRunning ? "↓ Stop" : "↓ Next Field / Start"),
     custom:    "",
+    datetime:  "",
   };
   pressBtn.textContent = labels[screen.type] ?? "↓ Press";
-  pressBtn.style.display = screen.type === "custom" ? "none" : "";
+  pressBtn.style.display = (screen.type === "custom" || screen.type === "datetime") ? "none" : "";
 }
 
 function renderOledPillContent() {
@@ -425,9 +449,18 @@ function renderOledPillContent() {
         </div>
         <div class="oled-pill-section">
           <button class="oled-action-btn" id="oled-timer-reset">Reset Timer</button>
+          <button class="oled-action-btn oled-del-screen" id="oled-del-builtin" style="margin-left:auto">Remove</button>
         </div>`;
       document.getElementById("oled-timer-reset")?.addEventListener("click", () => {
         oledTimerRunning = false; oledTimerAcc = 0; updateOledDisplay();
+      });
+      document.getElementById("oled-del-builtin")?.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const wasLast = oledScreenIdx >= getOledScreens().length - 1;
+        oledCustomScreens = oledCustomScreens.filter(s => s.id !== screen.id);
+        saveOledCustomScreens();
+        if (wasLast) oledScreenIdx = Math.max(0, oledScreenIdx - 1);
+        updateOledDisplay(); renderOledPillNav(); renderOledPillContent();
       });
       break;
     }
@@ -448,10 +481,40 @@ function renderOledPillContent() {
         </div>
         <div class="oled-pill-hint">
           Rotate encoder to adjust selected field (underlined) · Press ↓ to cycle field, then start.
+        </div>
+        <div class="oled-pill-section">
+          <button class="oled-action-btn oled-del-screen" id="oled-del-cd">Remove</button>
         </div>`;
       document.getElementById("oled-cd-h")?.addEventListener("input", (e) => { oledCdH = Math.max(0, Math.min(23, +e.target.value||0)); updateOledDisplay(); });
       document.getElementById("oled-cd-m")?.addEventListener("input", (e) => { oledCdM = Math.max(0, Math.min(59, +e.target.value||0)); updateOledDisplay(); });
       document.getElementById("oled-cd-s")?.addEventListener("input", (e) => { oledCdS = Math.max(0, Math.min(59, +e.target.value||0)); updateOledDisplay(); });
+      container.querySelector("#oled-del-cd")?.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const wasLast = oledScreenIdx >= getOledScreens().length - 1;
+        oledCdRunning = false; oledCdDone = false; oledCdAcc = 0;
+        oledCustomScreens = oledCustomScreens.filter(s => s.id !== screen.id);
+        saveOledCustomScreens();
+        if (wasLast) oledScreenIdx = Math.max(0, oledScreenIdx - 1);
+        updateOledDisplay(); renderOledPillNav(); renderOledPillContent();
+      });
+      break;
+    }
+    case "datetime": {
+      container.innerHTML = `
+        <div class="oled-pill-section oled-pill-hint">
+          Shows the current time and date. On hardware the RP2040 reads from its RTC.
+        </div>
+        <div class="oled-pill-section">
+          <button class="oled-action-btn oled-del-screen" id="oled-del-builtin">Remove</button>
+        </div>`;
+      document.getElementById("oled-del-builtin")?.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const wasLast = oledScreenIdx >= getOledScreens().length - 1;
+        oledCustomScreens = oledCustomScreens.filter(s => s.id !== screen.id);
+        saveOledCustomScreens();
+        if (wasLast) oledScreenIdx = Math.max(0, oledScreenIdx - 1);
+        updateOledDisplay(); renderOledPillNav(); renderOledPillContent();
+      });
       break;
     }
     case "custom": {
@@ -463,6 +526,10 @@ function renderOledPillContent() {
           <span class="pill-label">TITLE</span>
           <input class="oled-title-inp" id="oled-custom-title" type="text"
             value="${screen.title || ""}" placeholder="Screen title…" maxlength="${OLED_CUSTOM_TITLE_MAX}" />
+        </div>
+        <div class="oled-pill-section" style="align-items:flex-start;flex-direction:column;gap:6px;padding-bottom:12px">
+          <span class="pill-label">CONTEXT</span>
+          <textarea class="oled-body-inp" id="oled-custom-body" placeholder="Body text shown below title…" maxlength="200">${screen.body || ""}</textarea>
         </div>
         <div class="oled-pill-section oled-img-row">
           <div class="oled-img-thumb">${imgPreview}</div>
@@ -478,6 +545,9 @@ function renderOledPillContent() {
       document.getElementById("oled-custom-title")?.addEventListener("input", (e) => {
         screen.title = e.target.value; saveOledCustomScreens(); updateOledDisplay();
       });
+      document.getElementById("oled-custom-body")?.addEventListener("input", (e) => {
+        screen.body = e.target.value; saveOledCustomScreens(); updateOledDisplay();
+      });
       document.getElementById("oled-img-upload")?.addEventListener("change", async (e) => {
         const file = e.target.files[0];
         if (!file) return;
@@ -490,10 +560,12 @@ function renderOledPillContent() {
       document.getElementById("oled-img-clear")?.addEventListener("click", () => {
         screen.imageDataUrl = null; saveOledCustomScreens(); renderOledPillContent(); updateOledDisplay();
       });
-      document.getElementById("oled-del-screen")?.addEventListener("click", () => {
+      document.getElementById("oled-del-screen")?.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const wasLast = oledScreenIdx >= getOledScreens().length - 1;
         oledCustomScreens = oledCustomScreens.filter(s => s.id !== screen.id);
         saveOledCustomScreens();
-        oledScreenIdx = Math.max(0, oledScreenIdx - 1);
+        if (wasLast) oledScreenIdx = Math.max(0, oledScreenIdx - 1);
         updateOledDisplay(); renderOledPillNav(); renderOledPillContent();
       });
       break;
@@ -526,7 +598,8 @@ function oledAnimTick(now) {
   const screens = getOledScreens();
   const s       = screens[oledScreenIdx];
   const live    = (s?.type === "timer" && oledTimerRunning)
-               || (s?.type === "countdown" && oledCdRunning);
+               || (s?.type === "countdown" && oledCdRunning)
+               || s?.type === "datetime";
   if (live && now - oledLastTick > 250) {
     oledLastTick = now;
     const screenEl = document.querySelector(".oled-screen");
@@ -637,6 +710,7 @@ function applyCornerColors() {
       corner.querySelector(".ug-dot").style.background = hex;
       corner.querySelector(".ug-corner-inp").value     = hex;
     }
+    document.documentElement.style.setProperty(`--ug-c${i}`, hexToRgbTriple(hex));
   }
   updateCornerButtons();
   updateUgColorSwatch();
@@ -682,6 +756,36 @@ function saveAdvancedState() {
   localStorage.setItem(UG_ADVANCED_KEY, JSON.stringify({
     animation: ugAnimation, rate: ugRate, intensity: ugIntensity,
   }));
+}
+
+const DEFAULT_CORNER_COLORS = ["#ff6e14", "#ff6e14", "#ff6e14", "#ff6e14"];
+
+function currentUnderglowSnapshot() {
+  return {
+    animation:    ugAnimation,
+    rate:         ugRate,
+    intensity:    ugIntensity,
+    palette:      [...ugPalette],
+    cornerColors: [...cornerColors],
+  };
+}
+
+function syncUnderglowUI() {
+  document.getElementById("ug-rate").value      = ugRate;
+  document.getElementById("ug-intensity").value = ugIntensity;
+  applyCornerColors();
+  renderAnimChips();
+  renderPalette("ug-palette", ugPalette, UG_PALETTE_KEY, () => {});
+  updateUgPaletteDisabled();
+}
+
+function applyUnderglowSnapshot(ug) {
+  ugAnimation  = ug?.animation    ?? "solid";
+  ugRate       = ug?.rate         ?? 128;
+  ugIntensity  = ug?.intensity    ?? 180;
+  ugPalette    = ug?.palette      ? [...ug.palette]      : [];
+  cornerColors = ug?.cornerColors ? [...ug.cornerColors] : [...DEFAULT_CORNER_COLORS];
+  syncUnderglowUI();
 }
 
 function saveKlAdvancedState() {
@@ -1057,7 +1161,7 @@ function computeKeyLedColor(idx, row, col, elapsed, isSel) {
   const maxOp    = 0.15 + (intensity / 255) * 0.85;
   const ownColor = keyLedColors[idx] || "#ffffff";
   // Palette cycling is a group effect — only active while the key is selected
-  const usePalette = palette.length > 0 && isSel && animation !== "solid" && animation !== "rainbow";
+  const usePalette = palette.length > 0 && animation !== "solid" && animation !== "rainbow";
   const paletteIdx = usePalette ? Math.floor(elapsed / duration) % palette.length : 0;
   const baseHex  = usePalette ? palette[paletteIdx] : ownColor;
   const hasColor = !!baseHex;
@@ -1139,6 +1243,13 @@ function computeKeyLedColor(idx, row, col, elapsed, isSel) {
 function klAnimTick(now) {
   if (!klAnimStart) klAnimStart = now;
   const elapsed = (now - klAnimStart) / 1000;
+
+  // Step the cycle-preview chip through the palette at the current rate
+  if (klPalette.length > 1) {
+    const dur = 0.3 + (klRate / 255) * 7.7;
+    const pi  = Math.floor(elapsed / dur) % klPalette.length;
+    document.documentElement.style.setProperty("--kl-cycle-color", hexToRgbTriple(klPalette[pi]));
+  }
 
   // Countdown-done: flash all key LEDs until encoder press resets
   if (oledFlashKeys) {
@@ -1303,6 +1414,10 @@ async function init() {
   keyLedColors   = [...bootLayer.leds];
   keyIconLabels  = bootLayer.icons ? [...bootLayer.icons] : Array(21).fill("");
   keyIconImages  = bootLayer.iconImages ? [...bootLayer.iconImages] : Array(21).fill(null);
+  if (bootLayer.animStates) {
+    try { keyAnimStates = JSON.parse(JSON.stringify(bootLayer.animStates)); } catch {}
+  }
+  if (bootLayer.underglow) applyUnderglowSnapshot(bootLayer.underglow);
   activeProfileId = bootLayer.id;
   await invoke("set_keymap", { map: keymap });
 
@@ -1612,11 +1727,7 @@ async function init() {
   });
   document.getElementById("oled-add-screen").addEventListener("click", (e) => {
     e.stopPropagation();
-    oledCustomScreens.push({ id: Date.now().toString(), type: "custom", title: "New Screen", imageDataUrl: null });
-    saveOledCustomScreens();
-    const screens = getOledScreens();
-    oledScreenIdx = screens.length - 1;
-    updateOledDisplay(); renderOledPill();
+    openScreenPicker();
   });
 }
 
@@ -1829,10 +1940,32 @@ function getSavedLayers() {
   catch { return []; }
 }
 
+function saveCurrentLayerState() {
+  if (!activeProfileId) return;
+  const layers = getSavedLayers();
+  const cur = layers.find(l => l.id === activeProfileId);
+  if (!cur) return;
+  cur.keymap     = structuredClone(keymap);
+  cur.leds       = [...keyLedColors];
+  cur.icons      = [...keyIconLabels];
+  cur.iconImages = [...keyIconImages];
+  cur.animStates = JSON.parse(JSON.stringify(keyAnimStates));
+  cur.underglow  = currentUnderglowSnapshot();
+  localStorage.setItem(LAYERS_KEY, JSON.stringify(layers));
+}
+
 function saveCurrentAsLayer(name) {
   const layers = getSavedLayers();
   const id = Date.now().toString();
-  layers.push({ id, name, keymap: structuredClone(keymap), leds: [...keyLedColors], icons: [...keyIconLabels], iconImages: [...keyIconImages] });
+  layers.push({
+    id, name,
+    keymap:     structuredClone(keymap),
+    leds:       [...keyLedColors],
+    icons:      [...keyIconLabels],
+    iconImages: [...keyIconImages],
+    animStates: JSON.parse(JSON.stringify(keyAnimStates)),
+    underglow:  currentUnderglowSnapshot(),
+  });
   localStorage.setItem(LAYERS_KEY, JSON.stringify(layers));
   activeProfileId = id;
 }
@@ -1910,13 +2043,18 @@ function reorderLayers(srcId, dstId) {
   localStorage.setItem(LAYERS_KEY, JSON.stringify(layers));
 }
 
-async function switchToLayer(id) {
+async function switchToLayer(id, { silent = false } = {}) {
+  saveCurrentLayerState();
   const layer = getSavedLayers().find(l => l.id === id);
   if (!layer) return;
-  keymap = structuredClone(layer.keymap);
+  keymap         = structuredClone(layer.keymap);
   keyLedColors   = [...layer.leds];
   keyIconLabels  = layer.icons ? [...layer.icons] : Array(21).fill("");
   keyIconImages  = layer.iconImages ? [...layer.iconImages] : Array(21).fill(null);
+  keyAnimStates  = layer.animStates
+    ? JSON.parse(JSON.stringify(layer.animStates))
+    : Array.from({ length: 21 }, mkKeyAnim);
+  applyUnderglowSnapshot(layer.underglow ?? null);
   activeProfileId = id;
   keySelectionOrder = [];
   selectedKeys.clear();
@@ -1925,20 +2063,24 @@ async function switchToLayer(id) {
   flashBoard();
   await invoke("set_keymap", { map: keymap });
   renderSavedLayers();
-  // Open rename input pre-filled with this layer's name
-  const slNewRow   = document.getElementById("sl-new-row");
-  const slNewInput = document.getElementById("sl-new-input");
-  slNewInput.value = layer.name;
-  slNewInput.classList.remove("error");
-  slNewRow.classList.add("open");
-  slNewInput.select();
-  slNewInput.focus();
+  if (!silent) {
+    const slNewRow   = document.getElementById("sl-new-row");
+    const slNewInput = document.getElementById("sl-new-input");
+    slNewInput.value = layer.name;
+    slNewInput.classList.remove("error");
+    slNewRow.classList.add("open");
+    slNewInput.select();
+    slNewInput.focus();
+  }
 }
 
 function switchToBlankLayer() {
-  keymap = { layers: Array.from({ length: 4 }, () => ({ keys: Array(21).fill("KC_NO") })) };
-  keyLedColors = Array.from({ length: 21 }, () => "#ffffff");
-  keyIconImages = Array(21).fill(null);
+  saveCurrentLayerState();
+  keymap         = { layers: Array.from({ length: 4 }, () => ({ keys: Array(21).fill("KC_NO") })) };
+  keyLedColors   = Array.from({ length: 21 }, () => "#ffffff");
+  keyIconImages  = Array(21).fill(null);
+  keyAnimStates  = Array.from({ length: 21 }, mkKeyAnim);
+  applyUnderglowSnapshot(null);
   activeProfileId = null;
   keySelectionOrder = [];
   selectedKeys.clear();
@@ -2062,6 +2204,113 @@ function closeKeyLedPill() {
 }
 function openOledPill()    { document.getElementById("oled-pill").classList.add("visible"); renderOledPill(); }
 function closeOledPill()   { document.getElementById("oled-pill").classList.remove("visible"); }
+
+function openScreenPicker() {
+  if (document.getElementById("oled-screen-picker")) return;
+  const existing = new Set(oledCustomScreens.map(s => s.type));
+
+  const TYPES = [
+    {
+      type: "timer", label: "Timer", desc: "Stopwatch",
+      preview: `<div style="color:#ffb454;font-family:monospace;text-align:center">
+        <div style="font-size:6px;opacity:.4;letter-spacing:.1em">TIMER</div>
+        <div style="font-size:14px;font-weight:bold">00:00</div>
+        <div style="font-size:6px;opacity:.25">↓ start</div></div>`,
+    },
+    {
+      type: "countdown", label: "Countdown", desc: "Counts down to zero",
+      preview: `<div style="color:#ffb454;font-family:monospace;text-align:center">
+        <div style="font-size:6px;opacity:.4;letter-spacing:.1em">COUNTDOWN</div>
+        <div style="font-size:13px;font-weight:bold">01:00</div>
+        <div style="font-size:6px;opacity:.25">↓ cycle field</div></div>`,
+    },
+    {
+      type: "datetime", label: "Date & Time", desc: "Live clock + date",
+      preview: `<div style="color:#ffb454;font-family:monospace;text-align:center">
+        <div style="font-size:13px;font-weight:bold">12:00</div>
+        <div style="font-size:7px;opacity:.5">SUN JUN 29</div></div>`,
+    },
+    {
+      type: "custom", label: "Custom", desc: "Title + body text",
+      preview: `<div style="color:#ffb454;font-family:monospace;text-align:center;padding:2px;width:100%">
+        <div style="font-size:8px;font-weight:bold;border-bottom:1px solid rgba(255,180,84,.25);padding-bottom:2px;margin-bottom:3px">TITLE</div>
+        <div style="font-size:6px;opacity:.5">body text here</div></div>`,
+    },
+  ];
+
+  const available = TYPES.filter(t => t.type === "custom" || !existing.has(t.type));
+  if (!available.length) return;
+
+  const overlay = document.createElement("div");
+  overlay.id = "oled-screen-picker";
+  overlay.className = "oled-picker-overlay";
+
+  const selected = new Set();
+
+  overlay.innerHTML = `
+    <div class="oled-picker-modal">
+      <div class="oled-picker-heading">Add Screen</div>
+      <div class="oled-picker-grid">
+        ${available.map(t => `
+          <button class="oled-picker-card" data-type="${t.type}">
+            <div class="oled-picker-thumb">${t.preview}</div>
+            <div class="oled-picker-label">${t.label}</div>
+            <div class="oled-picker-desc">${t.desc}</div>
+          </button>`).join("")}
+      </div>
+      <div class="oled-picker-actions">
+        <button class="oled-picker-cancel">Cancel</button>
+        <button class="oled-picker-add" disabled>Add</button>
+      </div>
+    </div>`;
+
+  const addBtn = overlay.querySelector(".oled-picker-add");
+
+  const close = () => closeScreenPicker();
+  overlay.querySelector(".oled-picker-cancel").addEventListener("click", close);
+  overlay.addEventListener("click", e => { if (e.target === overlay) close(); });
+  const onKey = e => { if (e.key === "Escape") close(); };
+  document.addEventListener("keydown", onKey);
+  overlay._removeKey = () => document.removeEventListener("keydown", onKey);
+
+  overlay.querySelectorAll(".oled-picker-card").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const type = btn.dataset.type;
+      if (selected.has(type)) {
+        selected.delete(type);
+        btn.classList.remove("selected");
+      } else {
+        selected.add(type);
+        btn.classList.add("selected");
+      }
+      addBtn.disabled = selected.size === 0;
+      addBtn.textContent = selected.size > 1 ? `Add (${selected.size})` : "Add";
+    });
+  });
+
+  addBtn.addEventListener("click", () => {
+    let i = 0;
+    for (const type of selected) {
+      const s = { id: `${Date.now()}-${i++}`, type };
+      if (type === "custom") { s.title = ""; s.body = ""; s.imageDataUrl = null; }
+      oledCustomScreens.push(s);
+    }
+    saveOledCustomScreens();
+    oledScreenIdx = getOledScreens().length - 1;
+    close();
+    updateOledDisplay();
+    renderOledPill();
+  });
+
+  document.body.appendChild(overlay);
+}
+
+function closeScreenPicker() {
+  const el = document.getElementById("oled-screen-picker");
+  if (!el) return;
+  if (el._removeKey) el._removeKey();
+  el.remove();
+}
 
 function openUnderglowPill() {
   keySelectionOrder = [];

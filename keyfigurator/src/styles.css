@@ -8,6 +8,10 @@
   --amber: #ff7a1e;
   --titlebar-h: 32px;
   --ug-color: 255, 110, 20; /* underglow RGB — changed via JS/localStorage */
+  --ug-c0: 255, 110, 20;   /* per-corner colors for solid preview — set by applyCornerColors() */
+  --ug-c1: 255, 110, 20;
+  --ug-c2: 255, 110, 20;
+  --ug-c3: 255, 110, 20;
   --kl-color: 255, 255, 255;       /* key LED color — changed via JS */
   --kl-cycle-color: 255, 255, 255; /* key LED cycle color — first palette entry or key LED color */
   --kl-anim-dur: 4.2s;             /* key LED animation duration — driven by rate slider */
@@ -528,6 +532,13 @@ header {
   border-radius: 4px;
 }
 .ug-anim-preview   { background: rgba(var(--ug-color),       1); }
+.ug-anim-preview.solid {
+  background: linear-gradient(90deg,
+    rgba(var(--ug-c0),1) 0%, rgba(var(--ug-c0),1) 25%,
+    rgba(var(--ug-c1),1) 25%, rgba(var(--ug-c1),1) 50%,
+    rgba(var(--ug-c2),1) 50%, rgba(var(--ug-c2),1) 75%,
+    rgba(var(--ug-c3),1) 75%, rgba(var(--ug-c3),1) 100%);
+}
 .kl-anim-preview   { background: rgba(var(--kl-color),       1); }
 .kl-cycle-preview  { background: rgba(var(--kl-cycle-color), 1); }
 
@@ -1312,6 +1323,97 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 50%; }
   text-shadow: 0 0 6px rgba(255,180,84,.9);
   text-align: center; padding: 6px; word-break: break-all;
 }
+.oled-custom-screen {
+  display: flex; flex-direction: column; align-items: center; justify-content: flex-start;
+  padding: 5px; width: 100%; height: 100%; gap: 3px;
+}
+.oled-custom-screen-title {
+  color: #ffb454; font-family: 'Courier New', monospace; font-size: 11px; font-weight: bold;
+  text-shadow: 0 0 5px rgba(255,180,84,.8); text-align: center;
+  border-bottom: 1px solid rgba(255,180,84,0.2); width: 100%; padding-bottom: 3px;
+}
+.oled-custom-screen-body {
+  color: rgba(255,180,84,0.75); font-family: 'Courier New', monospace;
+  font-size: 8px; line-height: 1.3; text-align: center; word-break: break-word;
+  flex: 1; overflow: hidden;
+}
+
+/* ── OLED Date & Time screen ─────────────────────────────────── */
+.oled-datetime-screen {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 4px; width: 100%; height: 100%;
+}
+.oled-dt-time {
+  color: #ffb454; font-family: 'Courier New', monospace; font-size: 19px; font-weight: bold;
+  letter-spacing: 0.04em; text-shadow: 0 0 6px rgba(255,180,84,.9), 0 0 16px rgba(255,180,84,.4);
+}
+.oled-dt-date {
+  color: rgba(255,180,84,0.5); font-family: 'Courier New', monospace;
+  font-size: 9px; letter-spacing: 0.08em;
+}
+
+/* ── Custom screen body textarea in pill ─────────────────────── */
+.oled-body-inp {
+  width: 100%; box-sizing: border-box; min-height: 54px; resize: vertical;
+  background: var(--bg); border: 1px solid var(--line); color: var(--txt);
+  padding: 6px 9px; border-radius: 8px; font-size: 12px; font-family: inherit;
+}
+.oled-body-inp:focus { outline: none; border-color: var(--muted); }
+
+/* ── OLED screen picker modal ────────────────────────────────── */
+.oled-picker-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,0.72); z-index: 5000;
+  display: flex; align-items: center; justify-content: center;
+  animation: pill-appear 0.12s ease-out;
+}
+.oled-picker-modal {
+  background: #1a1c22; border: 1px solid var(--line); border-radius: 18px;
+  padding: 20px; max-width: 460px; width: 90%;
+  display: flex; flex-direction: column; gap: 16px;
+}
+.oled-picker-heading {
+  font-size: 13px; font-weight: 700; letter-spacing: 0.05em; color: var(--txt);
+}
+.oled-picker-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(88px, 1fr)); gap: 10px;
+}
+.oled-picker-card {
+  display: flex; flex-direction: column; align-items: center; gap: 8px;
+  padding: 12px 8px; border: 1px solid var(--line); border-radius: 12px;
+  background: none; cursor: pointer; transition: border-color 0.12s, background 0.12s;
+}
+.oled-picker-card:hover { border-color: var(--sel); background: rgba(255,180,84,0.05); }
+.oled-picker-card.selected { border-color: var(--sel); background: rgba(255,180,84,0.1); }
+.oled-picker-card.selected .oled-picker-thumb { box-shadow: 0 0 0 1px var(--sel); }
+.oled-picker-thumb {
+  width: 62px; height: 56px;
+  background: radial-gradient(ellipse at center, #08090e 60%, #04060a 100%);
+  border-radius: 5px; border: 1px solid #1e222c;
+  display: flex; align-items: center; justify-content: center; overflow: hidden;
+}
+.oled-picker-label {
+  font-size: 10px; font-weight: 700; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--txt);
+}
+.oled-picker-desc {
+  font-size: 9px; color: var(--muted); opacity: 0.7; text-align: center; line-height: 1.3;
+}
+.oled-picker-actions {
+  display: flex; justify-content: flex-end; gap: 8px; align-items: center;
+}
+.oled-picker-cancel {
+  background: none; border: 1px solid var(--line); border-radius: 8px;
+  color: var(--muted); font-size: 12px; padding: 6px 14px;
+  cursor: pointer; transition: border-color 0.12s, color 0.12s;
+}
+.oled-picker-cancel:hover { border-color: var(--txt); color: var(--txt); }
+.oled-picker-add {
+  background: var(--sel); border: none; border-radius: 8px;
+  color: #111; font-size: 12px; font-weight: 700; padding: 6px 18px;
+  cursor: pointer; transition: opacity 0.12s;
+}
+.oled-picker-add:disabled { opacity: 0.3; cursor: not-allowed; }
+.oled-picker-add:not(:disabled):hover { opacity: 0.82; }
 
 /* Key highlighted in OLED key-cycle mode */
 .key.oled-key-active {
