@@ -108,6 +108,10 @@ let oledFlashStart   = 0;
 
 let oledBackKeyIdx     = null;       // physical key index assigned as OLED back/escape; null = unassigned
 
+const OLED_EVENT_KEYS_KEY = "kf-oled-event-keys";
+let oledEventKeys      = {};    // { eventName: keyIdx }
+let pendingEventAssign = null;  // eventName string while waiting for the user to pick a key
+
 let oledCustomScreens = [];         // { id, type:"custom", title, imageDataUrl }
 let oledAnimFrame     = null;
 let oledLastTick      = 0;
@@ -169,6 +173,9 @@ function getCdRemaining() {
 function saveOledCustomScreens() {
   localStorage.setItem(OLED_CUSTOM_KEY, JSON.stringify(oledCustomScreens));
 }
+function saveOledEventKeys() {
+  localStorage.setItem(OLED_EVENT_KEYS_KEY, JSON.stringify(oledEventKeys));
+}
 
 function readFileAsDataUrl(file) {
   return new Promise((resolve, reject) => {
@@ -197,11 +204,23 @@ function renderOledScreenContent(screenEl) {
   switch (screen.type) {
     case "layer": {
       if (oledSubMode === "keycycle") {
-        const kc   = keymap?.layers[0]?.keys[oledKeyCycleIdx] ?? "KC_NO";
-        const disp = kc.replace(/^KC_/, "");
-        const icon = keyIconLabels[oledKeyCycleIdx] || "";
+        const cyclePos    = BOARD_POSITIONS[oledKeyCycleIdx];
+        const cycleKeyI   = cyclePos?.idx ?? 0;
+        const ksk         = currentOledScreenKey();
+        const kScreenEvMap = ksk ? (oledEventKeys[ksk] || {}) : {};
+        const evEntry     = Object.entries(kScreenEvMap).find(([, v]) => evIdx(v) === cycleKeyI);
+        const evLabel     = evEntry ? OLED_EVENT_LABELS[evEntry[0]] : null;
+        let numLabel, icon, disp;
+        if (cyclePos?.type === "encoder") {
+          numLabel = "ENC"; icon = ""; disp = evLabel || "ENCODER";
+        } else {
+          numLabel = String(cycleKeyI + 1).padStart(2, "0");
+          const kc = keymap?.layers[0]?.keys[cycleKeyI] ?? "KC_NO";
+          icon = keyIconLabels[cycleKeyI] || "";
+          disp = evLabel || kc.replace(/^KC_/, "");
+        }
         screenEl.innerHTML = `<div class="oled-keycycle">
-          <div class="oled-kc-num">${String(oledKeyCycleIdx + 1).padStart(2,"0")}</div>
+          <div class="oled-kc-num">${numLabel}</div>
           ${icon ? `<div class="oled-kc-icon">${icon}</div>` : ""}
           <div class="oled-kc-val">${disp}</div>
         </div>`;
@@ -327,6 +346,46 @@ function onEncoderCCW() {
   oledScreenNav(-1);
 }
 
+function triggerOledEvent(eventName) {
+  switch (eventName) {
+    case "presentKeys": {
+      if (oledSubMode === "keycycle") {
+        oledSubMode = "nav"; oledKeyCycleIdx = 0;
+      } else {
+        const pscreens = getOledScreens();
+        if (pscreens[oledScreenIdx]?.type !== "layer") {
+          const layerScrIdx = pscreens.findIndex(s => s.type === "layer" && s.layerId === activeProfileId);
+          if (layerScrIdx !== -1) oledScreenIdx = layerScrIdx;
+        }
+        oledSubMode = "keycycle"; oledKeyCycleIdx = 0;
+      }
+      updateOledDisplay(); renderBoard();
+      break;
+    }
+    case "timerStartStop":
+      if (oledTimerRunning) { oledTimerAcc = getTimerElapsed(); oledTimerRunning = false; }
+      else { oledTimerStart = performance.now(); oledTimerRunning = true; }
+      updateOledDisplay();
+      break;
+    case "timerReset":
+      oledTimerRunning = false; oledTimerAcc = 0; updateOledDisplay();
+      break;
+    case "cdEvent":
+      if (oledCdDone) {
+        oledCdDone = false; oledCdRunning = false; oledCdAcc = 0; oledFlashKeys = false;
+        updateOledDisplay(); renderBoard();
+      } else if (oledCdRunning) {
+        oledCdAcc += (performance.now() - oledCdStart) / 1000;
+        oledCdRunning = false; updateOledDisplay();
+      } else {
+        oledCdField = "hours"; oledCdStart = performance.now(); oledCdAcc = 0; oledCdRunning = true;
+        localStorage.setItem(OLED_CD_KEY, JSON.stringify({ h: oledCdH, m: oledCdM, s: oledCdS }));
+        updateOledDisplay();
+      }
+      break;
+  }
+}
+
 function onEncoderPress() {
   const screens = getOledScreens();
   const screen  = screens[oledScreenIdx];
@@ -379,11 +438,92 @@ function onEncoderPress() {
 
 function adjustCdField(delta) {
   switch (oledCdField) {
-    case "hours":   oledCdH = Math.max(0, Math.min(23, oledCdH + delta)); break;
+    case "hours":   oledCdH = Math.max(0, Math.min(99, oledCdH + delta)); break;
     case "minutes": oledCdM = Math.max(0, Math.min(59, oledCdM + delta)); break;
     case "seconds": oledCdS = Math.max(0, Math.min(59, oledCdS + delta)); break;
   }
   updateOledDisplay();
+}
+
+const OLED_EVENT_LABELS = {
+  presentKeys:    "Present Keys",
+  timerStartStop: "Start / Stop",
+  timerReset:     "Reset Timer",
+  cdEvent:        "Start / Stop",
+};
+
+function currentOledScreenKey() {
+  const screens = getOledScreens();
+  const s = screens[oledScreenIdx];
+  return s ? (s.layerId || s.id) : null;
+}
+
+function eventRowHTML(eventName, label) {
+  const sk       = currentOledScreenKey();
+  const entry    = sk ? (oledEventKeys[sk]?.[eventName] ?? null) : null;
+  const keyIdx   = evIdx(entry);
+  const isPending = pendingEventAssign === eventName;
+  if (isPending) {
+    return `<div class="oled-pill-section oled-event-row">
+      <span class="oled-event-name">${label}</span>
+      <span class="oled-event-key-val oled-event-picking">Press a key…</span>
+      <button class="oled-action-btn oled-del-screen" data-ev-cancel="${eventName}">Cancel</button>
+    </div>`;
+  }
+  const color = evColor(entry);
+  return `<div class="oled-pill-section oled-event-row">
+    <span class="oled-event-name">${label}</span>
+    <span class="oled-event-key-val">${keyIdx !== null ? `Key ${keyIdx}` : "—"}</span>
+    ${keyIdx !== null
+      ? `<input type="color" class="oled-event-color-inp" value="${color}" data-ev-color="${eventName}" title="Key color" />
+         <button class="oled-action-btn" data-ev-led="${keyIdx}" title="LED settings">LED</button>
+         <button class="oled-action-btn oled-del-screen" data-ev-clear="${eventName}">Clear</button>`
+      : `<button class="oled-action-btn" data-ev-assign="${eventName}">Assign</button>`
+    }
+  </div>`;
+}
+
+function wireEventRows(container) {
+  container.querySelectorAll("[data-ev-color]").forEach(inp => {
+    inp.addEventListener("input", (e) => {
+      e.stopPropagation();
+      const sk = currentOledScreenKey();
+      const evName = inp.dataset.evColor;
+      if (sk && oledEventKeys[sk]?.[evName]) {
+        oledEventKeys[sk][evName].color = inp.value;
+        saveOledEventKeys();
+        renderBoard();
+      }
+    });
+  });
+  container.querySelectorAll("[data-ev-led]").forEach(btn => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      openLedSettingsForKey(Number(btn.dataset.evLed));
+    });
+  });
+  container.querySelectorAll("[data-ev-assign]").forEach(btn => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      pendingEventAssign = btn.dataset.evAssign;
+      renderOledPillContent(); renderBoard();
+    });
+  });
+  container.querySelectorAll("[data-ev-clear]").forEach(btn => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const sk = currentOledScreenKey();
+      if (sk && oledEventKeys[sk]) { delete oledEventKeys[sk][btn.dataset.evClear]; }
+      saveOledEventKeys(); renderOledPillContent(); renderBoard();
+    });
+  });
+  container.querySelectorAll("[data-ev-cancel]").forEach(btn => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      pendingEventAssign = null;
+      renderOledPillContent(); renderBoard();
+    });
+  });
 }
 
 function renderOledPillNav() {
@@ -394,7 +534,7 @@ function renderOledPillNav() {
     case "layer": {
       const layer = getSavedLayers().find(l => l.id === screen.layerId);
       const idx   = getSavedLayers().indexOf(layer) + 1;
-      name = `Layer ${String(idx).padStart(2,"0")}${oledSubMode === "keycycle" ? " — Key Cycle" : ""}`;
+      name = `Layer ${String(idx).padStart(2,"0")}${oledSubMode === "keycycle" ? " — Present Keys" : ""}`;
       break;
     }
     case "timer":     name = "Timer";       break;
@@ -405,17 +545,24 @@ function renderOledPillNav() {
   const nameEl = document.getElementById("oled-screen-name");
   if (nameEl) nameEl.textContent = `${oledScreenIdx + 1} / ${screens.length} — ${name}`;
 
-  const pressBtn = document.getElementById("oled-enc-press");
-  if (!pressBtn) return;
-  const labels = {
-    layer:     oledSubMode === "keycycle" ? "↓ Exit Cycle" : "↓ Key Cycle",
-    timer:     oledTimerRunning ? "↓ Stop" : "↓ Start",
-    countdown: oledCdDone ? "↓ Reset" : (oledCdRunning ? "↓ Stop" : "↓ Next Field / Start"),
-    custom:    "",
-    datetime:  "",
-  };
-  pressBtn.textContent = labels[screen.type] ?? "↓ Press";
-  pressBtn.style.display = (screen.type === "custom" || screen.type === "datetime") ? "none" : "";
+  const removable = ["timer", "countdown", "datetime", "custom"].includes(screen.type);
+  const oldBtn = document.getElementById("oled-remove-screen");
+  if (oldBtn) {
+    const newBtn = oldBtn.cloneNode(true);
+    newBtn.style.display = removable ? "" : "none";
+    oldBtn.parentNode.replaceChild(newBtn, oldBtn);
+    if (removable) {
+      newBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const wasLast = oledScreenIdx >= getOledScreens().length - 1;
+        if (screen.type === "countdown") { oledCdRunning = false; oledCdDone = false; oledCdAcc = 0; }
+        oledCustomScreens = oledCustomScreens.filter(s => s.id !== screen.id);
+        saveOledCustomScreens();
+        if (wasLast) oledScreenIdx = Math.max(0, oledScreenIdx - 1);
+        updateOledDisplay(); renderOledPillNav(); renderOledPillContent();
+      });
+    }
+  }
 }
 
 function renderOledPillContent() {
@@ -434,87 +581,71 @@ function renderOledPillContent() {
             value="${layer?.name || ""}" placeholder="Layer name…" maxlength="${OLED_LAYER_NAME_MAX}" />
         </div>
         <div class="oled-pill-hint">
-          Press ↓ to enter key cycle mode — rotate CW/CCW to step through keys, press again to exit.
-          First ${OLED_LAYER_NAME_MAX} chars shown on OLED.
-        </div>`;
+          Layer name shown on OLED (max ${OLED_LAYER_NAME_MAX} chars). Present Keys cycles through key assignments.
+        </div>
+        <div class="oled-pill-section" style="padding-bottom:6px">
+          <span class="pill-label">OLED Events</span>
+        </div>
+        ${eventRowHTML("presentKeys", "Present Keys")}`;
       document.getElementById("oled-title-inp")?.addEventListener("input", (e) => {
         if (layer) { renameSavedLayer(layer.id, e.target.value); updateOledDisplay(); }
       });
+      wireEventRows(container);
       break;
     }
     case "timer": {
       container.innerHTML = `
         <div class="oled-pill-section oled-pill-hint">
-          Press encoder ↓ to start / stop. Resets when you navigate away.
+          Timer resets when you navigate to another screen.
         </div>
-        <div class="oled-pill-section">
-          <button class="oled-action-btn" id="oled-timer-reset">Reset Timer</button>
-          <button class="oled-action-btn oled-del-screen" id="oled-del-builtin" style="margin-left:auto">Remove</button>
-        </div>`;
-      document.getElementById("oled-timer-reset")?.addEventListener("click", () => {
-        oledTimerRunning = false; oledTimerAcc = 0; updateOledDisplay();
-      });
-      document.getElementById("oled-del-builtin")?.addEventListener("click", (e) => {
-        e.stopPropagation();
-        const wasLast = oledScreenIdx >= getOledScreens().length - 1;
-        oledCustomScreens = oledCustomScreens.filter(s => s.id !== screen.id);
-        saveOledCustomScreens();
-        if (wasLast) oledScreenIdx = Math.max(0, oledScreenIdx - 1);
-        updateOledDisplay(); renderOledPillNav(); renderOledPillContent();
-      });
+        <div class="oled-pill-section" style="padding-bottom:6px">
+          <span class="pill-label">OLED Events</span>
+        </div>
+        ${eventRowHTML("timerStartStop", "Start / Stop")}
+        ${eventRowHTML("timerReset", "Reset")}
+        ${eventRowHTML("presentKeys", "Present Keys")}`;
+      wireEventRows(container);
       break;
     }
     case "countdown": {
       container.innerHTML = `
         <div class="oled-pill-section oled-cd-setrow">
           <label class="oled-cd-field-lbl">H
-            <input class="oled-cd-num" id="oled-cd-h" type="number" min="0" max="23" value="${oledCdH}" />
+            <input class="oled-cd-num" id="oled-cd-h" type="number" min="0" max="99" step="1" value="${oledCdH}" />
           </label>
           <span class="oled-cd-sep">:</span>
           <label class="oled-cd-field-lbl">M
-            <input class="oled-cd-num" id="oled-cd-m" type="number" min="0" max="59" value="${oledCdM}" />
+            <input class="oled-cd-num" id="oled-cd-m" type="number" min="0" max="59" step="1" value="${oledCdM}" />
           </label>
           <span class="oled-cd-sep">:</span>
           <label class="oled-cd-field-lbl">S
-            <input class="oled-cd-num" id="oled-cd-s" type="number" min="0" max="59" value="${oledCdS}" />
+            <input class="oled-cd-num" id="oled-cd-s" type="number" min="0" max="59" step="1" value="${oledCdS}" />
           </label>
         </div>
         <div class="oled-pill-hint">
-          Rotate encoder to adjust selected field (underlined) · Press ↓ to cycle field, then start.
+          Rotate encoder to adjust the selected field.
         </div>
-        <div class="oled-pill-section">
-          <button class="oled-action-btn oled-del-screen" id="oled-del-cd">Remove</button>
-        </div>`;
-      document.getElementById("oled-cd-h")?.addEventListener("input", (e) => { oledCdH = Math.max(0, Math.min(23, +e.target.value||0)); updateOledDisplay(); });
-      document.getElementById("oled-cd-m")?.addEventListener("input", (e) => { oledCdM = Math.max(0, Math.min(59, +e.target.value||0)); updateOledDisplay(); });
-      document.getElementById("oled-cd-s")?.addEventListener("input", (e) => { oledCdS = Math.max(0, Math.min(59, +e.target.value||0)); updateOledDisplay(); });
-      container.querySelector("#oled-del-cd")?.addEventListener("click", (e) => {
-        e.stopPropagation();
-        const wasLast = oledScreenIdx >= getOledScreens().length - 1;
-        oledCdRunning = false; oledCdDone = false; oledCdAcc = 0;
-        oledCustomScreens = oledCustomScreens.filter(s => s.id !== screen.id);
-        saveOledCustomScreens();
-        if (wasLast) oledScreenIdx = Math.max(0, oledScreenIdx - 1);
-        updateOledDisplay(); renderOledPillNav(); renderOledPillContent();
-      });
+        <div class="oled-pill-section" style="padding-bottom:6px">
+          <span class="pill-label">OLED Events</span>
+        </div>
+        ${eventRowHTML("cdEvent", "Start / Stop")}
+        ${eventRowHTML("presentKeys", "Present Keys")}`;
+      document.getElementById("oled-cd-h")?.addEventListener("input", (e) => { oledCdH = Math.max(0, Math.min(99, parseInt(e.target.value, 10) || 0)); e.target.value = oledCdH; updateOledDisplay(); });
+      document.getElementById("oled-cd-m")?.addEventListener("input", (e) => { oledCdM = Math.max(0, Math.min(59, parseInt(e.target.value, 10) || 0)); e.target.value = oledCdM; updateOledDisplay(); });
+      document.getElementById("oled-cd-s")?.addEventListener("input", (e) => { oledCdS = Math.max(0, Math.min(59, parseInt(e.target.value, 10) || 0)); e.target.value = oledCdS; updateOledDisplay(); });
+      wireEventRows(container);
       break;
     }
     case "datetime": {
       container.innerHTML = `
         <div class="oled-pill-section oled-pill-hint">
-          Shows the current time and date. On hardware the RP2040 reads from its RTC.
+          Shows current time and date.
         </div>
-        <div class="oled-pill-section">
-          <button class="oled-action-btn oled-del-screen" id="oled-del-builtin">Remove</button>
-        </div>`;
-      document.getElementById("oled-del-builtin")?.addEventListener("click", (e) => {
-        e.stopPropagation();
-        const wasLast = oledScreenIdx >= getOledScreens().length - 1;
-        oledCustomScreens = oledCustomScreens.filter(s => s.id !== screen.id);
-        saveOledCustomScreens();
-        if (wasLast) oledScreenIdx = Math.max(0, oledScreenIdx - 1);
-        updateOledDisplay(); renderOledPillNav(); renderOledPillContent();
-      });
+        <div class="oled-pill-section" style="padding-bottom:6px">
+          <span class="pill-label">OLED Events</span>
+        </div>
+        ${eventRowHTML("presentKeys", "Present Keys")}`;
+      wireEventRows(container);
       break;
     }
     case "custom": {
@@ -539,9 +670,10 @@ function renderOledPillContent() {
           <span class="oled-img-notice">max 128×128</span>
           ${screen.imageDataUrl ? `<button class="oled-img-clear" id="oled-img-clear">✕</button>` : ""}
         </div>
-        <div class="oled-pill-section">
-          <button class="oled-action-btn oled-del-screen" id="oled-del-screen">Delete Screen</button>
-        </div>`;
+        <div class="oled-pill-section" style="padding-bottom:6px">
+          <span class="pill-label">OLED Events</span>
+        </div>
+        ${eventRowHTML("presentKeys", "Present Keys")}`;
       document.getElementById("oled-custom-title")?.addEventListener("input", (e) => {
         screen.title = e.target.value; saveOledCustomScreens(); updateOledDisplay();
       });
@@ -560,14 +692,7 @@ function renderOledPillContent() {
       document.getElementById("oled-img-clear")?.addEventListener("click", () => {
         screen.imageDataUrl = null; saveOledCustomScreens(); renderOledPillContent(); updateOledDisplay();
       });
-      document.getElementById("oled-del-screen")?.addEventListener("click", (e) => {
-        e.stopPropagation();
-        const wasLast = oledScreenIdx >= getOledScreens().length - 1;
-        oledCustomScreens = oledCustomScreens.filter(s => s.id !== screen.id);
-        saveOledCustomScreens();
-        if (wasLast) oledScreenIdx = Math.max(0, oledScreenIdx - 1);
-        updateOledDisplay(); renderOledPillNav(); renderOledPillContent();
-      });
+      wireEventRows(container);
       break;
     }
     default:
@@ -604,10 +729,9 @@ function oledAnimTick(now) {
     oledLastTick = now;
     const screenEl = document.querySelector(".oled-screen");
     if (screenEl) renderOledScreenContent(screenEl);
-    if (document.getElementById("oled-pill").classList.contains("visible")
-        && (s.type === "timer" || s.type === "countdown")) {
-      renderOledPillContent();
-    }
+    // Only update the OLED screen display; pill content (buttons) must not be
+    // rebuilt on the animation tick — replacing button DOM nodes while the
+    // user is clicking them swallows the click event.
   }
 
   oledAnimFrame = requestAnimationFrame(oledAnimTick);
@@ -1429,6 +1553,26 @@ async function init() {
   } catch {}
   const savedBack = localStorage.getItem(OLED_BACK_KEY);
   if (savedBack !== null) oledBackKeyIdx = Number(savedBack);
+  try {
+    const raw = JSON.parse(localStorage.getItem(OLED_EVENT_KEYS_KEY) || "{}");
+    // Discard the old pre-per-screen flat format (top-level values were numbers)
+    if (Object.values(raw).some(v => typeof v === "number")) {
+      oledEventKeys = {};
+    } else {
+      oledEventKeys = {};
+      for (const [sk, evMap] of Object.entries(raw)) {
+        if (!evMap || typeof evMap !== "object") continue;
+        oledEventKeys[sk] = {};
+        for (const [evName, v] of Object.entries(evMap)) {
+          if (typeof v === "number") {
+            oledEventKeys[sk][evName] = { idx: v, color: "#ff6e14" }; // migrate
+          } else if (v && typeof v.idx === "number") {
+            oledEventKeys[sk][evName] = v;
+          }
+        }
+      }
+    }
+  } catch {}
 
   renderBoard();
   startUgAnimation();
@@ -1722,13 +1866,31 @@ async function init() {
   document.getElementById("oled-nav-next").addEventListener("click", (e) => {
     e.stopPropagation(); oledScreenNav(1); renderOledPill();
   });
-  document.getElementById("oled-enc-press").addEventListener("click", (e) => {
-    e.stopPropagation(); onEncoderPress(); renderOledPill();
-  });
   document.getElementById("oled-add-screen").addEventListener("click", (e) => {
     e.stopPropagation();
     openScreenPicker();
   });
+}
+
+function evIdx(v)   { return typeof v === "number" ? v : (v?.idx ?? null); }
+function evColor(v) { return typeof v === "number" ? "#ff6e14" : (v?.color ?? "#ff6e14"); }
+
+function openLedSettingsForKey(keyIdx) {
+  for (const prev of selectedKeys) {
+    const prevEl = document.getElementById("key-" + prev);
+    if (prevEl) prevEl.classList.remove("sel");
+  }
+  keySelectionOrder = [keyIdx];
+  selectedKeys.clear();
+  selectedKeys.add(keyIdx);
+  const el = document.getElementById("key-" + keyIdx);
+  if (el) el.classList.add("sel");
+  loadKeyAnimState(keyIdx);
+  closeUnderglowPill();
+  closeOledPill();
+  syncKeyLedPill();
+  openKeyLedPill();
+  flashKey(keyIdx);
 }
 
 // ── Board render ───────────────────────────────────────────────────────────
@@ -1771,10 +1933,19 @@ function renderBoard() {
       encWrap.className = "encoder-wrap";
       encWrap.style.cssText = `grid-row:${pos.row};grid-column:${pos.col}`;
 
+      const encCycleActive = oledSubMode === "keycycle" && BOARD_POSITIONS[oledKeyCycleIdx]?.idx === pos.idx;
+      const encEvMapBsk    = currentOledScreenKey();
+      const encEvMap       = encEvMapBsk ? (oledEventKeys[encEvMapBsk] || {}) : {};
+      const encEvEntry     = Object.values(encEvMap).find(v => evIdx(v) === pos.idx);
+      const isEncEventKey  = !!encEvEntry;
       const enc = document.createElement("button");
       enc.id = "key-" + pos.idx;
       enc.title = "";
-      enc.className = "encoder-knob" + (isSel ? " sel" : "");
+      enc.className = "encoder-knob" + (isSel ? " sel" : "") + (encCycleActive ? " oled-key-active" : "") + (isEncEventKey ? " oled-event-key" : "");
+      if (isEncEventKey) {
+        const { r, g, b } = hexToRgb(evColor(encEvEntry));
+        enc.style.setProperty("--oled-ev-color", `rgba(${r},${g},${b},0.75)`);
+      }
       enc.textContent = "◉";
       enc.addEventListener("mousedown", (e) => { e.preventDefault(); onKeyDown(pos.idx); });
       enc.addEventListener("mouseenter", (e) => { onKeyEnter(pos.idx); showKeyTooltip(pos.idx, e.currentTarget); });
@@ -1801,14 +1972,25 @@ function renderBoard() {
       k.id = "key-" + pos.idx;
       k.title = "";
       const isEmpty = kc === "KC_NO" || kc === "KC_TRNS";
-      const isCycleActive = oledSubMode === "keycycle" && pos.idx === oledKeyCycleIdx;
-      const isBackKey     = pos.idx === oledBackKeyIdx;
+      const isCycleActive  = oledSubMode === "keycycle" && pos.idx === (BOARD_POSITIONS[oledKeyCycleIdx]?.idx);
+      const isBackKey      = pos.idx === oledBackKeyIdx;
+      const bsk            = currentOledScreenKey();
+      const bScreenEvMap   = bsk ? (oledEventKeys[bsk] || {}) : {};
+      const evEntry        = Object.values(bScreenEvMap).find(v => evIdx(v) === pos.idx);
+      const isEventKey     = !!evEntry;
+      const isAssigning    = pendingEventAssign !== null && !isEventKey && !isBackKey;
       k.className = "key"
         + (isSel ? " sel" : "")
         + (isEmpty ? " empty" : "")
         + (isCycleActive ? " oled-key-active" : "")
-        + (isBackKey ? " oled-back-key" : "");
+        + (isBackKey ? " oled-back-key" : "")
+        + (isEventKey ? " oled-event-key" : "")
+        + (isAssigning ? " oled-assigning" : "");
       k.style.cssText = `grid-row:${pos.row};grid-column:${pos.col}`;
+      if (isEventKey) {
+        const { r, g, b } = hexToRgb(evColor(evEntry));
+        k.style.setProperty("--oled-ev-color", `rgba(${r},${g},${b},0.75)`);
+      }
       const icon = keyIconLabels[pos.idx];
       const imgSrc = keyIconImages[pos.idx];
       if (imgSrc) {
@@ -1836,6 +2018,25 @@ function flashBoard() {
 }
 
 function onKeyDown(idx) {
+  // Assign mode: bind this key to the pending OLED event
+  if (pendingEventAssign !== null) {
+    const sk = currentOledScreenKey();
+    if (sk) {
+      oledEventKeys[sk] = oledEventKeys[sk] || {};
+      oledEventKeys[sk][pendingEventAssign] = { idx, color: "#ff6e14" };
+    }
+    saveOledEventKeys();
+    pendingEventAssign = null;
+    renderOledPillContent(); renderBoard();
+    return;
+  }
+
+  // Event key: trigger the bound OLED event for the current screen
+  const sk        = currentOledScreenKey();
+  const screenEvMap = sk ? (oledEventKeys[sk] || {}) : {};
+  const eventHit  = Object.entries(screenEvMap).find(([, v]) => evIdx(v) === idx);
+  if (eventHit) { triggerOledEvent(eventHit[0]); return; }
+
   // Back key pressed while in OLED sub-mode — exit to nav without touching LED selection.
   if (oledBackKeyIdx === idx && oledSubMode !== "nav") {
     oledSubMode = "nav";
@@ -2203,7 +2404,10 @@ function closeKeyLedPill() {
   document.getElementById("kc-adv-arrow").textContent = "▸";
 }
 function openOledPill()    { document.getElementById("oled-pill").classList.add("visible"); renderOledPill(); }
-function closeOledPill()   { document.getElementById("oled-pill").classList.remove("visible"); }
+function closeOledPill() {
+  document.getElementById("oled-pill").classList.remove("visible");
+  if (pendingEventAssign !== null) { pendingEventAssign = null; renderBoard(); }
+}
 
 function openScreenPicker() {
   if (document.getElementById("oled-screen-picker")) return;
