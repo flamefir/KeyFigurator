@@ -27,7 +27,7 @@
       </button>
       <div class="sl-dropdown" id="sl-dropdown">
         <div class="sl-new-row" id="sl-new-row">
-          <input type="text" id="sl-new-input" placeholder="Layer name…" />
+          <input type="text" id="sl-new-input" placeholder="Layer name…" maxlength="16" />
           <label class="sl-import-btn" title="Import layer from JSON file">
             ↑
             <input type="file" id="sl-import-file" accept=".json" style="display:none" />
@@ -177,6 +177,15 @@
           <button class="oled-remove-screen" id="oled-remove-screen" style="display:none">Remove</button>
         </div>
         <div class="oled-pill-content" id="oled-pill-content"></div>
+        <div class="oled-font-row">
+          <span class="pill-label">FONT</span>
+          <div class="oled-font-btns" id="oled-font-btns">
+            <button class="oled-font-btn" data-font="small">Small<span>5×7</span></button>
+            <button class="oled-font-btn" data-font="medium">Medium<span>6×8</span></button>
+            <button class="oled-font-btn" data-font="large">Large<span>8×8</span></button>
+            <button class="oled-font-btn" data-font="xl">XL<span>8×16</span></button>
+          </div>
+        </div>
       </div>
     </div>
 

@@ -82,9 +82,17 @@ let encoderMode   = "layer"; // "layer" | "scroll"
 const OLED_CUSTOM_KEY     = "kf-oled-custom";
 const OLED_CD_KEY         = "kf-oled-cd";
 const OLED_BACK_KEY       = "kf-oled-back";
-// Max chars that fit on the 120px screen at each font size (Courier New, with 110px text area)
-const OLED_LAYER_NAME_MAX  = 16;   // 10px Courier ≈ 6px/char → ~18 fit; 16 is the enforced display limit
-const OLED_CUSTOM_TITLE_MAX = 14;  // 13px Courier ≈ 7.8px/char → ~14 fit
+// Standard 128×128 OLED font presets — char limits derived from real glyph cell widths
+const OLED_FONTS = [
+  { id: "small",  label: "Small",  hw: "5×7",  previewPx: "8px",  nameMax: 21, titleMax: 19 },
+  { id: "medium", label: "Medium", hw: "6×8",  previewPx: "10px", nameMax: 16, titleMax: 14 },
+  { id: "large",  label: "Large",  hw: "8×8",  previewPx: "13px", nameMax: 13, titleMax: 11 },
+  { id: "xl",     label: "XL",     hw: "8×16", previewPx: "16px", nameMax: 11, titleMax:  9 },
+];
+let oledFontId = localStorage.getItem("kf-oled-font") || "medium";
+function getOledFont() { return OLED_FONTS.find(f => f.id === oledFontId) ?? OLED_FONTS[1]; }
+function oledNameMax()  { return getOledFont().nameMax; }
+function oledTitleMax() { return getOledFont().titleMax; }
 
 let oledScreenIdx    = 0;
 let oledSubMode      = "nav";       // "nav" | "keycycle"
@@ -225,13 +233,14 @@ function renderOledScreenContent(screenEl) {
           <div class="oled-kc-val">${disp}</div>
         </div>`;
       } else {
-        const layers = getSavedLayers();
-        const layer  = layers.find(l => l.id === screen.layerId);
-        const idx    = String(layers.indexOf(layer) + 1).padStart(2, "0");
-        const name   = (layer?.name || "").toUpperCase().slice(0, OLED_LAYER_NAME_MAX);
+        const layers    = getSavedLayers();
+        const layer     = layers.find(l => l.id === screen.layerId);
+        const idx       = String(layers.indexOf(layer) + 1).padStart(2, "0");
+        const name      = (layer?.name || "").toUpperCase().slice(0, oledNameMax());
+        const showTitle = layer?.showTitle !== false;
         screenEl.innerHTML = `<div class="oled-layer-screen">
           <div class="oled-lyr-idx">LAYER ${idx}</div>
-          <div class="oled-lyr-name">${name}</div>
+          ${showTitle && name ? `<div class="oled-lyr-name">${name}</div>` : ""}
         </div>`;
       }
       break;
@@ -281,7 +290,7 @@ function renderOledScreenContent(screenEl) {
       if (screen.imageDataUrl) {
         screenEl.innerHTML = `<img class="oled-custom-img" src="${screen.imageDataUrl}" alt="" />`;
       } else {
-        const title = (screen.title || "").toUpperCase().slice(0, OLED_CUSTOM_TITLE_MAX);
+        const title = (screen.title || "").toUpperCase().slice(0, oledTitleMax());
         const body  = screen.body || "";
         if (body) {
           screenEl.innerHTML = `<div class="oled-custom-screen">
@@ -532,8 +541,9 @@ function renderOledPillNav() {
   let name = "";
   switch (screen.type) {
     case "layer": {
-      const layer = getSavedLayers().find(l => l.id === screen.layerId);
-      const idx   = getSavedLayers().indexOf(layer) + 1;
+      const layers = getSavedLayers();
+      const layer  = layers.find(l => l.id === screen.layerId);
+      const idx    = layers.indexOf(layer) + 1;
       name = `Layer ${String(idx).padStart(2,"0")}${oledSubMode === "keycycle" ? " — Present Keys" : ""}`;
       break;
     }
@@ -574,14 +584,19 @@ function renderOledPillContent() {
   switch (screen.type) {
     case "layer": {
       const layer = getSavedLayers().find(l => l.id === screen.layerId);
+      const showTitle = layer?.showTitle !== false;
       container.innerHTML = `
         <div class="oled-pill-section">
           <span class="pill-label">TITLE</span>
           <input class="oled-title-inp" id="oled-title-inp" type="text"
-            value="${layer?.name || ""}" placeholder="Layer name…" maxlength="${OLED_LAYER_NAME_MAX}" />
+            value="${layer?.name || ""}" placeholder="Layer name…" maxlength="${oledNameMax()}" />
+          <label class="oled-show-title-wrap" title="Show title on OLED">
+            <input type="checkbox" id="oled-show-title" ${showTitle ? "checked" : ""} />
+            <span>Show</span>
+          </label>
         </div>
         <div class="oled-pill-hint">
-          Layer name shown on OLED (max ${OLED_LAYER_NAME_MAX} chars). Present Keys cycles through key assignments.
+          Layer name shown on OLED (max ${oledNameMax()} chars). Present Keys cycles through key assignments.
         </div>
         <div class="oled-pill-section" style="padding-bottom:6px">
           <span class="pill-label">OLED Events</span>
@@ -589,6 +604,9 @@ function renderOledPillContent() {
         ${eventRowHTML("presentKeys", "Present Keys")}`;
       document.getElementById("oled-title-inp")?.addEventListener("input", (e) => {
         if (layer) { renameSavedLayer(layer.id, e.target.value); updateOledDisplay(); }
+      });
+      document.getElementById("oled-show-title")?.addEventListener("change", (e) => {
+        if (layer) { setLayerShowTitle(layer.id, e.target.checked); updateOledDisplay(); }
       });
       wireEventRows(container);
       break;
@@ -656,7 +674,7 @@ function renderOledPillContent() {
         <div class="oled-pill-section">
           <span class="pill-label">TITLE</span>
           <input class="oled-title-inp" id="oled-custom-title" type="text"
-            value="${screen.title || ""}" placeholder="Screen title…" maxlength="${OLED_CUSTOM_TITLE_MAX}" />
+            value="${screen.title || ""}" placeholder="Screen title…" maxlength="${oledTitleMax()}" />
         </div>
         <div class="oled-pill-section" style="align-items:flex-start;flex-direction:column;gap:6px;padding-bottom:12px">
           <span class="pill-label">CONTEXT</span>
@@ -703,6 +721,20 @@ function renderOledPillContent() {
 
 function renderOledPill() {
   renderOledPillNav();
+  renderOledPillContent();
+}
+
+function applyOledFont(fontId) {
+  oledFontId = fontId;
+  localStorage.setItem("kf-oled-font", fontId);
+  const font = getOledFont();
+  document.documentElement.style.setProperty("--oled-lyr-font-size", font.previewPx);
+  const slInp = document.getElementById("sl-new-input");
+  if (slInp) slInp.maxLength = font.nameMax;
+  document.querySelectorAll(".oled-font-btn").forEach(btn => {
+    btn.classList.toggle("active", btn.dataset.font === fontId);
+  });
+  updateOledDisplay();
   renderOledPillContent();
 }
 
@@ -1870,6 +1902,13 @@ async function init() {
     e.stopPropagation();
     openScreenPicker();
   });
+
+  // OLED font picker
+  document.getElementById("oled-font-btns").addEventListener("click", (e) => {
+    const btn = e.target.closest(".oled-font-btn");
+    if (btn) { e.stopPropagation(); applyOledFont(btn.dataset.font); }
+  });
+  applyOledFont(oledFontId);
 }
 
 function evIdx(v)   { return typeof v === "number" ? v : (v?.idx ?? null); }
@@ -1999,7 +2038,10 @@ function renderBoard() {
         imgEl.className = "key-icon-img";
         k.appendChild(imgEl);
       } else {
-        k.textContent = icon || (isEmpty ? "·" : kc.replace(/^KC_/, ""));
+        const label = document.createElement("span");
+        label.className = "key-label";
+        label.textContent = icon || (isEmpty ? "·" : kc.replace(/^KC_/, ""));
+        k.appendChild(label);
       }
       k.addEventListener("mousedown", (e) => { e.preventDefault(); onKeyDown(pos.idx); });
       k.addEventListener("mouseenter", (e) => { onKeyEnter(pos.idx); showKeyTooltip(pos.idx, e.currentTarget); });
@@ -2176,6 +2218,15 @@ function renameSavedLayer(id, name) {
   const layer = layers.find(l => l.id === id);
   if (layer) {
     layer.name = name;
+    localStorage.setItem(LAYERS_KEY, JSON.stringify(layers));
+  }
+}
+
+function setLayerShowTitle(id, show) {
+  const layers = getSavedLayers();
+  const layer = layers.find(l => l.id === id);
+  if (layer) {
+    layer.showTitle = show;
     localStorage.setItem(LAYERS_KEY, JSON.stringify(layers));
   }
 }
