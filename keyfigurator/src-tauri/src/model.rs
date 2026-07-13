@@ -99,6 +99,70 @@ pub struct HostBinding {
     pub cwd: Option<String>,
 }
 
+/// OLED screen configuration - mirrors the firmware's on-device screen model
+/// (Macro-Pro-Firmware keyboards/macro_pad_pro/kf_hid.h, KF_CMD_OLED_*).
+/// v1: RAM-only on the board, so the app re-pushes this on every reconnect
+/// (see hid.rs::HidTransport::push_oled_config).
+pub const OLED_LAYER_NAME_MAX: usize = 16;
+pub const OLED_CUSTOM_TITLE_MAX: usize = 14;
+pub const OLED_CUSTOM_BODY_MAX: usize = 48;
+pub const OLED_MAX_CUSTOM_SCREENS: usize = 6;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum OledScreenType {
+    Timer = 1,
+    Countdown = 2,
+    Datetime = 3,
+    CustomText = 4,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OledLayerInfo {
+    pub show_title: bool,
+    /// Truncated to OLED_LAYER_NAME_MAX bytes on the wire.
+    pub name: String,
+}
+
+impl Default for OledLayerInfo {
+    fn default() -> Self {
+        Self {
+            show_title: true,
+            name: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OledCustomScreen {
+    pub screen_type: OledScreenType,
+    /// Truncated to OLED_CUSTOM_TITLE_MAX bytes on the wire.
+    pub title: String,
+    /// Truncated to OLED_CUSTOM_BODY_MAX bytes on the wire.
+    pub body: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OledConfig {
+    /// Exactly LAYER_COUNT entries, one per hardware layer.
+    pub layers: [OledLayerInfo; LAYER_COUNT],
+    /// At most OLED_MAX_CUSTOM_SCREENS entries.
+    pub custom_screens: Vec<OledCustomScreen>,
+    /// Single global countdown duration (h, m, s) - the board only tracks
+    /// one countdown instance, matching the app's own model.
+    pub countdown: (u8, u8, u8),
+}
+
+impl Default for OledConfig {
+    fn default() -> Self {
+        Self {
+            layers: std::array::from_fn(|_| OledLayerInfo::default()),
+            custom_screens: Vec::new(),
+            countdown: (0, 1, 0),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,5 +189,26 @@ mod tests {
         let json = serde_json::to_string(&m).unwrap();
         let back: KeyMap = serde_json::from_str(&json).unwrap();
         assert_eq!(m, back);
+    }
+
+    #[test]
+    fn oled_config_default_has_right_shape() {
+        let cfg = OledConfig::default();
+        assert_eq!(cfg.layers.len(), LAYER_COUNT);
+        assert!(cfg.custom_screens.is_empty());
+    }
+
+    #[test]
+    fn oled_config_serde_roundtrip() {
+        let mut cfg = OledConfig::default();
+        cfg.layers[0].name = "NUMPAD".into();
+        cfg.custom_screens.push(OledCustomScreen {
+            screen_type: OledScreenType::Timer,
+            title: String::new(),
+            body: String::new(),
+        });
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: OledConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(cfg, back);
     }
 }

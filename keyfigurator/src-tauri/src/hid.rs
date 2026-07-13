@@ -19,7 +19,12 @@
 //! 21 = top-left, 22 = top-right, 23 = bottom-right, 24 = bottom-left.
 
 use crate::keycodes;
-use crate::model::{KeyMap, Layer, LedState, KEY_COUNT, LAYER_COUNT, UNDERGLOW_COUNT};
+use crate::model::{
+    KeyMap, Layer, LedState, OledConfig, OledScreenType, KEY_COUNT, LAYER_COUNT,
+    OLED_CUSTOM_BODY_MAX, OLED_CUSTOM_TITLE_MAX, OLED_LAYER_NAME_MAX, OLED_MAX_CUSTOM_SCREENS,
+    UNDERGLOW_COUNT,
+};
+use chrono::{Datelike, Local, Timelike};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
@@ -36,6 +41,11 @@ pub enum Cmd {
     SetLeds = 0x20,
     RunHostCmd = 0x30,   // board -> host: "run this bound command" (index only)
     EepromCommit = 0x40, // host -> board: persist LED overlay to EEPROM
+    OledSetLayer = 0x50,
+    OledSetScreens = 0x51,
+    OledSetText = 0x52,
+    OledSetCountdown = 0x53,
+    OledSyncTime = 0x54,
 }
 
 /// SET_LEDS control-frame selectors (first payload byte).
@@ -72,6 +82,13 @@ pub trait HidTransport: Send {
     fn set_keymap(&mut self, map: &KeyMap) -> Result<(), HidError>;
     fn set_leds(&mut self, leds: &LedState) -> Result<(), HidError>;
     fn eeprom_commit(&mut self) -> Result<(), HidError>;
+    /// Push the full OLED screen configuration (layer titles + custom
+    /// screens + countdown duration). RAM-only on the board (v1) - call this
+    /// on every reconnect, same pattern as keymap/LED profile application.
+    fn push_oled_config(&mut self, cfg: &OledConfig) -> Result<(), HidError>;
+    /// Sync the board's free-running clock to this machine's local time.
+    /// Call alongside push_oled_config so any DATETIME screen is accurate.
+    fn sync_oled_time(&mut self) -> Result<(), HidError>;
     /// Drain any RunHostCmd indices the board has sent since the last call.
     fn poll_host_cmds(&mut self) -> Vec<u8> {
         Vec::new()
@@ -136,6 +153,12 @@ impl HidTransport for MockHid {
     }
     fn eeprom_commit(&mut self) -> Result<(), HidError> {
         Ok(()) // mock: already in EEPROM (there is no real EEPROM)
+    }
+    fn push_oled_config(&mut self, _cfg: &OledConfig) -> Result<(), HidError> {
+        Ok(()) // mock: no screen to render
+    }
+    fn sync_oled_time(&mut self) -> Result<(), HidError> {
+        Ok(())
     }
     fn is_mock(&self) -> bool {
         true
@@ -323,6 +346,44 @@ impl HidTransport for RealHid {
         self.xfer_ok(Cmd::EepromCommit, &[], "EepromCommit")
     }
 
+    fn push_oled_config(&mut self, cfg: &OledConfig) -> Result<(), HidError> {
+        for (layer, info) in cfg.layers.iter().enumerate() {
+            let name = truncate_str(&info.name, OLED_LAYER_NAME_MAX);
+            let mut payload = vec![layer as u8, info.show_title as u8, name.len() as u8];
+            payload.extend_from_slice(name.as_bytes());
+            self.xfer_ok(Cmd::OledSetLayer, &payload, "OledSetLayer")?;
+        }
+
+        let count = cfg.custom_screens.len().min(OLED_MAX_CUSTOM_SCREENS);
+        let mut screens_payload = vec![count as u8];
+        screens_payload.extend(cfg.custom_screens.iter().take(count).map(|s| s.screen_type as u8));
+        self.xfer_ok(Cmd::OledSetScreens, &screens_payload, "OledSetScreens")?;
+
+        for (slot, screen) in cfg.custom_screens.iter().take(count).enumerate() {
+            send_oled_text_chunked(self, slot as u8, 0, &screen.title, OLED_CUSTOM_TITLE_MAX)?;
+            send_oled_text_chunked(self, slot as u8, 1, &screen.body, OLED_CUSTOM_BODY_MAX)?;
+        }
+
+        let (h, m, s) = cfg.countdown;
+        self.xfer_ok(Cmd::OledSetCountdown, &[h, m, s], "OledSetCountdown")
+    }
+
+    fn sync_oled_time(&mut self) -> Result<(), HidError> {
+        let now = Local::now();
+        let year_offset = (now.year() - 2000).clamp(0, 255) as u8;
+        let month = now.month() as u8;
+        let day = now.day() as u8;
+        let hour = now.hour() as u8;
+        let minute = now.minute() as u8;
+        let second = now.second() as u8;
+        let weekday = now.weekday().num_days_from_sunday() as u8;
+        self.xfer_ok(
+            Cmd::OledSyncTime,
+            &[year_offset, month, day, hour, minute, second, weekday],
+            "OledSyncTime",
+        )
+    }
+
     fn poll_host_cmds(&mut self) -> Vec<u8> {
         // non-blocking drain of anything the board pushed since last poll
         loop {
@@ -342,6 +403,47 @@ impl HidTransport for RealHid {
         }
         std::mem::take(&mut self.pending_host_cmds)
     }
+}
+
+/// Truncate to at most `max` bytes without splitting a UTF-8 char boundary.
+/// The firmware only ever renders ASCII, but this keeps a stray multi-byte
+/// char from producing an invalid slice.
+fn truncate_str(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// OLED_SET_TEXT is chunked: 32 - 2 (magic/cmd) - 4 (slot, field, offset,
+/// len) = 26 payload bytes per report (see kf_hid.h).
+const OLED_TEXT_CHUNK: usize = 26;
+
+fn send_oled_text_chunked(
+    hid: &mut RealHid,
+    slot: u8,
+    field: u8,
+    text: &str,
+    max: usize,
+) -> Result<(), HidError> {
+    let bytes = truncate_str(text, max).as_bytes();
+    if bytes.is_empty() {
+        // still clear the field on the board
+        return hid.xfer_ok(Cmd::OledSetText, &[slot, field, 0, 0], "OledSetText");
+    }
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let len = (bytes.len() - offset).min(OLED_TEXT_CHUNK);
+        let mut payload = vec![slot, field, offset as u8, len as u8];
+        payload.extend_from_slice(&bytes[offset..offset + len]);
+        hid.xfer_ok(Cmd::OledSetText, &payload, "OledSetText")?;
+        offset += len;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -401,5 +503,44 @@ mod tests {
         assert!(2 + 2 + LED_CHUNK * 3 <= REPORT_LEN);
         // 2 + 3 header + 13*2 keycodes = 31
         assert!(2 + 3 + KEYMAP_CHUNK * 2 <= REPORT_LEN);
+
+        // OLED text: 2 magic/cmd + 4 header (slot,field,offset,len) + 26 bytes = 32
+        assert!(2 + 4 + OLED_TEXT_CHUNK <= REPORT_LEN);
+        // title (14) fits in one chunk, body (48) needs two (26 + 22)
+        assert!(crate::model::OLED_CUSTOM_TITLE_MAX <= OLED_TEXT_CHUNK);
+        let body_chunks: Vec<usize> = (0..crate::model::OLED_CUSTOM_BODY_MAX)
+            .step_by(OLED_TEXT_CHUNK)
+            .map(|o| (crate::model::OLED_CUSTOM_BODY_MAX - o).min(OLED_TEXT_CHUNK))
+            .collect();
+        assert_eq!(body_chunks, vec![26, 22]);
+    }
+
+    #[test]
+    fn truncate_str_respects_utf8_boundaries() {
+        assert_eq!(truncate_str("hello", 10), "hello");
+        assert_eq!(truncate_str("hello world", 5), "hello");
+        // multi-byte char ('é' = 2 bytes) right at the cut point must not split
+        let s = "café";
+        assert_eq!(truncate_str(s, 4), "caf"); // would split é's 2 bytes at offset 4
+        assert!(truncate_str(s, 4).len() <= 4);
+    }
+
+    #[test]
+    fn oled_set_layer_frame_layout_matches_firmware() {
+        // layer 2, show_title=true, name "NUMPAD" (6 bytes) -> kf_hid.c reads
+        // p[0]=layer p[1]=show_title p[2]=len p[3..]=name
+        let mut payload = vec![2u8, 1, 6];
+        payload.extend_from_slice(b"NUMPAD");
+        let r = frame_report(Cmd::OledSetLayer, &payload);
+        assert_eq!(&r[..9], &[0xC0, 0x50, 2, 1, 6, b'N', b'U', b'M', b'P']);
+    }
+
+    #[test]
+    fn oled_screen_type_values_match_firmware_enum() {
+        // must match enum kf_screen_type in kf_hid.h exactly
+        assert_eq!(OledScreenType::Timer as u8, 1);
+        assert_eq!(OledScreenType::Countdown as u8, 2);
+        assert_eq!(OledScreenType::Datetime as u8, 3);
+        assert_eq!(OledScreenType::CustomText as u8, 4);
     }
 }

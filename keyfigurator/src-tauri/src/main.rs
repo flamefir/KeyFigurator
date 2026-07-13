@@ -12,7 +12,7 @@ mod model;
 mod runner;
 
 use hid::{HidTransport, MockHid, RealHid};
-use model::{HostBinding, KeyMap, LedState};
+use model::{HostBinding, KeyMap, LedState, OledConfig};
 use std::sync::Mutex;
 use tauri::{Manager, State};
 use tauri::window::Color;
@@ -66,6 +66,17 @@ fn eeprom_commit(state: State<AppState>) -> Result<(), String> {
         .unwrap()
         .eeprom_commit()
         .map_err(|e| e.to_string())
+}
+
+/// Push OLED screen config (layer titles, custom screens, countdown
+/// duration) and sync the board's clock in one call. RAM-only on the board
+/// (v1) - the frontend should call this on every reconnect and whenever the
+/// OLED designer's config changes, same pattern as the keymap/LED profile.
+#[tauri::command]
+fn push_oled_config(state: State<AppState>, config: OledConfig) -> Result<(), String> {
+    let mut transport = state.transport.lock().unwrap();
+    transport.push_oled_config(&config).map_err(|e| e.to_string())?;
+    transport.sync_oled_time().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -168,6 +179,7 @@ fn main() {
             run_binding,
             poll_host_cmds,
             try_connect,
+            push_oled_config,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

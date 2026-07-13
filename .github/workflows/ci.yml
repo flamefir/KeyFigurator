@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+# Runs on windows-latest (stock MSVC toolchain, no path-space workarounds
+# needed - those only exist for this dev machine's portable toolchain, see
+# the vault Firmware/Build-Guide.md).
+jobs:
+  rust:
+    name: cargo test (backend)
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: keyfigurator/src-tauri
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: keyfigurator/src-tauri
+      - run: cargo test --verbose
+
+  frontend:
+    name: build + smoke test (frontend)
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: keyfigurator
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: keyfigurator/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - run: npx playwright install --with-deps chromium
+      - run: npx playwright test
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-report
+          path: keyfigurator/playwright-report/
+          retention-days: 14
