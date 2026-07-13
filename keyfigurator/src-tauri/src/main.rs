@@ -7,10 +7,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod hid;
+mod keycodes;
 mod model;
 mod runner;
 
-use hid::{HidTransport, MockHid};
+use hid::{HidTransport, MockHid, RealHid};
 use model::{HostBinding, KeyMap, LedState};
 use std::sync::Mutex;
 use tauri::{Manager, State};
@@ -89,10 +90,55 @@ fn run_binding(state: State<AppState>, index: u8) -> Result<String, String> {
     ))
 }
 
+/// Drain RunHostCmd packets from the board and execute the bound commands.
+/// Called on an interval by the frontend; returns a log line per execution.
+#[tauri::command]
+fn poll_host_cmds(state: State<AppState>) -> Vec<String> {
+    let indices = state.transport.lock().unwrap().poll_host_cmds();
+    if indices.is_empty() {
+        return Vec::new();
+    }
+    let bindings = state.bindings.lock().unwrap();
+    indices
+        .into_iter()
+        .map(|index| match runner::run_binding(&bindings, index) {
+            Ok(out) => format!("HOST({index}): exit={:?}", out.status),
+            Err(e) => format!("HOST({index}): {e}"),
+        })
+        .collect()
+}
+
+/// Retry connecting to the real board; used by the frontend's reconnect poll.
+/// Returns true if the active transport is now a real board.
+#[tauri::command]
+fn try_connect(state: State<AppState>) -> bool {
+    let mut transport = state.transport.lock().unwrap();
+    if !transport.is_mock() && transport.is_connected() {
+        return true;
+    }
+    match RealHid::open() {
+        Ok(real) => {
+            *transport = Box::new(real);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 fn main() {
-    // Until boards arrive: MockHid. When they do: Box::new(RealHid::open()?...).
+    // Prefer the real board; fall back to the mock so the UI always works.
+    let transport: Box<dyn HidTransport> = match RealHid::open() {
+        Ok(real) => {
+            eprintln!("keyfigurator: connected to Macro Pad Pro");
+            Box::new(real)
+        }
+        Err(_) => {
+            eprintln!("keyfigurator: no board found, using MockHid");
+            Box::new(MockHid::new())
+        }
+    };
     let state = AppState {
-        transport: Mutex::new(Box::new(MockHid::new())),
+        transport: Mutex::new(transport),
         bindings: Mutex::new(vec![HostBinding {
             index: 0,
             label: "git commit (wip)".into(),
@@ -120,6 +166,8 @@ fn main() {
             get_bindings,
             set_bindings,
             run_binding,
+            poll_host_cmds,
+            try_connect,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

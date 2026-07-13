@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 
 pub const KEY_COUNT: usize = 21;
 pub const LAYER_COUNT: usize = 4;
+/// Underglow corners, in wire-slot order: top-left, top-right, bottom-right,
+/// bottom-left (LED slots 21..=24, see hid.rs / firmware kf_hid.h).
+pub const UNDERGLOW_COUNT: usize = 4;
 
 /// RGB as [r, g, b].
 pub type Rgb = [u8; 3];
@@ -78,7 +81,7 @@ impl LedState {
     pub fn all_off(key_count: usize) -> Self {
         Self {
             keys: vec![[0, 0, 0]; key_count],
-            underglow: vec![[0, 0, 0]; 6],
+            underglow: vec![[0, 0, 0]; UNDERGLOW_COUNT],
             brightness: 180,
         }
     }

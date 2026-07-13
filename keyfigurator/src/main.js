@@ -2701,7 +2701,9 @@ let _wasConnected = false;
 
 async function pollConnection() {
   try {
-    const connected = await invoke("is_connected");
+    // try_connect upgrades mock -> real board when one appears (and answers
+    // whether the active transport is a real, live board)
+    const connected = hasTauri ? await invoke("try_connect") : await invoke("is_connected");
     const connPill  = document.getElementById("conn");
     if (connPill) {
       connPill.textContent = connected ? "● connected" : "○ no device";
@@ -2714,7 +2716,17 @@ async function pollConnection() {
   } catch {}
 }
 
+// Drain HOST(n) key presses from the board; the backend runs the bound command.
+async function pollHostCmds() {
+  if (!hasTauri || !_wasConnected) return;
+  try {
+    const results = await invoke("poll_host_cmds");
+    for (const line of results || []) console.log("[host-cmd]", line);
+  } catch {}
+}
+
 init().then(() => {
   _wasConnected = true; // init already applied the profile; don't re-push on first poll
   setInterval(pollConnection, 3000);
+  setInterval(pollHostCmds, 300);
 });
