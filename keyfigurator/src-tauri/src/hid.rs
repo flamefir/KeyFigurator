@@ -15,6 +15,10 @@
 use crate::kf_protocol::{self as kf, BoardModel, REPORT_LEN};
 use crate::model::{KeyMap, Layer, LedState, OledConfig};
 use serde::Serialize;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 #[derive(Debug, thiserror::Error)]
 pub enum HidError {
@@ -226,34 +230,156 @@ impl HidTransport for MockHid {
 }
 
 // ---------------------------------------------------------------------------
-// Real: talks to the actual board over Raw HID via `hidapi`. STUBBED until
-// boards arrive — only `transceive` (a USB write + read on the KeyFigurator
-// interface) is left to implement; all protocol logic above is already shared.
+// Real: talks to the actual board over Raw HID via `hidapi`.
+//
+// The `HidDevice` is not `Sync`, and unsolicited RUN_HOST_CMD packets share the
+// single IN pipe with command responses. So one dedicated I/O thread OWNS the
+// device and serializes all access: `transceive` hands it a request over a
+// channel and blocks for the reply; when idle the thread polls for unsolicited
+// RUN_HOST_CMD packets and forwards their index to the host-cmd channel.
+//
 // Identity constants live in kf_protocol (kf::VENDOR_ID / PRODUCT_ID / USAGE*).
+// Untestable without a board — validate against hardware during bring-up.
 // ---------------------------------------------------------------------------
+type IoRequest = ([u8; REPORT_LEN], Sender<Result<[u8; REPORT_LEN], HidError>>);
+
 pub struct RealHid {
-    // device: Option<hidapi::HidDevice>,  // uncomment when wiring hidapi
+    req_tx: Mutex<Sender<IoRequest>>,
+    connected: Arc<AtomicBool>,
 }
 
 impl RealHid {
-    pub fn open() -> Result<Self, HidError> {
-        // TODO when boards arrive:
-        //  let api = hidapi::HidApi::new().map_err(|e| HidError::Io(e.to_string()))?;
-        //  enumerate for kf::VENDOR_ID/PRODUCT_ID on usage_page kf::USAGE_PAGE /
-        //  usage kf::USAGE, open it, keep the handle. Also spawn a read thread that
-        //  parses inbound frames with kf::parse_run_host_cmd(..) and forwards the
-        //  index to the host-cmd channel (see main.rs).
-        Err(HidError::NotConnected)
+    /// Open the KeyFigurator Raw HID interface and start its I/O thread.
+    /// `host_cmd_tx` receives the binding index whenever the board sends an
+    /// unsolicited RUN_HOST_CMD packet. Returns quickly with `NotConnected` if
+    /// no matching board is present, so callers can fall back to `MockHid`.
+    pub fn open(host_cmd_tx: Sender<u8>) -> Result<Self, HidError> {
+        let (req_tx, req_rx) = channel::<IoRequest>();
+        let (ready_tx, ready_rx) = channel::<Result<(), String>>();
+        let connected = Arc::new(AtomicBool::new(false));
+        let conn_thread = connected.clone();
+
+        std::thread::Builder::new()
+            .name("kf-hid-io".into())
+            .spawn(move || {
+                // HidApi + HidDevice live entirely in this thread (HidDevice is
+                // not Sync) and stay alive together for the loop's duration.
+                let api = match hidapi::HidApi::new() {
+                    Ok(a) => a,
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(e.to_string()));
+                        return;
+                    }
+                };
+                let device = match find_and_open(&api) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(e));
+                        return;
+                    }
+                };
+                conn_thread.store(true, Ordering::SeqCst);
+                let _ = ready_tx.send(Ok(()));
+                io_loop(&device, &req_rx, &host_cmd_tx);
+                conn_thread.store(false, Ordering::SeqCst);
+            })
+            .map_err(|e| HidError::Io(e.to_string()))?;
+
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(RealHid {
+                req_tx: Mutex::new(req_tx),
+                connected,
+            }),
+            Ok(Err(e)) => Err(HidError::Io(e)),
+            Err(_) => Err(HidError::Io("hid i/o thread exited before init".into())),
+        }
     }
+}
+
+/// Find the KeyFigurator interface (VID/PID on the QMK Raw HID usage) and open it.
+fn find_and_open(api: &hidapi::HidApi) -> Result<hidapi::HidDevice, String> {
+    let info = api
+        .device_list()
+        .find(|d| {
+            d.vendor_id() == kf::VENDOR_ID
+                && d.product_id() == kf::PRODUCT_ID
+                && d.usage_page() == kf::USAGE_PAGE
+                && d.usage() == kf::USAGE
+        })
+        .ok_or_else(|| "no KeyFigurator interface found".to_string())?;
+    info.open_device(api).map_err(|e| e.to_string())
+}
+
+/// The single-owner I/O loop. Services `transceive` requests and, when idle,
+/// drains unsolicited RUN_HOST_CMD packets to `host_cmd_tx`.
+fn io_loop(device: &hidapi::HidDevice, req_rx: &Receiver<IoRequest>, host_cmd_tx: &Sender<u8>) {
+    loop {
+        match req_rx.try_recv() {
+            Ok((frame, resp_tx)) => {
+                let _ = resp_tx.send(write_then_read(device, &frame, host_cmd_tx));
+            }
+            Err(TryRecvError::Empty) => {
+                // No pending request — poll briefly for unsolicited packets.
+                let mut buf = [0u8; REPORT_LEN];
+                match device.read_timeout(&mut buf, 10) {
+                    Ok(n) if n > 0 => {
+                        if let Some(idx) = kf::parse_run_host_cmd(&buf) {
+                            let _ = host_cmd_tx.send(idx);
+                        }
+                    }
+                    Ok(_) => {}         // timeout, nothing available
+                    Err(_) => break,    // device gone
+                }
+            }
+            Err(TryRecvError::Disconnected) => break, // RealHid dropped
+        }
+    }
+}
+
+/// Write one request frame, then read until the matching response arrives,
+/// forwarding any interleaved RUN_HOST_CMD packets to `host_cmd_tx`.
+fn write_then_read(
+    device: &hidapi::HidDevice,
+    frame: &[u8; REPORT_LEN],
+    host_cmd_tx: &Sender<u8>,
+) -> Result<[u8; REPORT_LEN], HidError> {
+    // QMK Raw HID uses report id 0: prepend a 0x00 report-id byte on write.
+    let mut wbuf = [0u8; REPORT_LEN + 1];
+    wbuf[1..].copy_from_slice(frame);
+    device.write(&wbuf).map_err(|e| HidError::Io(e.to_string()))?;
+
+    // Up to ~2s (100 × 20ms) for the response.
+    for _ in 0..100 {
+        let mut buf = [0u8; REPORT_LEN];
+        let n = device
+            .read_timeout(&mut buf, 20)
+            .map_err(|e| HidError::Io(e.to_string()))?;
+        if n == 0 {
+            continue;
+        }
+        if let Some(idx) = kf::parse_run_host_cmd(&buf) {
+            let _ = host_cmd_tx.send(idx); // unsolicited; not our response
+            continue;
+        }
+        return Ok(buf);
+    }
+    Err(HidError::Io("timeout waiting for board response".into()))
 }
 
 impl HidTransport for RealHid {
     fn is_connected(&self) -> bool {
-        false
+        self.connected.load(Ordering::SeqCst)
     }
-    fn transceive(&mut self, _frame: &[u8; REPORT_LEN]) -> Result<[u8; REPORT_LEN], HidError> {
-        // TODO: device.write(frame)?; device.read(&mut buf)?; return buf.
-        Err(HidError::NotConnected)
+    fn transceive(&mut self, frame: &[u8; REPORT_LEN]) -> Result<[u8; REPORT_LEN], HidError> {
+        let (resp_tx, resp_rx) = channel();
+        self.req_tx
+            .lock()
+            .unwrap()
+            .send((*frame, resp_tx))
+            .map_err(|_| HidError::NotConnected)?;
+        resp_rx
+            .recv_timeout(Duration::from_secs(3))
+            .map_err(|_| HidError::Io("hid i/o thread timeout".into()))?
     }
 }
 

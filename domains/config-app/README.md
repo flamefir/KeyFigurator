@@ -17,9 +17,9 @@ host-side command bindings (run scripts/git from a key). See [[vial-vs-custom-co
 The app now speaks the firmware's **KeyFigurator Raw HID protocol** byte-for-byte, proven
 against a software model of the board (`kf_protocol::BoardModel`, 23 Rust tests). Everything
 the differentiator needs — keymap, per-key + underglow RGB, OLED, the host-command/git layer —
-is wired and testable with **no hardware**. The only thing between the mock and a real board
-is `RealHid`'s USB transport (hidapi); all protocol logic is already shared between mock and
-real. After that: physical bring-up (a human gate) and the `/pr` harness.
+is wired and testable with **no hardware**. `RealHid`'s USB transport (hidapi) is now
+implemented too — the app auto-detects a real board at startup and falls back to the mock —
+so the remaining work is purely **physical bring-up** (a human gate) and the `/pr` harness.
 
 ## Backlog
 
@@ -46,9 +46,12 @@ real. After that: physical bring-up (a human gate) and the `/pr` harness.
 - [x] PING protocol-version negotiation
 - [x] The keymap/RGB data model now matches the REAL matrix/LED indices → wrote [[keymatrix-led-layout]]
 
-### Blocked on physical boards — the only remaining gap
-- [ ] `RealHid` USB transport: hidapi enumerate/open + inbound read thread (only `transceive` left; protocol shared with mock)
-- [ ] Physical verification: LEDs/OLED actually change, a `HOST(n)` press runs on the host (human gate)
+### Done — RealHid USB transport (2026-07-25)
+- [x] `RealHid` implemented: hidapi enumerate/open on VID/PID `0xFEED/0x4D50` (usage `0xFF60/0x61`), single-owner I/O thread serializing all access, inbound RUN_HOST_CMD reader → host-cmd channel. App auto-detects a board at startup and falls back to `MockHid`. **Compiles + falls back cleanly; unverified on real hardware.**
+
+### Blocked on physical boards — the only remaining gap (human gate)
+- [ ] Bring-up validation of `RealHid` on a real board (enumeration, read/write timing, report-id framing)
+- [ ] Physical verification: LEDs/OLED actually change, a `HOST(n)` press runs on the host
 - [ ] Confirm underglow corner orientation (TL/TR/BR/BL) on a real board
 
 ### Remaining app work
@@ -65,3 +68,4 @@ real. After that: physical bring-up (a human gate) and the `/pr` harness.
 2026-06-23 | setup — domain created; Tauri chosen; Raw HID architecture adopted; app scaffolded.
 2026-07-25 | backlog burndown — full mock-side editor shipped on `feature/backlog-clear` (19 commits: keymap/RGB/OLED/encoder editors, host-command runner, saved layers, save-to-board, reconnect auto-apply). Remaining work is hardware/firmware-blocked + repo harness.
 2026-07-25 | app⟷firmware integration — aligned the app to the firmware's KeyFigurator Raw HID protocol byte-for-byte: new `kf_protocol.rs` (mirrors `kf_hid.h`, test-pinned), keycode codec, fixed LED payload + IDs + framing, OLED + host-cmd + PING wired, [[keymatrix-led-layout]] written. Only `RealHid` USB transport + physical bring-up remain.
+2026-07-25 | RealHid USB transport — implemented the hidapi transport (enumerate/open + single-owner I/O thread + inbound RUN_HOST_CMD reader); app auto-detects a board and falls back to MockHid. Compiles + falls back cleanly; awaiting a real board for bring-up. Only the physical human gate remains.

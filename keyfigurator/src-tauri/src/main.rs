@@ -11,7 +11,7 @@ mod kf_protocol;
 mod model;
 mod runner;
 
-use hid::{HidTransport, MockHid, PingInfo};
+use hid::{HidTransport, MockHid, PingInfo, RealHid};
 use model::{HostBinding, KeyMap, LedState, OledConfig};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
@@ -159,11 +159,22 @@ fn main() {
         cwd: None,
     }]));
 
-    // Until boards arrive: MockHid. When they do: Box::new(RealHid::open()?...),
-    // and have RealHid's read thread forward inbound RunHostCmd indices to
-    // host_cmd_tx (clone it out of AppState).
+    // Prefer a real board if one is plugged in; otherwise fall back to the mock
+    // so the whole app stays usable with no hardware. RealHid forwards inbound
+    // RunHostCmd indices to the same host_cmd channel the listener drains below.
+    let transport: Box<dyn HidTransport> = match RealHid::open(host_cmd_tx.clone()) {
+        Ok(real) => {
+            eprintln!("kf: connected to a Macro Pad Pro over Raw HID");
+            Box::new(real)
+        }
+        Err(e) => {
+            eprintln!("kf: no board found ({e}); using MockHid");
+            Box::new(MockHid::new())
+        }
+    };
+
     let state = AppState {
-        transport: Mutex::new(Box::new(MockHid::new())),
+        transport: Mutex::new(transport),
         bindings: bindings.clone(),
         host_cmd_tx,
     };
