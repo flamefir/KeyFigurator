@@ -19,7 +19,7 @@ Place the PCBWay order.
 - [ ] Receive boards
 - [ ] Bring-up: power rails, RP2040 enumerates, flash test firmware
 - [ ] Validate: key matrix, per-key RGB, underglow, OLED, USB-C
-- [ ] Document the real key-matrix + LED index map → [[keymatrix-led-layout]] (the app depends on this)
+- [x] Document the real key-matrix + LED index map → [[keymatrix-led-layout]] (written from the firmware's `kf_hid.c` tables; the app mirrors it)
 
 ## Evidence & analysis
 [[vial-vs-custom-config-app]]

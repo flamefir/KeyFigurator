@@ -66,22 +66,71 @@ impl Default for KeyMap {
 /// per-key static colors that the Vial GUI doesn't fully expose.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LedState {
-    /// One color per physical key, in the same index order as the keymap.
+    /// One color per physical key (21: indices 0..20, encoder at 20), in the
+    /// same index order as the keymap / `BOARD_POSITIONS`.
     pub keys: Vec<Rgb>,
-    /// Bottom underglow (RGBLIGHT). A handful of LEDs along the base.
+    /// The 4 underglow corners, in firmware slot order: TL, TR, BR, BL
+    /// (LED slots 21..24 in `kf_hid.c`).
     pub underglow: Vec<Rgb>,
     /// Global brightness 0-255.
     pub brightness: u8,
 }
 
+/// Number of underglow corners — matches `kf_protocol::UNDERGLOW_COUNT`.
+pub const UNDERGLOW_COUNT: usize = 4;
+
 impl LedState {
     pub fn all_off(key_count: usize) -> Self {
         Self {
             keys: vec![[0, 0, 0]; key_count],
-            underglow: vec![[0, 0, 0]; 6],
+            underglow: vec![[0, 0, 0]; UNDERGLOW_COUNT],
             brightness: 180,
         }
     }
+
+    /// Flatten to the 25 wire LED slots the firmware expects: keys 0..20
+    /// followed by the 4 underglow corners (slots 21..24). Missing entries are
+    /// padded with off; extras are ignored.
+    pub fn to_slots(&self) -> Vec<Rgb> {
+        let mut slots = vec![[0u8, 0, 0]; KEY_COUNT + UNDERGLOW_COUNT];
+        for (i, c) in self.keys.iter().take(KEY_COUNT).enumerate() {
+            slots[i] = *c;
+        }
+        for (i, c) in self.underglow.iter().take(UNDERGLOW_COUNT).enumerate() {
+            slots[KEY_COUNT + i] = *c;
+        }
+        slots
+    }
+}
+
+/// One OLED layer screen: the title shown for a keymap layer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct OledLayer {
+    pub name: String,
+    pub show_title: bool,
+}
+
+/// One ordered custom OLED screen. `kind` is "timer" | "countdown" |
+/// "datetime" | "custom"; `title`/`body` apply to custom-text screens.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct OledScreen {
+    pub kind: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub body: String,
+}
+
+/// The full OLED configuration the app pushes to the board. RAM-only on the
+/// firmware side, so the app re-pushes this on every reconnect.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct OledConfig {
+    /// Per keymap layer (index 0..LAYER_COUNT-1).
+    pub layers: Vec<OledLayer>,
+    /// Ordered custom screens (max 6).
+    pub screens: Vec<OledScreen>,
+    /// Single global countdown duration: hours, minutes, seconds.
+    pub countdown: (u8, u8, u8),
 }
 
 /// A host-side command bound to a HOST(n) key. When the board sends a

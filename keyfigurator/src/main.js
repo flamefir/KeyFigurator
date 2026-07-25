@@ -17,6 +17,14 @@ function browserMock(cmd, args) {
     case "get_keymap":   return structuredClone(browserState.keymap);
     case "set_keymap":   browserState.keymap = structuredClone(args.map); return;
     case "set_leds":     return;
+    case "oled_push":    return;
+    case "sync_time":    return;
+    case "eeprom_commit":return;
+    case "board_ping":   return { protocol: 1, fw_major: 0, fw_minor: 1 };
+    case "get_bindings": return [];
+    case "set_bindings": return;
+    case "run_binding":  return "exit=Some(0)\n--- stdout ---\n(browser mock)\n--- stderr ---\n";
+    case "simulate_board_host_cmd": return;
   }
 }
 
@@ -1499,6 +1507,18 @@ async function init() {
   connPill.textContent = connected ? "● connected (mock)" : "○ no device";
   connPill.classList.toggle("ok", connected);
 
+  // Inbound host-command events: the board (via RealHid) or the simulate command
+  // asks the backend to run a HOST(n) binding; the result comes back here.
+  if (hasTauri) {
+    try {
+      const { listen } = await import("@tauri-apps/api/event");
+      await listen("host-cmd", (e) => {
+        const p = e.payload || {};
+        console.log("host-cmd", p.ok ? `HOST(${p.index}) exit ${p.status}` : `HOST(${p.index}) failed: ${p.error || ""}`);
+      });
+    } catch (e) { console.warn("host-cmd listen failed", e); }
+  }
+
   // Restore underglow + corner + advanced settings from localStorage
   const savedCorners = localStorage.getItem(UG_CORNERS_KEY);
   if (savedCorners) try { cornerColors = JSON.parse(savedCorners); } catch {}
@@ -1852,7 +1872,7 @@ async function init() {
 
   document.getElementById("kl-kc").addEventListener("keydown", (e) => {
     if (e.key === "Enter") {
-      const val = e.target.value.trim() || "KC_NO";
+      const val = normalizeKeycode(e.target.value);
       for (const idx of selectedKeys) keymap.layers[0].keys[idx] = val;
       renderBoard();
     }
@@ -2242,7 +2262,7 @@ function deleteSavedLayer(id) {
     keymap = { layers: keymap.layers.map(() => ({ keys: Array(21).fill("KC_NO") })) };
     keyLedColors = Array(21).fill("#ffffff");
     invoke("set_keymap", { map: keymap });
-    invoke("set_leds", { leds: { colors: Array(21).fill({ r: 0, g: 0, b: 0 }) } });
+    invoke("set_leds", { leds: { keys: Array(21).fill([0, 0, 0]), underglow: Array(4).fill([0, 0, 0]), brightness: 255 } });
   }
 
   renderSavedLayers();
@@ -2687,14 +2707,72 @@ async function renderHostBindings() {
   }
 }
 
+// ── Board protocol payloads (must match src-tauri model.rs / kf_protocol.rs) ──
+
+// Normalize a raw keycode string so the app never sends garbage over the wire.
+// Bare letters/digits get a KC_ prefix ("a" -> "KC_A"); everything else is
+// upper-cased and left for the backend codec (which defers unknowns to KC_NO).
+function normalizeKeycode(raw) {
+  const up = (raw || "").trim().toUpperCase();
+  if (!up) return "KC_NO";
+  if (/^[A-Z0-9]$/.test(up)) return "KC_" + up;
+  return up;
+}
+
+function hexToRgbArr(hex) {
+  const { r, g, b } = hexToRgb(hex || "#000000");
+  return [r, g, b];
+}
+
+// LedState: 21 per-key colors (0..20, encoder at 20) + 4 underglow corners
+// (TL, TR, BR, BL = firmware LED slots 21..24) + global brightness.
+function buildLedState() {
+  return {
+    keys: keyLedColors.map(hexToRgbArr),
+    underglow: cornerColors.slice(0, 4).map(hexToRgbArr),
+    brightness: 255,
+  };
+}
+
+// OledConfig: per-layer titles + ordered custom screens + one countdown.
+// RAM-only on the board, so we re-push it on every apply/reconnect.
+function buildOledConfig() {
+  return {
+    layers: getSavedLayers().slice(0, 4).map(l => ({
+      name: l.name || "",
+      show_title: l.showTitle !== false,
+    })),
+    screens: oledCustomScreens.slice(0, 6).map(s => ({
+      kind: s.type || "custom",
+      title: s.title || "",
+      body: s.body || "",
+    })),
+    countdown: [oledCdH, oledCdM, oledCdS],
+  };
+}
+
+async function syncBoardTime() {
+  const d = new Date();
+  try {
+    await invoke("sync_time", {
+      year2000: d.getFullYear() - 2000,
+      month: d.getMonth() + 1,
+      day: d.getDate(),
+      hour: d.getHours(),
+      min: d.getMinutes(),
+      sec: d.getSeconds(),
+      weekday: d.getDay(),
+    });
+  } catch {}
+}
+
 async function applyActiveProfileToBoard() {
   if (!keymap || !activeProfileId) return;
-  const colors = keyLedColors.map(hex => {
-    const { r, g, b } = hexToRgb(hex || "#ffffff");
-    return { r, g, b };
-  });
   await invoke("set_keymap", { map: keymap });
-  await invoke("set_leds", { leds: { colors } });
+  await invoke("set_leds", { leds: buildLedState() });
+  try { await invoke("oled_push", { config: buildOledConfig() }); }
+  catch (e) { console.warn("oled_push failed", e); }
+  await syncBoardTime();
 }
 
 let _wasConnected = false;
