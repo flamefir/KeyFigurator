@@ -1493,11 +1493,16 @@ async function init() {
     btn.textContent = "Saving…";
     btn.disabled = true;
     try {
+      // Push first, THEN commit. eeprom_commit only persists the LED block the
+      // board already holds in RAM, so committing without pushing just re-saves
+      // stale state — and it never touches the keymap or the OLED at all.
+      await pushStateToBoard();
       await invoke("eeprom_commit");
       btn.textContent = "Saved ✓";
-      setTimeout(() => { btn.textContent = "Save to Board"; btn.disabled = false; }, 1500);
-    } catch {
-      btn.textContent = "No Board";
+    } catch (e) {
+      console.warn("save to board failed", e);
+      btn.textContent = _wasConnected ? "Failed" : "No Board";
+    } finally {
       setTimeout(() => { btn.textContent = "Save to Board"; btn.disabled = false; }, 1500);
     }
   });
@@ -2793,13 +2798,22 @@ async function syncBoardTime() {
   } catch {}
 }
 
-async function applyActiveProfileToBoard() {
-  if (!keymap || !activeProfileId) return;
+// Push everything the editor currently holds into board RAM. This is the only
+// thing that makes the board reflect the editor — eeprom_commit does NOT pull
+// state from the host, it just persists the LED block the board already has.
+// No activeProfileId guard: "Save to Board" has to work on an unsaved layer too.
+async function pushStateToBoard() {
+  if (!keymap) return;
   await invoke("set_keymap", { map: keymap });
   await invoke("set_leds", { leds: buildLedState() });
   try { await invoke("oled_push", { config: buildOledConfig() }); }
   catch (e) { console.warn("oled_push failed", e); }
   await syncBoardTime();
+}
+
+async function applyActiveProfileToBoard() {
+  if (!activeProfileId) return;
+  await pushStateToBoard();
 }
 
 // Tracks whether a PHYSICAL board is attached (the mock standing in reads as

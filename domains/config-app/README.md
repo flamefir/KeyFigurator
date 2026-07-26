@@ -28,7 +28,7 @@ gate — see the hardware domain) and the `/pr` harness.
 - [x] Mock HID device: a fake board the app talks to with no hardware
 - [x] Layout editor UI (remap keys) — searchable keycode palette → `set_keymap`
 - [x] Per-key LED designer (RGB Matrix) — the Vial gap — per-key anim + underglow → `set_leds`
-- [x] Live sync: changes sent to board RAM immediately on edit; no push step
+- [~] Live sync: **NOT implemented** — marked done in error. State reaches the board only on attach or via "Save to Board"; see the gap list below
 - [x] "Save to board" — explicit EEPROM commit (`eeprom_commit`)
 - [x] "Saved Boards" tab — manage saved profiles (name, load, delete, export/import per layer)
 - [x] On reconnect: app auto-applies active profile to board RAM (3s poll)
@@ -56,6 +56,30 @@ gate — see the hardware domain) and the `/pr` harness.
 - [x] Profile auto-applies on every attach (not just the first), including a board already attached at app start
 - [x] Keycode codec heals bare/lower-case names (`"A"` → `KC_A`) instead of silently sending KC_NO; frontend sanitizes keymaps loaded from localStorage and imported layer files
 
+### Protocol feature gaps — see [[protocol-feature-gaps]] for the full audit
+Confirmed on hardware: keycodes, per-key LED colour, underglow colour. Everything below is
+app-side preview only or unsent. **Solid colour is the whole designed surface of protocol v1.**
+
+Uses protocol v1 as it already stands (no firmware change):
+- [ ] Send overlay off/on (`0xF1`/`0xF2`) — `kf_protocol::overlay_frame` is dead code, so once the app pushes LEDs the board is locked to static colour with no way back to animations
+- [ ] Feed the brightness byte (`0xF0`) — `buildLedState()` hardcodes 255; needs a global brightness control in the UI (the RATE/INTENSITY sliders are animation params, not this)
+- [ ] Live sync on edit — changes reach the board only on attach or via "Save to Board" (was marked done in error; never implemented). Needs a debounced flush hooked to the real mutation points
+
+Needs firmware work first:
+- [ ] Firmware: enable `ENABLE_RGB_MATRIX_*` effects — `config.h` currently compiles in **zero** effects, so there is nothing to fall back to even with overlay-off
+- [ ] Animation over the wire (mode/rate/intensity, per-key + underglow) — protocol v2, bump `PROTOCOL_VERSION`. **Decide first:** board-side QMK effects (global only) vs host-streamed frames (keeps per-key, costs continuous USB). See the audit
+- [ ] Cycle palettes (`klPalette`/`ugPalette`/per-key `palette[]`) — depends on the animation decision
+
+New command each, independent:
+- [ ] OLED font picker (`oledFontId`)
+- [ ] OLED screen images (`imageDataUrl`) — `0x52` carries text only
+- [ ] OLED timer/countdown start-stop-reset — only the duration syncs today (`0x53`)
+- [ ] Encoder mode (layer / scroll)
+- [ ] OLED back key (`oledBackKeyIdx`) + OLED event keys (`oledEventKeys`)
+
+Decide scope before building:
+- [ ] Per-key icons + images (`keyIconLabels`/`keyIconImages`) — may be intentionally host-side; the firmware's Present Keys screen derives labels from the dynamic keymap
+
 ### Blocked on physical boards — remaining gap (human gate)
 - [x] `RealHid` enumeration validated on a real board
 - [ ] `RealHid` read/write timing + report-id framing under load (bulk LED/OLED pushes)
@@ -67,7 +91,7 @@ gate — see the hardware domain) and the `/pr` harness.
 - [ ] (optional) Full QMK keycode table — deferred to Vial by the chosen scope
 
 ## Evidence & analysis
-[[vial-vs-custom-config-app]]
+[[vial-vs-custom-config-app]] · [[keymatrix-led-layout]] · [[protocol-feature-gaps]]
 
 ## Metrics
 `metrics/` — TBD (build/test pass rate once harnessed).
@@ -78,3 +102,4 @@ gate — see the hardware domain) and the `/pr` harness.
 2026-07-25 | app⟷firmware integration — aligned the app to the firmware's KeyFigurator Raw HID protocol byte-for-byte: new `kf_protocol.rs` (mirrors `kf_hid.h`, test-pinned), keycode codec, fixed LED payload + IDs + framing, OLED + host-cmd + PING wired, [[keymatrix-led-layout]] written. Only `RealHid` USB transport + physical bring-up remain.
 2026-07-25 | RealHid USB transport — implemented the hidapi transport (enumerate/open + single-owner I/O thread + inbound RUN_HOST_CMD reader); app auto-detects a board and falls back to MockHid. Compiles + falls back cleanly; awaiting a real board for bring-up. Only the physical human gate remains.
 2026-07-26 | first real link + hot-plug — the app connected to a flashed board on first try. Reworked `RealHid` into a session-long supervisor (rescan/attach/detach) behind a new `BoardLink`, so connecting is no longer startup-only; added the `board-connection` event + `board_status` command. Fixed the keycode codec silently blanking keys on bare names (`"A"` → KC_NO). 26 Rust tests pass.
+2026-07-26 | Save to Board fixed + gap audit — "Save to Board" only sent `eeprom_commit`, which persists the LED block the board already holds rather than pulling from the host, so it could never move keys or OLED; it now pushes keymap/LEDs/OLED/time first. That exposed the fact that live-sync-on-edit was never implemented. Audited the whole protocol surface against the editor → [[protocol-feature-gaps]]: solid colour is all protocol v1 carries, and the firmware has zero RGB effects compiled in.

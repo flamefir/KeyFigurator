@@ -27,12 +27,14 @@ report-id framing still need a proper exercise under load.
 - [ ] Exercise `RealHid` read/write timing + report-id framing under load (bulk LED/OLED pushes)
 - [ ] Confirm underglow corner orientation (TL/TR/BR/BL) — one-line reorder in [[keymatrix-led-layout]] + `main.js` if wrong
 - [ ] Verify a physical `HOST(n)` press runs its binding on the host
+- [ ] Firmware: enable `ENABLE_RGB_MATRIX_*` effects in `config.h` — currently **zero** effects are compiled in (only `RGB_MATRIX_SOLID_COLOR` as default mode), which blocks every LED animation feature in the app. See [[protocol-feature-gaps]]
 - [x] Document the real key-matrix + LED index map → [[keymatrix-led-layout]] (written from the firmware's `kf_hid.c` tables; the app mirrors it)
 
 ## Evidence & analysis
-[[vial-vs-custom-config-app]]
+[[vial-vs-custom-config-app]] · [[keymatrix-led-layout]] · [[protocol-feature-gaps]]
 
 ## Timeline
 2026-06-23 | setup — domain created; BOM locked, about to order.
 2026-07-25 | boards in hand — PCBs received, soldered, and bench-tested successfully (power + RP2040 enumeration). Firmware flashing next; then functional validation + RealHid bring-up.
 2026-07-26 | firmware flashed + first app link — `macro_pad_pro_vial.uf2` flashed; the config app enumerated and opened the board over Raw HID on first try. Peripheral validation (matrix/RGB/OLED/HOST) is the remaining hardware work.
+2026-07-26 | first bench results — keycodes + per-key/underglow colour confirmed working on hardware. Only solid colour renders: the audit ([[protocol-feature-gaps]]) traced it to zero RGB matrix effects compiled into `config.h`, which is a firmware prerequisite for every animation feature.
