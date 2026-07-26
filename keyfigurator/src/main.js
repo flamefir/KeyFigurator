@@ -13,7 +13,8 @@ function browserMock(cmd, args) {
     };
   }
   switch (cmd) {
-    case "is_connected": return true;
+    case "is_connected": return false;
+    case "board_status": return { connected: false, transport: "mock" };
     case "get_keymap":   return structuredClone(browserState.keymap);
     case "set_keymap":   browserState.keymap = structuredClone(args.map); return;
     case "set_leds":     return;
@@ -1501,14 +1502,13 @@ async function init() {
     }
   });
 
-  const connected = await invoke("is_connected");
-  _wasConnected   = connected;
-  const connPill = document.getElementById("conn");
-  connPill.textContent = connected ? "● connected (mock)" : "○ no device";
-  connPill.classList.toggle("ok", connected);
+  const status  = await invoke("board_status");
+  _wasConnected = !!status?.connected;
+  renderConnPill(_wasConnected);
 
-  // Inbound host-command events: the board (via RealHid) or the simulate command
-  // asks the backend to run a HOST(n) binding; the result comes back here.
+  // Backend events: inbound HOST(n) results, and board attach/detach. The
+  // attach/detach event is what makes plugging a board in mid-session work —
+  // the backend supervises USB for the whole run, not just at startup.
   if (hasTauri) {
     try {
       const { listen } = await import("@tauri-apps/api/event");
@@ -1516,7 +1516,12 @@ async function init() {
         const p = e.payload || {};
         console.log("host-cmd", p.ok ? `HOST(${p.index}) exit ${p.status}` : `HOST(${p.index}) failed: ${p.error || ""}`);
       });
-    } catch (e) { console.warn("host-cmd listen failed", e); }
+      await listen("board-connection", (e) => {
+        const connected = !!e.payload?.connected;
+        console.log("board-connection", connected ? "attached" : "detached");
+        onConnectionChange(connected);
+      });
+    } catch (e) { console.warn("event listen failed", e); }
   }
 
   // Restore underglow + corner + advanced settings from localStorage
@@ -1586,7 +1591,7 @@ async function init() {
 
   // Always boot into the first saved layer
   const bootLayer = getSavedLayers()[0];
-  keymap         = structuredClone(bootLayer.keymap);
+  keymap         = sanitizeKeymap(structuredClone(bootLayer.keymap));
   keyLedColors   = [...bootLayer.leds];
   keyIconLabels  = bootLayer.icons ? [...bootLayer.icons] : Array(21).fill("");
   keyIconImages  = bootLayer.iconImages ? [...bootLayer.iconImages] : Array(21).fill(null);
@@ -2291,7 +2296,7 @@ function importLayer(file) {
       layers.push({
         id,
         name: data.name || "Imported",
-        keymap: data.keymap,
+        keymap: sanitizeKeymap(data.keymap),
         leds:   data.leds,
         icons:      data.icons || Array(21).fill(""),
         iconImages: data.iconImages || Array(21).fill(null),
@@ -2319,7 +2324,7 @@ async function switchToLayer(id, { silent = false } = {}) {
   saveCurrentLayerState();
   const layer = getSavedLayers().find(l => l.id === id);
   if (!layer) return;
-  keymap         = structuredClone(layer.keymap);
+  keymap         = sanitizeKeymap(structuredClone(layer.keymap));
   keyLedColors   = [...layer.leds];
   keyIconLabels  = layer.icons ? [...layer.icons] : Array(21).fill("");
   keyIconImages  = layer.iconImages ? [...layer.iconImages] : Array(21).fill(null);
@@ -2709,14 +2714,36 @@ async function renderHostBindings() {
 
 // ── Board protocol payloads (must match src-tauri model.rs / kf_protocol.rs) ──
 
-// Normalize a raw keycode string so the app never sends garbage over the wire.
-// Bare letters/digits get a KC_ prefix ("a" -> "KC_A"); everything else is
-// upper-cased and left for the backend codec (which defers unknowns to KC_NO).
+// Normalize a raw keycode string so the app never sends garbage over the wire
+// and the stored form always matches what the palette produces. Bare names get
+// their KC_ prefix ("a" -> "KC_A", "enter" -> "KC_ENTER"); parametric and hex
+// forms pass through; anything unrecognised is upper-cased and left for the
+// backend codec, which heals what it can and warns on the rest.
 function normalizeKeycode(raw) {
   const up = (raw || "").trim().toUpperCase();
   if (!up) return "KC_NO";
+  if (KC_ALL_FLAT.includes(up)) return up;
+  if (/^(MO|TO|TG|DF|OSL|HOST)\(\d+\)$/.test(up)) return up;
+  if (/^0X[0-9A-F]{1,4}$/.test(up)) return up;
+  if (KC_ALL_FLAT.includes("KC_" + up)) return "KC_" + up;
   if (/^[A-Z0-9]$/.test(up)) return "KC_" + up;
   return up;
+}
+
+// Heal a keymap coming from anywhere we don't control the spelling of: saved
+// layers in localStorage (some predate normalizeKeycode) and imported layer
+// files. Without this a stored bare "A" reaches the backend as an unknown
+// keycode, becomes KC_NO, and silently blanks that key on the board — while the
+// UI still renders "A", because it strips the KC_ prefix for display either way.
+function sanitizeKeymap(map) {
+  if (!map || !Array.isArray(map.layers)) {
+    return { layers: Array.from({ length: 4 }, () => ({ keys: Array(21).fill("KC_NO") })) };
+  }
+  return {
+    layers: map.layers.map(l => ({
+      keys: Array.from({ length: 21 }, (_, i) => normalizeKeycode(l?.keys?.[i] ?? "KC_NO")),
+    })),
+  };
 }
 
 function hexToRgbArr(hex) {
@@ -2775,24 +2802,42 @@ async function applyActiveProfileToBoard() {
   await syncBoardTime();
 }
 
+// Tracks whether a PHYSICAL board is attached (the mock standing in reads as
+// false), so attaching one mid-session triggers exactly one profile re-apply.
 let _wasConnected = false;
+
+function renderConnPill(connected) {
+  const connPill = document.getElementById("conn");
+  if (!connPill) return;
+  connPill.textContent = connected ? "● connected" : "○ mock (no board)";
+  connPill.classList.toggle("ok", connected);
+}
+
+// The one place that reacts to the link changing state. Driven by the backend's
+// board-connection event (fires on the plug) and by the poll below (a fallback
+// in case an event is ever missed) — both are idempotent via _wasConnected.
+async function onConnectionChange(connected) {
+  renderConnPill(connected);
+  if (connected && !_wasConnected) {
+    try { await applyActiveProfileToBoard(); }
+    catch (e) { console.warn("apply on connect failed", e); }
+  }
+  _wasConnected = connected;
+}
 
 async function pollConnection() {
   try {
-    const connected = await invoke("is_connected");
-    const connPill  = document.getElementById("conn");
-    if (connPill) {
-      connPill.textContent = connected ? "● connected" : "○ no device";
-      connPill.classList.toggle("ok", connected);
-    }
-    if (connected && !_wasConnected) {
-      await applyActiveProfileToBoard();
-    }
-    _wasConnected = connected;
+    const status = await invoke("board_status");
+    await onConnectionChange(!!status?.connected);
   } catch {}
 }
 
-init().then(() => {
-  _wasConnected = true; // init already applied the profile; don't re-push on first poll
+init().then(async () => {
+  // A board attached before the app started never fires an attach event, so push
+  // the active profile once here. A board attached later is handled by the event.
+  if (_wasConnected) {
+    try { await applyActiveProfileToBoard(); }
+    catch (e) { console.warn("initial apply failed", e); }
+  }
   setInterval(pollConnection, 3000);
 });

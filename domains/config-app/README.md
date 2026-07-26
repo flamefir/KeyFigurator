@@ -14,12 +14,12 @@ layout from the KiCad project; produces keymap + LED profiles pushed to the boar
 host-side command bindings (run scripts/git from a key). See [[vial-vs-custom-config-app]].
 
 ## Current focus
-The app now speaks the firmware's **KeyFigurator Raw HID protocol** byte-for-byte, proven
-against a software model of the board (`kf_protocol::BoardModel`, 23 Rust tests). Everything
-the differentiator needs — keymap, per-key + underglow RGB, OLED, the host-command/git layer —
-is wired and testable with **no hardware**. `RealHid`'s USB transport (hidapi) is now
-implemented too — the app auto-detects a real board at startup and falls back to the mock —
-so the remaining work is purely **physical bring-up** (a human gate) and the `/pr` harness.
+The app speaks the firmware's **KeyFigurator Raw HID protocol** byte-for-byte, proven against
+a software model of the board (`kf_protocol::BoardModel`) and now **against real hardware** —
+a flashed board enumerates and opens on first try. The USB link is **supervised**: it attaches
+whenever a board is present, survives unplug/replug any number of times per session, and falls
+back to the mock while dark. Remaining work is **peripheral validation on hardware** (a human
+gate — see the hardware domain) and the `/pr` harness.
 
 ## Backlog
 
@@ -49,8 +49,16 @@ so the remaining work is purely **physical bring-up** (a human gate) and the `/p
 ### Done — RealHid USB transport (2026-07-25)
 - [x] `RealHid` implemented: hidapi enumerate/open on VID/PID `0xFEED/0x4D50` (usage `0xFF60/0x61`), single-owner I/O thread serializing all access, inbound RUN_HOST_CMD reader → host-cmd channel. App auto-detects a board at startup and falls back to `MockHid`. **Compiles + falls back cleanly; unverified on real hardware.**
 
-### Blocked on physical boards — the only remaining gap (human gate)
-- [ ] Bring-up validation of `RealHid` on a real board (enumeration, read/write timing, report-id framing)
+### Done — USB hot-plug + keycode healing (2026-07-26)
+- [x] `RealHid` is now **supervised**, not opened once at startup: one thread owns `HidApi` + the device for the whole session, rescans every 1s while dark, attaches the moment a board appears, and drops + rescans on a USB error. Unplug/replug works repeatedly in one session.
+- [x] `BoardLink` routes each frame to the board when attached and the mock when not, so the editor never breaks and a board plugged in later is picked up without a restart
+- [x] `board-connection` Tauri event + `board_status` command — UI reacts on the plug instead of on its 3s poll, and can tell "real board" from "mock standing in"
+- [x] Profile auto-applies on every attach (not just the first), including a board already attached at app start
+- [x] Keycode codec heals bare/lower-case names (`"A"` → `KC_A`) instead of silently sending KC_NO; frontend sanitizes keymaps loaded from localStorage and imported layer files
+
+### Blocked on physical boards — remaining gap (human gate)
+- [x] `RealHid` enumeration validated on a real board
+- [ ] `RealHid` read/write timing + report-id framing under load (bulk LED/OLED pushes)
 - [ ] Physical verification: LEDs/OLED actually change, a `HOST(n)` press runs on the host
 - [ ] Confirm underglow corner orientation (TL/TR/BR/BL) on a real board
 
@@ -69,3 +77,4 @@ so the remaining work is purely **physical bring-up** (a human gate) and the `/p
 2026-07-25 | backlog burndown — full mock-side editor shipped on `feature/backlog-clear` (19 commits: keymap/RGB/OLED/encoder editors, host-command runner, saved layers, save-to-board, reconnect auto-apply). Remaining work is hardware/firmware-blocked + repo harness.
 2026-07-25 | app⟷firmware integration — aligned the app to the firmware's KeyFigurator Raw HID protocol byte-for-byte: new `kf_protocol.rs` (mirrors `kf_hid.h`, test-pinned), keycode codec, fixed LED payload + IDs + framing, OLED + host-cmd + PING wired, [[keymatrix-led-layout]] written. Only `RealHid` USB transport + physical bring-up remain.
 2026-07-25 | RealHid USB transport — implemented the hidapi transport (enumerate/open + single-owner I/O thread + inbound RUN_HOST_CMD reader); app auto-detects a board and falls back to MockHid. Compiles + falls back cleanly; awaiting a real board for bring-up. Only the physical human gate remains.
+2026-07-26 | first real link + hot-plug — the app connected to a flashed board on first try. Reworked `RealHid` into a session-long supervisor (rescan/attach/detach) behind a new `BoardLink`, so connecting is no longer startup-only; added the `board-connection` event + `board_status` command. Fixed the keycode codec silently blanking keys on bare names (`"A"` → KC_NO). 26 Rust tests pass.

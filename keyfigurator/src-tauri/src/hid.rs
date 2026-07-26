@@ -9,16 +9,20 @@
 //!
 //! - `MockHid` wraps a [`kf_protocol::BoardModel`] (a software port of
 //!   `kf_hid.c`) and works today with no hardware.
-//! - `RealHid` is the hidapi stub you fill in once boards arrive; only its
-//!   `transceive` (a USB write + read) is left to do.
+//! - `RealHid` talks to a physical board over USB (hidapi). It is *supervised*:
+//!   it survives the board not being present and hot-plugs in both directions.
+//! - `BoardLink` is what the app actually holds — it routes each frame to the
+//!   real board when one is attached and to the mock when one isn't, so the
+//!   editor keeps working with no hardware and starts driving the board the
+//!   moment it is plugged in.
 
 use crate::kf_protocol::{self as kf, BoardModel, REPORT_LEN};
 use crate::model::{KeyMap, Layer, LedState, OledConfig};
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, thiserror::Error)]
 pub enum HidError {
@@ -233,15 +237,30 @@ impl HidTransport for MockHid {
 // Real: talks to the actual board over Raw HID via `hidapi`.
 //
 // The `HidDevice` is not `Sync`, and unsolicited RUN_HOST_CMD packets share the
-// single IN pipe with command responses. So one dedicated I/O thread OWNS the
-// device and serializes all access: `transceive` hands it a request over a
-// channel and blocks for the reply; when idle the thread polls for unsolicited
-// RUN_HOST_CMD packets and forwards their index to the host-cmd channel.
+// single IN pipe with command responses. So one dedicated supervisor thread OWNS
+// the `HidApi` and the device and serializes all access: `transceive` hands it a
+// request over a channel and blocks for the reply; when idle the thread polls
+// for unsolicited RUN_HOST_CMD packets and forwards their index to the host-cmd
+// channel.
+//
+// That thread also owns CONNECTION STATE. It runs for the whole life of the app
+// whether or not a board is present: when dark it rescans every SCAN_INTERVAL
+// and attaches as soon as the board appears; when a USB error says the board
+// went away it drops the device and goes dark again. So unplug/replug works any
+// number of times within one session — connecting is not a startup-only event.
 //
 // Identity constants live in kf_protocol (kf::VENDOR_ID / PRODUCT_ID / USAGE*).
-// Untestable without a board — validate against hardware during bring-up.
 // ---------------------------------------------------------------------------
 type IoRequest = ([u8; REPORT_LEN], Sender<Result<[u8; REPORT_LEN], HidError>>);
+
+/// How often to rescan the USB bus while no board is attached.
+const SCAN_INTERVAL: Duration = Duration::from_millis(1000);
+/// How long the supervisor blocks per wait while dark. Shorter than
+/// `SCAN_INTERVAL` so a queued frame is rejected promptly instead of sitting
+/// until the next rescan.
+const DARK_POLL: Duration = Duration::from_millis(200);
+/// How long a caller waits for the supervisor to answer one frame.
+const TRANSCEIVE_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub struct RealHid {
     req_tx: Mutex<Sender<IoRequest>>,
@@ -249,49 +268,130 @@ pub struct RealHid {
 }
 
 impl RealHid {
-    /// Open the KeyFigurator Raw HID interface and start its I/O thread.
+    /// Start the supervised Raw HID link. Never fails on "no board" — it returns
+    /// a handle that reports `is_connected() == false` and attaches by itself as
+    /// soon as a board is plugged in.
+    ///
     /// `host_cmd_tx` receives the binding index whenever the board sends an
-    /// unsolicited RUN_HOST_CMD packet. Returns quickly with `NotConnected` if
-    /// no matching board is present, so callers can fall back to `MockHid`.
-    pub fn open(host_cmd_tx: Sender<u8>) -> Result<Self, HidError> {
+    /// unsolicited RUN_HOST_CMD packet. `conn_tx` receives `true`/`false` on
+    /// every attach/detach so the UI can be told without waiting for a poll.
+    pub fn start(host_cmd_tx: Sender<u8>, conn_tx: Sender<bool>) -> Self {
         let (req_tx, req_rx) = channel::<IoRequest>();
-        let (ready_tx, ready_rx) = channel::<Result<(), String>>();
         let connected = Arc::new(AtomicBool::new(false));
-        let conn_thread = connected.clone();
+        let conn_flag = connected.clone();
 
-        std::thread::Builder::new()
+        // If the thread can't even spawn we still hand back a usable (permanently
+        // disconnected) handle; BoardLink falls through to the mock.
+        let spawned = std::thread::Builder::new()
             .name("kf-hid-io".into())
-            .spawn(move || {
-                // HidApi + HidDevice live entirely in this thread (HidDevice is
-                // not Sync) and stay alive together for the loop's duration.
-                let api = match hidapi::HidApi::new() {
-                    Ok(a) => a,
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(e.to_string()));
-                        return;
-                    }
-                };
-                let device = match find_and_open(&api) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(e));
-                        return;
-                    }
-                };
-                conn_thread.store(true, Ordering::SeqCst);
-                let _ = ready_tx.send(Ok(()));
-                io_loop(&device, &req_rx, &host_cmd_tx);
-                conn_thread.store(false, Ordering::SeqCst);
-            })
-            .map_err(|e| HidError::Io(e.to_string()))?;
+            .spawn(move || supervisor(&req_rx, &host_cmd_tx, &conn_tx, &conn_flag));
+        if let Err(e) = spawned {
+            eprintln!("kf: could not start the hid supervisor thread ({e}); mock only");
+        }
 
-        match ready_rx.recv() {
-            Ok(Ok(())) => Ok(RealHid {
-                req_tx: Mutex::new(req_tx),
-                connected,
-            }),
-            Ok(Err(e)) => Err(HidError::Io(e)),
-            Err(_) => Err(HidError::Io("hid i/o thread exited before init".into())),
+        RealHid {
+            req_tx: Mutex::new(req_tx),
+            connected,
+        }
+    }
+}
+
+/// Outcome of one board transaction, separating "this call failed" from "the
+/// board is gone" so the supervisor knows when to drop the device and rescan.
+enum IoOutcome {
+    Response([u8; REPORT_LEN]),
+    /// Transaction failed but the device still looks alive (e.g. no reply).
+    Failed(HidError),
+    /// USB-layer error — treat the board as unplugged.
+    Lost(HidError),
+}
+
+/// The single-owner supervisor loop: owns `HidApi` + the open device, services
+/// `transceive` requests, drains unsolicited packets, and handles attach/detach.
+/// Returns only when `RealHid` is dropped (the request channel closes).
+fn supervisor(
+    req_rx: &Receiver<IoRequest>,
+    host_cmd_tx: &Sender<u8>,
+    conn_tx: &Sender<bool>,
+    connected: &AtomicBool,
+) {
+    // Exactly one HidApi for the process; it lives here for the whole run so
+    // rescans are a `refresh_devices` rather than a re-init.
+    let mut api = match hidapi::HidApi::new() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("kf: hidapi unavailable ({e}); mock only");
+            return;
+        }
+    };
+
+    let mut device: Option<hidapi::HidDevice> = None;
+    let mut last_scan = Instant::now() - SCAN_INTERVAL;
+
+    loop {
+        // ---- Dark: no board attached. Reject queued frames, rescan on a timer.
+        let Some(dev) = device.as_ref() else {
+            match req_rx.recv_timeout(DARK_POLL) {
+                Ok((_, resp_tx)) => {
+                    let _ = resp_tx.send(Err(HidError::NotConnected));
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return, // RealHid dropped
+            }
+            if last_scan.elapsed() >= SCAN_INTERVAL {
+                last_scan = Instant::now();
+                if api.refresh_devices().is_ok() {
+                    if let Ok(d) = find_and_open(&api) {
+                        eprintln!("kf: board attached over Raw HID");
+                        device = Some(d);
+                        connected.store(true, Ordering::SeqCst);
+                        let _ = conn_tx.send(true);
+                    }
+                }
+            }
+            continue;
+        };
+
+        // ---- Attached: serve requests, and poll for unsolicited packets when idle.
+        let lost = match req_rx.try_recv() {
+            Ok((frame, resp_tx)) => match write_then_read(dev, &frame, host_cmd_tx) {
+                IoOutcome::Response(r) => {
+                    let _ = resp_tx.send(Ok(r));
+                    None
+                }
+                IoOutcome::Failed(e) => {
+                    let _ = resp_tx.send(Err(e));
+                    None
+                }
+                IoOutcome::Lost(e) => {
+                    let _ = resp_tx.send(Err(HidError::NotConnected));
+                    Some(e)
+                }
+            },
+            Err(TryRecvError::Empty) => {
+                let mut buf = [0u8; REPORT_LEN];
+                match dev.read_timeout(&mut buf, 10) {
+                    Ok(n) if n > 0 => {
+                        if let Some(idx) = kf::parse_run_host_cmd(&buf) {
+                            let _ = host_cmd_tx.send(idx);
+                        }
+                        None
+                    }
+                    Ok(_) => None, // read timed out, nothing available
+                    Err(e) => Some(HidError::Io(e.to_string())),
+                }
+            }
+            Err(TryRecvError::Disconnected) => return, // RealHid dropped
+        };
+
+        if let Some(e) = lost {
+            eprintln!("kf: board detached ({e}); rescanning every {SCAN_INTERVAL:?}");
+            device = None;
+            connected.store(false, Ordering::SeqCst);
+            let _ = conn_tx.send(false);
+            // Rescan immediately rather than after a full interval, so a quick
+            // replug (or a board rebooting out of the bootloader) reattaches fast.
+            last_scan = Instant::now() - SCAN_INTERVAL;
         }
     }
 }
@@ -310,50 +410,27 @@ fn find_and_open(api: &hidapi::HidApi) -> Result<hidapi::HidDevice, String> {
     info.open_device(api).map_err(|e| e.to_string())
 }
 
-/// The single-owner I/O loop. Services `transceive` requests and, when idle,
-/// drains unsolicited RUN_HOST_CMD packets to `host_cmd_tx`.
-fn io_loop(device: &hidapi::HidDevice, req_rx: &Receiver<IoRequest>, host_cmd_tx: &Sender<u8>) {
-    loop {
-        match req_rx.try_recv() {
-            Ok((frame, resp_tx)) => {
-                let _ = resp_tx.send(write_then_read(device, &frame, host_cmd_tx));
-            }
-            Err(TryRecvError::Empty) => {
-                // No pending request — poll briefly for unsolicited packets.
-                let mut buf = [0u8; REPORT_LEN];
-                match device.read_timeout(&mut buf, 10) {
-                    Ok(n) if n > 0 => {
-                        if let Some(idx) = kf::parse_run_host_cmd(&buf) {
-                            let _ = host_cmd_tx.send(idx);
-                        }
-                    }
-                    Ok(_) => {}         // timeout, nothing available
-                    Err(_) => break,    // device gone
-                }
-            }
-            Err(TryRecvError::Disconnected) => break, // RealHid dropped
-        }
-    }
-}
-
 /// Write one request frame, then read until the matching response arrives,
 /// forwarding any interleaved RUN_HOST_CMD packets to `host_cmd_tx`.
 fn write_then_read(
     device: &hidapi::HidDevice,
     frame: &[u8; REPORT_LEN],
     host_cmd_tx: &Sender<u8>,
-) -> Result<[u8; REPORT_LEN], HidError> {
+) -> IoOutcome {
     // QMK Raw HID uses report id 0: prepend a 0x00 report-id byte on write.
     let mut wbuf = [0u8; REPORT_LEN + 1];
     wbuf[1..].copy_from_slice(frame);
-    device.write(&wbuf).map_err(|e| HidError::Io(e.to_string()))?;
+    if let Err(e) = device.write(&wbuf) {
+        return IoOutcome::Lost(HidError::Io(e.to_string()));
+    }
 
     // Up to ~2s (100 × 20ms) for the response.
     for _ in 0..100 {
         let mut buf = [0u8; REPORT_LEN];
-        let n = device
-            .read_timeout(&mut buf, 20)
-            .map_err(|e| HidError::Io(e.to_string()))?;
+        let n = match device.read_timeout(&mut buf, 20) {
+            Ok(n) => n,
+            Err(e) => return IoOutcome::Lost(HidError::Io(e.to_string())),
+        };
         if n == 0 {
             continue;
         }
@@ -361,9 +438,9 @@ fn write_then_read(
             let _ = host_cmd_tx.send(idx); // unsolicited; not our response
             continue;
         }
-        return Ok(buf);
+        return IoOutcome::Response(buf);
     }
-    Err(HidError::Io("timeout waiting for board response".into()))
+    IoOutcome::Failed(HidError::Io("timeout waiting for board response".into()))
 }
 
 impl HidTransport for RealHid {
@@ -371,6 +448,9 @@ impl HidTransport for RealHid {
         self.connected.load(Ordering::SeqCst)
     }
     fn transceive(&mut self, frame: &[u8; REPORT_LEN]) -> Result<[u8; REPORT_LEN], HidError> {
+        if !self.is_connected() {
+            return Err(HidError::NotConnected);
+        }
         let (resp_tx, resp_rx) = channel();
         self.req_tx
             .lock()
@@ -378,8 +458,47 @@ impl HidTransport for RealHid {
             .send((*frame, resp_tx))
             .map_err(|_| HidError::NotConnected)?;
         resp_rx
-            .recv_timeout(Duration::from_secs(3))
+            .recv_timeout(TRANSCEIVE_TIMEOUT)
             .map_err(|_| HidError::Io("hid i/o thread timeout".into()))?
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BoardLink — what the app holds. Routes each frame to the real board when one
+// is attached and to the mock when one isn't, so the editor never breaks and a
+// board that shows up mid-session is picked up without a restart.
+// ---------------------------------------------------------------------------
+pub struct BoardLink {
+    real: RealHid,
+    mock: MockHid,
+}
+
+impl BoardLink {
+    pub fn new(real: RealHid) -> Self {
+        Self {
+            real,
+            mock: MockHid::new(),
+        }
+    }
+
+    /// True when a physical board is attached (as opposed to the mock standing in).
+    pub fn has_board(&self) -> bool {
+        self.real.is_connected()
+    }
+}
+
+impl HidTransport for BoardLink {
+    fn is_connected(&self) -> bool {
+        self.has_board()
+    }
+    fn transceive(&mut self, frame: &[u8; REPORT_LEN]) -> Result<[u8; REPORT_LEN], HidError> {
+        // Decided per frame, so a board attaching or detaching takes effect on
+        // the very next frame instead of at the next app start.
+        if self.real.is_connected() {
+            self.real.transceive(frame)
+        } else {
+            self.mock.transceive(frame)
+        }
     }
 }
 
@@ -416,6 +535,44 @@ mod tests {
         let mut hid = MockHid::new();
         let info = hid.ping().unwrap();
         assert_eq!(info.protocol, kf::PROTOCOL_VERSION);
+    }
+
+    /// With no board attached, BoardLink must report "no board" yet still serve
+    /// every operation off the mock, so the editor works with nothing plugged in.
+    #[test]
+    fn board_link_falls_through_to_mock_when_dark() {
+        let (host_cmd_tx, _host_cmd_rx) = channel::<u8>();
+        let (conn_tx, _conn_rx) = channel::<bool>();
+        let mut link = BoardLink::new(RealHid::start(host_cmd_tx, conn_tx));
+
+        assert!(!link.has_board(), "no hardware in a unit test");
+        assert!(!link.is_connected());
+
+        // Served by the mock: a full keymap round-trip still succeeds.
+        let mut map = link.get_keymap().unwrap();
+        map.layers[0].keys[3] = "KC_F5".into();
+        link.set_keymap(&map).unwrap();
+        assert_eq!(link.get_keymap().unwrap().layers[0].keys[3], "KC_F5");
+        assert_eq!(link.ping().unwrap().protocol, kf::PROTOCOL_VERSION);
+    }
+
+    /// A disconnected RealHid rejects frames immediately rather than blocking a
+    /// caller for the full transceive timeout.
+    #[test]
+    fn real_hid_rejects_frames_while_dark() {
+        let (host_cmd_tx, _host_cmd_rx) = channel::<u8>();
+        let (conn_tx, _conn_rx) = channel::<bool>();
+        let mut real = RealHid::start(host_cmd_tx, conn_tx);
+
+        assert!(!real.is_connected());
+        let started = std::time::Instant::now();
+        let err = real.transceive(&kf::ping_frame()).unwrap_err();
+        assert!(matches!(err, HidError::NotConnected), "got {err:?}");
+        assert!(
+            started.elapsed() < TRANSCEIVE_TIMEOUT,
+            "should fail fast, took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

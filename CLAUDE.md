@@ -16,11 +16,13 @@ and a YouTube build series as public deliverables.
   Our app is the differentiator, talking to the board over **Raw HID** alongside Vial.
 
 ## Current state & focus
-BOM is **locked**; about to order from PCBWay. Boards are **not in hand yet** — so the
-config app's near-term work is everything that does NOT need physical hardware: app
-scaffold, the keymap/RGB data model, the editor UI against a **mock HID device**, and the
-Raw HID protocol definition. Hardware-touching features get stubbed behind the mock until
-PCBs arrive. Decision record: [[vial-vs-custom-config-app]].
+Boards are **in hand**: PCBs received from PCBWay, assembled, bench-tested, and flashed
+with the KeyFigurator firmware (`macro_pad_pro_vial.uf2`). The config app speaks the
+firmware's Raw HID protocol byte-for-byte and `RealHid` (hidapi) talks to a real board.
+Current work is **hardware-in-the-loop bring-up**: validating the key matrix, per-key RGB,
+underglow, OLED, and the HOST(n) round-trip on physical hardware, plus USB hot-plug
+robustness. `MockHid` stays as the no-hardware fallback so editor work never needs a board.
+Decision record: [[vial-vs-custom-config-app]].
 
 ## Voice & tone
 Public-facing writing (Hackaday, YouTube) is the maker's own voice: direct, technical,
@@ -31,8 +33,9 @@ honest about tradeoffs. No marketing fluff.
 ## Data & tooling
 - **Firmware:** vial-qmk fork (git). Raw HID command channel added on top of the Vial port.
 - **Config app:** Tauri (Rust backend owns HID transport; web frontend owns the editor UI).
-- **Hardware truth:** the KiCad project defines the real key matrix + LED indices — the
-  app's data model MUST match it. See [[keymatrix-led-layout]] when written.
+- **Hardware truth:** the firmware's `kf_hid.c` tables are the source of truth for the key
+  matrix + LED indices (traced from the KiCad project) — the app's data model MUST match
+  them. See [[keymatrix-led-layout]].
 
 ## Knowledge base (full model: `ARCHITECTURE.md`)
 **Artifacts** are global, foldered by **kind** — `signals/` (feedback, ideas, observations)
@@ -57,8 +60,10 @@ Kinds (now): signal, doc.
 Domains (now): config-app (active), hardware (milestone backlog).
 
 ## When spawning agents for code work
-- **Repo map:** `macropad-pro` (this repo) = knowledge base + LOG, never app code ·
-  `macropad-config` = the Tauri config app · `vial-qmk` (fork) = the firmware.
+- **Repo map:** `KeyFigurator` (this repo, `C:\Repos\KeyFigurator`) = knowledge base + LOG
+  **and** the Tauri config app, which lives in-repo under `keyfigurator/` (crate name
+  `macropad-config`) · `C:\Repos\Macro-Pro-Firmware` = the firmware (vial-qmk fork; board
+  at `keyboards/macro_pad_pro/`) · `C:\Repos\Macro-Pro` = the KiCad hardware + enclosure.
 - **git worktree** each sub-agent code session so parallel agents don't collide. Read the
   target repo's own `CLAUDE.md` for its rules.
 - **Output contract:** a worker returns a PR URL + a result summary. Knowledge-base updates
@@ -71,8 +76,8 @@ The standard harness verifies features by driving the app in a browser. Two devi
 1. **Tauri, not a browser app** — drive the frontend (webview / component tests) + Rust unit
    tests on the protocol layer.
 2. **Hardware-in-the-loop is a HUMAN step** — "the RGB actually changed on the board" cannot
-   be auto-verified by a sub-agent. Until boards arrive, verify against the **mock HID
-   device**; after, the physical check is a human gate in `/pr`.
+   be auto-verified by a sub-agent. Agents verify against the **mock HID device** + Rust
+   unit tests; the physical check on a real board is a human gate in `/pr`.
 
 ## Links
 - Firmware base: https://github.com/vial-kb/vial-qmk

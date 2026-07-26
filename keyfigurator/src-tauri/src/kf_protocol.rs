@@ -329,9 +329,9 @@ const KEYCODES: &[(&str, u16)] = &[
     ("RESET", 0x7C00),
 ];
 
-/// Convert a keycode string to its u16 wire value. Returns `None` for names
-/// outside the supported subset (caller logs + substitutes KC_NO).
-pub fn keycode_to_u16(name: &str) -> Option<u16> {
+/// One lookup pass over the parametric forms, the hex escape hatch, and the
+/// name table. Exact string match — casing/prefix healing happens in the caller.
+fn lookup_exact(name: &str) -> Option<u16> {
     if let Some(v) = parse_parametric(name) {
         return Some(v);
     }
@@ -339,6 +339,38 @@ pub fn keycode_to_u16(name: &str) -> Option<u16> {
         return u16::from_str_radix(hex, 16).ok();
     }
     KEYCODES.iter().find(|(n, _)| *n == name).map(|&(_, v)| v)
+}
+
+/// Convert a keycode string to its u16 wire value. Returns `None` for names
+/// outside the supported subset (caller logs + substitutes KC_NO).
+///
+/// Tolerant by design: the UI, older saved profiles and imported layer files all
+/// carry hand-written keycodes, so a bare or lower-case name (`"a"`, `"ENTER"`,
+/// `"5"`) is healed to its `KC_*` form rather than silently becoming KC_NO. A
+/// name that already carries a prefix is NOT re-prefixed, so genuine typos
+/// (`"KC_NONSENSE"`) still fail loudly.
+pub fn keycode_to_u16(name: &str) -> Option<u16> {
+    let raw = name.trim();
+    if raw.is_empty() {
+        return Some(0); // KC_NO
+    }
+    // Exact match first: the table's own spelling always wins.
+    if let Some(v) = lookup_exact(raw) {
+        return Some(v);
+    }
+    let up = raw.to_ascii_uppercase();
+    if up != raw {
+        if let Some(v) = lookup_exact(&up) {
+            return Some(v);
+        }
+    }
+    // Bare name: try the KC_ namespace it almost certainly meant.
+    if !up.contains('(') && !up.starts_with("KC_") {
+        if let Some(v) = lookup_exact(&format!("KC_{up}")) {
+            return Some(v);
+        }
+    }
+    None
 }
 
 /// Convert a u16 wire value back to a keycode string. Falls back to `0xXXXX`.
@@ -613,6 +645,26 @@ mod tests {
         // unknown value round-trips as hex, and back
         assert_eq!(keycode_from_u16(0x1234), "0x1234");
         assert_eq!(keycode_to_u16("0x1234"), Some(0x1234));
+    }
+
+    #[test]
+    fn keycode_heals_bare_and_lowercase_names() {
+        // Bare names (older saved profiles / imported layer files) used to land
+        // on KC_NO and silently blank the key on the board.
+        assert_eq!(keycode_to_u16("A"), Some(0x0004));
+        assert_eq!(keycode_to_u16("a"), Some(0x0004));
+        assert_eq!(keycode_to_u16("5"), Some(0x0022));
+        assert_eq!(keycode_to_u16("ENTER"), Some(0x0028));
+        assert_eq!(keycode_to_u16("esc"), Some(0x0029));
+        assert_eq!(keycode_to_u16("f12"), Some(0x0045));
+        assert_eq!(keycode_to_u16(" KC_TAB "), Some(0x002B));
+        assert_eq!(keycode_to_u16("kc_lctl"), Some(0x00E0));
+        assert_eq!(keycode_to_u16("host(2)"), Some(0x7E02));
+        assert_eq!(keycode_to_u16("mo(1)"), Some(0x5221));
+        assert_eq!(keycode_to_u16(""), Some(0x0000));
+        // Real typos must still fail loudly rather than being re-prefixed.
+        assert_eq!(keycode_to_u16("KC_NOPE"), None);
+        assert_eq!(keycode_to_u16("NOPE"), None);
     }
 
     #[test]

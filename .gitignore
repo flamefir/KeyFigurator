@@ -8,6 +8,9 @@ keyfigurator/.vite-temp/
 keyfigurator/src-tauri/target/
 keyfigurator/rustup-init.exe
 
+## Logs
+keyfigurator/.taurirun.log
+
 ## OS
 .DS_Store
 Thumbs.db
