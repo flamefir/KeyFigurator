@@ -3,13 +3,15 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>KeyFigurator Pro</title>
+    <title>Orbit</title>
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
     <!-- Custom title bar (replaces native OS chrome) -->
     <div class="titlebar" data-tauri-drag-region>
-      <span class="titlebar-title">KeyFigurator Pro</span>
+      <span class="titlebar-title">
+        <img class="titlebar-logo" src="logo.svg" alt="" />Orbit
+      </span>
       <div class="titlebar-btns">
         <button id="btn-min"   title="Minimize">&#x2013;</button>
         <button id="btn-max"   title="Maximize">&#x25A1;</button>
@@ -141,23 +143,6 @@
       <div class="app-device" id="app-device"></div>
     </div>
 
-    <!-- Fixed top-right: Saved Layers (hover-activated) -->
-    <div class="sl-wrap" id="sl-wrap">
-      <button class="sl-btn" id="sl-btn">
-        Saved Layers <span class="sl-plus" id="sl-plus">+</span>
-      </button>
-      <div class="sl-dropdown" id="sl-dropdown">
-        <div class="sl-new-row" id="sl-new-row">
-          <input type="text" id="sl-new-input" placeholder="Layer name…" maxlength="16" />
-          <label class="sl-import-btn" title="Import layer from JSON file">
-            ↑
-            <input type="file" id="sl-import-file" accept=".json" style="display:none" />
-          </label>
-        </div>
-        <div class="sl-list" id="sl-list"></div>
-      </div>
-    </div>
-
     <header>
       <div id="conn" class="pill">checking…</div>
       <!-- Global board LED controls. Both are protocol-level: brightness is the
@@ -169,19 +154,29 @@
         <input type="range" id="led-brightness" min="0" max="255" value="255" />
         <span class="bright-val" id="led-brightness-val">100%</span>
       </label>
-      <!-- Derived from the animation, not an independent control: "solid" means
-           the board shows our per-key colours, any other animation means the
-           board drives its own effect. Two controls over one firmware flag
-           would just fight. -->
-      <div id="overlay-ind" class="overlay-ind" title="Who is driving the LEDs right now">
-        <span class="pill-label">LED SOURCE</span>
-        <span class="overlay-state" id="overlay-state">App</span>
-      </div>
       <button id="btn-save-board" class="save-board-btn">Save to Board</button>
     </header>
 
+    <!-- Which screen the board is showing, centred over it, with the layer
+         arrows either side of the board itself. Replaces the old top-right
+         Saved Layers dropdown: switching is the common action and belongs on
+         the board, not behind a hover menu in a corner. -->
+    <div class="layer-bar" id="layer-bar">
+      <div class="layer-name-row">
+        <input type="text" id="layer-name" class="layer-name" maxlength="16"
+               title="Layer name. Shown on the board's OLED." />
+        <span class="layer-pos" id="layer-pos"></span>
+      </div>
+      <div class="layer-actions">
+        <button class="layer-act" id="layer-add-screen" title="Add a screen or layer">+ Screen</button>
+        <button class="layer-act danger" id="layer-del-screen" title="Remove this screen">✕ Screen</button>
+      </div>
+    </div>
+
     <div class="board-wrap">
       <div class="board-ring" id="board-ring" title="Click anywhere on the ring to open Underglow settings">
+        <button class="layer-arrow prev" id="layer-prev" title="Previous screen">‹</button>
+        <button class="layer-arrow next" id="layer-next" title="Next screen">›</button>
         <div class="board" id="board" title=""></div>
         <!-- Corner underglow LED pickers (one per corner) -->
         <div class="ug-corner ug-tl" id="ug-c0" title="Top-left LED"><span class="ug-dot"></span><input type="color" class="ug-corner-inp" value="#ffffff" /></div>
@@ -291,23 +286,6 @@
             </div>
             <div class="kc-macro-note" id="kc-macro-note"></div>
 
-            <!-- Above the keycode palette on purpose: the palette is a long
-                 scrolling list, so anything below it needs scrolling past to
-                 reach. These two settings are short and get looked for. -->
-            <div class="kc-layer-events" id="kc-layer-events">
-              <span class="pill-label">LAYER EVENTS</span>
-              <div class="kc-back-row" id="kc-back-row">
-                <span class="kc-back-label">Back key</span>
-                <span class="kc-back-val" id="kc-back-val">—</span>
-                <button class="oled-action-btn" id="kc-back-assign">Set</button>
-                <button class="oled-action-btn oled-del-screen" id="kc-back-clear" style="display:none">Clear</button>
-              </div>
-              <!-- No "Special Enter" row. It was one global confirm key
-                   standing in for the encoder push, which duplicated what the
-                   per-screen OLED Events already do better: every screen that
-                   needs a confirm has its own assignable event, so a single
-                   global one had no job left. -->
-            </div>
             <div class="kc-palette-wrap">
               <input id="kc-search" class="kc-search" placeholder="Search keycodes…" />
               <div id="kc-palette-list" class="kc-palette-list"></div>
@@ -316,13 +294,11 @@
         </div>
       </div>
       <div class="oled-pill" id="oled-pill">
+        <!-- Navigation and add/remove live on the layer bar above the board
+             now, so this is just a label for which screen is being edited. -->
         <div class="oled-pill-nav">
           <span class="pill-label">OLED</span>
-          <button class="oled-nav-btn" id="oled-nav-prev" title="Previous screen">‹</button>
           <span class="oled-screen-name-wrap"><span id="oled-screen-name">—</span></span>
-          <button class="oled-nav-btn" id="oled-nav-next" title="Next screen">›</button>
-          <button class="oled-add-screen" id="oled-add-screen" title="Add a custom text or image screen">+ Screen</button>
-          <button class="oled-remove-screen" id="oled-remove-screen" style="display:none">Remove</button>
         </div>
         <div class="oled-pill-content" id="oled-pill-content"></div>
         <div class="oled-font-row">

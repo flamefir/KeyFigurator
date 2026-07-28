@@ -240,6 +240,31 @@ fn default_sleep_timeout() -> u8 {
     60
 }
 
+/// The underglow's own animation. Separate from `AnimState` because it carries
+/// no colour: the animated modes reuse the corner colours already pushed by
+/// SET_LEDS, and rainbow generates its own spectrum.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UnderglowAnim {
+    pub name: String,
+    pub speed: u8,
+    pub intensity: u8,
+}
+
+impl Default for UnderglowAnim {
+    fn default() -> Self {
+        Self { name: "solid".into(), speed: 128, intensity: 180 }
+    }
+}
+
+/// A "Cycle Colors" palette: the running animation steps through these instead
+/// of holding one tint. Empty means no cycling.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct Palette {
+    pub colors: Vec<Rgb>,
+    /// The app's animation-rate byte; the board maps it to a cycle period.
+    pub rate: u8,
+}
+
 /// A host-side command bound to a HOST(n) key. When the board sends a
 /// RunHostCmd Raw HID packet with index n, the app runs this.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -6,7 +6,7 @@
   --muted: #8b929e;
   --sel:   #ffb454;
   --amber: #ff7a1e;
-  --titlebar-h: 32px;
+  --titlebar-h: 42px;
   /* Vertical room reserved for the fixed top-corner UI. The editor's nav is
      taller than the home page's because it carries the device identity block. */
   --nav-clear: 60px;
@@ -1947,6 +1947,81 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 50%; }
   border-color: var(--oled-ev-color, rgba(255,110,20,0.65)) !important;
   color: var(--oled-ev-color, rgba(255,110,20,0.85)) !important;
 }
+
+.titlebar-title { display: inline-flex; align-items: center; gap: 7px; }
+.titlebar-logo {
+  width: 30px; height: 30px; vertical-align: middle;
+  /* The source art is solid black; the title bar is dark. */
+  filter: invert(1) brightness(1.6);
+}
+
+.prompt-field { display: flex; flex-direction: column; gap: 6px; }
+.prompt-field .macro-name-inp { width: 100%; }
+
+/* ── Layer bar ────────────────────────────────────────────────────────────
+   Centred over the board, below the header info. The name is deliberately a
+   size up from the surrounding labels: it is the thing you look at to know
+   where you are. */
+.layer-bar { display: none; flex-direction: column; align-items: center; gap: 6px; margin: 10px auto 2px; }
+body.editor .layer-bar { display: flex; }
+.layer-name-row { display: flex; align-items: baseline; gap: 10px; }
+.layer-name {
+  background: none; border: none; border-bottom: 1px solid transparent;
+  color: var(--txt); font-size: 19px; font-weight: 500; text-align: center;
+  padding: 2px 6px; min-width: 150px; max-width: 260px;
+}
+.layer-name:not(:disabled):hover  { border-bottom-color: var(--line); }
+.layer-name:not(:disabled):focus  { border-bottom-color: var(--sel); outline: none; }
+.layer-name:disabled { color: var(--muted); }
+.layer-pos { font-size: 11px; color: var(--muted); font-family: monospace; }
+
+.layer-actions { display: flex; align-items: center; gap: 6px; }
+.layer-act {
+  background: none; border: 1px solid var(--line); border-radius: 7px;
+  color: var(--muted); font-size: 11px; padding: 3px 10px;
+  cursor: pointer; transition: border-color 0.12s, color 0.12s;
+}
+.layer-act:not(:disabled):hover { border-color: var(--txt); color: var(--txt); }
+.layer-act.danger:not(:disabled):hover { border-color: #d15a5a; color: #d15a5a; }
+.layer-act:disabled { opacity: 0.3; cursor: not-allowed; }
+.layer-sep { width: 1px; height: 16px; background: var(--line); margin: 0 4px; }
+
+/* Arrows flank the board, so switching is a click either side of the thing you
+   are looking at.
+
+   Positioned against .board-ring rather than .board-wrap: the wrap also holds
+   the pills below the board, so centring on IT put the arrows low. The ring is
+   the circle, and the circle is what they should line up with. */
+.board-ring { position: relative; }
+.layer-arrow {
+  position: absolute; top: 50%; transform: translateY(-50%);
+  background: none; border: 1px solid var(--line); border-radius: 50%;
+  width: 68px; height: 68px; color: var(--muted); font-size: 40px;
+  cursor: pointer; z-index: 5; transition: border-color 0.12s, color 0.12s;
+  display: flex; align-items: center; justify-content: center;
+  /* The ‹ › glyphs sit high in their em box, so the line box centres but the
+     mark does not. line-height 0 takes the box out of the calculation and
+     leaves flex centring the glyph itself. */
+  line-height: 0; padding: 0;
+}
+.layer-arrow:hover { border-color: var(--sel); color: var(--sel); }
+/* 68px arrow + a 20px gap to the ring (was 18px, +10%). */
+.layer-arrow.prev { left: -88px; }
+.layer-arrow.next { right: -88px; }
+@media (max-width: 1180px) {
+  .layer-arrow { width: 52px; height: 52px; font-size: 31px; }
+  .layer-arrow.prev { left: -66px; }
+  .layer-arrow.next { right: -66px; }
+}
+
+/* Device card: layer export / import */
+.device-io {
+  background: none; border: 1px solid var(--line); border-radius: 8px;
+  color: var(--muted); font-size: 12px; padding: 3px 9px;
+  cursor: pointer; transition: border-color 0.12s, color 0.12s;
+  display: inline-flex; align-items: center;
+}
+.device-io:hover { border-color: var(--sel); color: var(--sel); }
 
 /* Device card: reset. Sits next to the remove ✕ but reads as the heavier of
    the two, since remove is recoverable by rescanning and this is not. */

@@ -1,7 +1,7 @@
 [package]
 name = "macropad-config"
 version = "0.1.0"
-description = "Macro Pad Pro configuration app"
+description = "Orbit - configuration app for the Lunar x MacroPad"
 edition = "2021"
 
 [build-dependencies]

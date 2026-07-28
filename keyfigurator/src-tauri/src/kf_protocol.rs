@@ -18,6 +18,8 @@
 /// Every KeyFigurator report is framed behind this magic byte so it can never
 /// collide with VIA (0x01..0x1D) / Vial (0xFE) command ids on the shared Raw
 /// HID interface.
+use crate::model::Rgb;
+
 pub const KF_MAGIC: u8 = 0xC0;
 
 /// Fixed QMK Raw HID report size.
@@ -51,6 +53,15 @@ pub const CMD_GET_KEYMAP: u8 = 0x10;
 pub const CMD_SET_KEYMAP: u8 = 0x11;
 pub const CMD_SET_LEDS: u8 = 0x20;
 pub const CMD_SET_ANIM: u8 = 0x21;
+/// The four underglow corners get their own animation, rendered by the firmware
+/// rather than by QMK's RGB matrix. QMK has one effect for the whole board, so
+/// SET_ANIM alone could never give the underglow something different from the
+/// keys — the app's separate underglow picker had no way to reach the hardware.
+pub const CMD_SET_UG_ANIM: u8 = 0x22;
+/// "Cycle Colors": a palette the running animation steps through instead of
+/// holding one tint. Two targets, keys and underglow, because each runs its own
+/// animation and the app offers a separate colour list for each.
+pub const CMD_SET_PALETTE: u8 = 0x23;
 pub const CMD_RUN_HOST_CMD: u8 = 0x30; // board -> host, unsolicited: [index]
 pub const CMD_EEPROM_COMMIT: u8 = 0x40;
 pub const CMD_OLED_SET_LAYER: u8 = 0x50;
@@ -64,6 +75,10 @@ pub const CMD_OLED_SET_POMODORO: u8 = 0x58;
 /// Per-screen OLED sleep. Same "not behind a version bump" rule as 0x58:
 /// firmware that predates it answers STATUS_ERROR and simply never sleeps.
 pub const CMD_OLED_SET_SLEEP: u8 = 0x59;
+/// How many layer screens the board shows. Its keymap always has LAYER_COUNT
+/// layers; this is only about the OLED's screen list, which the app's own
+/// arbitrary-length layer list drives.
+pub const CMD_OLED_SET_LAYER_COUNT: u8 = 0x5A;
 
 /// Pomodoro limits + defaults, mirroring `KF_POMO_*` in `kf_hid.h`. The board
 /// clamps to these, so the app applies the same bounds rather than letting the
@@ -237,6 +252,41 @@ pub fn set_anim_frame(anim: u8, speed: u8, hue: u8, sat: u8, val: u8) -> [u8; RE
     frame(CMD_SET_ANIM, &[anim, speed, hue, sat, val])
 }
 
+pub const PALETTE_MAX: usize = 20;
+pub const PALETTE_CHUNK_MAX: usize = 9;
+pub const PALETTE_SET_LEN: u8 = 0xF0;
+pub const PALETTE_TARGET_KEYS: u8 = 0;
+pub const PALETTE_TARGET_UNDERGLOW: u8 = 1;
+
+/// Palette length + cycle rate for one target. `len` 0 clears it.
+pub fn set_palette_len_frame(target: u8, len: u8, rate: u8) -> [u8; REPORT_LEN] {
+    frame(CMD_SET_PALETTE, &[target, PALETTE_SET_LEN, len, rate])
+}
+
+/// Palette colours, chunked to what one report carries.
+pub fn set_palette_frames(target: u8, colors: &[Rgb]) -> Vec<[u8; REPORT_LEN]> {
+    colors
+        .chunks(PALETTE_CHUNK_MAX)
+        .enumerate()
+        .map(|(ci, chunk)| {
+            let mut p = Vec::with_capacity(3 + chunk.len() * 3);
+            p.push(target);
+            p.push((ci * PALETTE_CHUNK_MAX) as u8);
+            p.push(chunk.len() as u8);
+            for c in chunk {
+                p.extend_from_slice(c);
+            }
+            frame(CMD_SET_PALETTE, &p)
+        })
+        .collect()
+}
+
+/// Underglow animation. No colour: the animated modes use the corner colours
+/// SET_LEDS already pushed, and RAINBOW generates its own spectrum.
+pub fn set_ug_anim_frame(anim: u8, speed: u8, intensity: u8) -> [u8; REPORT_LEN] {
+    frame(CMD_SET_UG_ANIM, &[anim, speed, intensity])
+}
+
 pub fn oled_img_begin_frame(total_len: u32) -> [u8; REPORT_LEN] {
     let b = total_len.to_le_bytes();
     frame(CMD_OLED_IMG_BEGIN, &[b[0], b[1], b[2]])
@@ -330,6 +380,10 @@ pub fn oled_set_countdown_frame(h: u8, m: u8, s: u8) -> [u8; REPORT_LEN] {
 /// Which screens may blank themselves, as a bitmap over the nav-index space
 /// (bits 0..3 = layer screens, 4..9 = custom screens), and after how long.
 /// A `timeout_s` of 0 leaves the board's current timeout alone.
+pub fn oled_set_layer_count_frame(count: u8) -> [u8; REPORT_LEN] {
+    frame(CMD_OLED_SET_LAYER_COUNT, &[count])
+}
+
 pub fn oled_set_sleep_frame(timeout_s: u8, mask: u16) -> [u8; REPORT_LEN] {
     frame(
         CMD_OLED_SET_SLEEP,
@@ -533,6 +587,20 @@ pub fn keycode_from_u16(kc: u16) -> String {
 // returns the response, exactly like `kf_hid_handle`.
 // ---------------------------------------------------------------------------
 
+/// A "Cycle Colors" palette as the board holds it.
+#[derive(Clone, Copy)]
+pub struct PaletteState {
+    pub rgb: [Rgb; PALETTE_MAX],
+    pub len: u8,
+    pub rate: u8,
+}
+
+impl Default for PaletteState {
+    fn default() -> Self {
+        Self { rgb: [[0, 0, 0]; PALETTE_MAX], len: 0, rate: 128 }
+    }
+}
+
 #[derive(Clone)]
 pub struct BoardModel {
     pub keymap: [[u16; KEY_COUNT]; LAYER_COUNT],
@@ -559,6 +627,16 @@ pub struct BoardModel {
     pub reject_pomodoro: bool,
     /// Per-screen sleep: bitmap over the nav-index space, plus the idle
     /// timeout. Starts empty — a board nobody configured never goes dark.
+    /// Underglow animation, independent of the global one (kf_hid.c renders
+    /// slots 21..24 itself).
+    /// One palette per target (keys, underglow), mirroring kf_palettes.
+    pub palettes: [PaletteState; 2],
+    pub ug_anim: u8,
+    pub ug_speed: u8,
+    pub ug_intensity: u8,
+    /// How many layer screens the board shows (not how many keymap layers it
+    /// has, which is always LAYER_COUNT).
+    pub layer_screen_count: u8,
     pub sleep_mask: u16,
     pub sleep_timeout_s: u8,
     /// Image upload state, mirroring the board's single image buffer.
@@ -589,6 +667,11 @@ impl Default for BoardModel {
                 POMO_DEFAULT_LONG_EVERY,
             ),
             reject_pomodoro: false,
+            palettes: [PaletteState::default(); 2],
+            ug_anim: ANIM_SOLID,
+            ug_speed: 128,
+            ug_intensity: 180,
+            layer_screen_count: LAYER_COUNT as u8,
             sleep_mask: 0,
             sleep_timeout_s: 60,
             oled_img_expected: 0,
@@ -656,7 +739,7 @@ impl BoardModel {
                 // Mirrors kf_hid.c: the mock reports the same product 0x01 /
                 // hw 1.0.0 the bench board does, so capability lookups behave
                 // identically with and without hardware attached.
-                let name = b"Macro Pad Pro";
+                let name = b"Lunar x MacroPad";
                 r[0] = 0x01; // product id
                 r[1] = 1; // hardware 1.0.0
                 r[2] = 0;
@@ -669,6 +752,41 @@ impl BoardModel {
             }
             CMD_SET_LEDS => {
                 r[0] = self.apply_set_leds(p);
+            }
+            CMD_SET_PALETTE => {
+                let t = p[0] as usize;
+                if t >= self.palettes.len() {
+                    r[0] = STATUS_ERROR;
+                } else if p[1] == PALETTE_SET_LEN {
+                    if p[2] as usize > PALETTE_MAX {
+                        r[0] = STATUS_ERROR;
+                    } else {
+                        self.palettes[t].len = p[2];
+                        self.palettes[t].rate = p[3];
+                        r[0] = STATUS_OK;
+                    }
+                } else {
+                    let (off, n) = (p[1] as usize, p[2] as usize);
+                    if n > PALETTE_CHUNK_MAX || off + n > PALETTE_MAX {
+                        r[0] = STATUS_ERROR;
+                    } else {
+                        for i in 0..n {
+                            self.palettes[t].rgb[off + i] =
+                                [p[3 + i * 3], p[4 + i * 3], p[5 + i * 3]];
+                        }
+                        r[0] = STATUS_OK;
+                    }
+                }
+            }
+            CMD_SET_UG_ANIM => {
+                if p[0] >= ANIM_COUNT {
+                    r[0] = STATUS_ERROR;
+                } else {
+                    self.ug_anim      = p[0];
+                    self.ug_speed     = p[1];
+                    self.ug_intensity = p[2];
+                    r[0] = STATUS_OK;
+                }
             }
             CMD_SET_ANIM => {
                 if p[0] >= ANIM_COUNT {
@@ -759,6 +877,12 @@ impl BoardModel {
             }
             CMD_OLED_SET_COUNTDOWN => {
                 self.oled_countdown = (p[0], p[1], p[2]);
+                r[0] = STATUS_OK;
+            }
+            CMD_OLED_SET_LAYER_COUNT => {
+                if p[0] > 0 {
+                    self.layer_screen_count = p[0].min(LAYER_COUNT as u8);
+                }
                 r[0] = STATUS_OK;
             }
             CMD_OLED_SET_SLEEP => {

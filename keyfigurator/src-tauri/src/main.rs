@@ -26,7 +26,7 @@ mod qgf;
 mod runner;
 
 use hid::{BoardLink, HidTransport, PingInfo, RealHid};
-use model::{AnimState, HostBinding, KeyMap, LedState, OledConfig};
+use model::{AnimState, HostBinding, KeyMap, LedState, OledConfig, Palette, UnderglowAnim};
 use serde::Serialize;
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
@@ -174,6 +174,29 @@ fn set_anim(state: State<AppState>, anim: AnimState) -> Result<(), String> {
         .lock()
         .unwrap()
         .set_anim(&anim)
+        .map_err(|e| e.to_string())
+}
+
+/// Set the underglow's own animation. Distinct from `set_anim`, which is the
+/// board-wide one; the firmware renders the four corners separately.
+#[tauri::command(async)]
+fn set_ug_anim(state: State<AppState>, ug: UnderglowAnim) -> Result<(), String> {
+    state
+        .transport
+        .lock()
+        .unwrap()
+        .set_ug_anim(&ug)
+        .map_err(|e| e.to_string())
+}
+
+/// Push a Cycle Colors palette. `target` 0 = keys, 1 = underglow.
+#[tauri::command(async)]
+fn set_palette(state: State<AppState>, target: u8, palette: Palette) -> Result<(), String> {
+    state
+        .transport
+        .lock()
+        .unwrap()
+        .set_palette(target, &palette)
         .map_err(|e| e.to_string())
 }
 
@@ -402,6 +425,8 @@ fn main() {
             set_keymap,
             set_leds,
             set_anim,
+            set_ug_anim,
+            set_palette,
             set_overlay,
             oled_push,
             oled_push_image,

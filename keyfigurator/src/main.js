@@ -21,6 +21,8 @@ function browserMock(cmd, args) {
     case "get_keymap":   return structuredClone(browserState.keymap);
     case "set_keymap":   browserState.keymap = structuredClone(args.map); return;
     case "set_leds":     return;
+    case "set_ug_anim":  return;
+    case "set_palette":  return;
     case "oled_push":    return;
     case "sync_time":    return;
     case "eeprom_commit":return;
@@ -136,7 +138,6 @@ let encoderMode   = "layer"; // "layer" | "scroll"
 const OLED_CUSTOM_KEY     = "kf-oled-custom";
 // No OLED_CD_KEY: the countdown is not persisted at all any more, it always
 // opens at 00:00:00. Old "kf-oled-cd" entries are simply left to rot.
-const OLED_BACK_KEY       = "kf-oled-back";
 // Standard 128×128 OLED font presets — char limits derived from real glyph cell widths
 const OLED_FONTS = [
   { id: "small",  label: "Small",  hw: "5×7",  previewPx: "8px",  nameMax: 21, titleMax: 19 },
@@ -173,29 +174,28 @@ let oledCdDone       = false;
 // The durations are configuration, pushed to the board via OLED_SET_POMODORO.
 // These are the FIRMWARE's power-on defaults, so an unconfigured board and a
 // fresh editor agree before anything is sent.
-const POMO_DEFAULTS = { workMin: 25, shortBreakMin: 5, longBreakMin: 15, longEvery: 4 };
+const POMO_DEFAULTS = { workMin: 25, pauseMin: 5, cycles: 4 };
 // Same bounds the firmware clamps to (KF_POMO_MIN/MAX_* in kf_hid.h). Applied
 // here too, so a value cannot be shown that the board would silently change.
 const POMO_MIN_MINUTES = 1;
 const POMO_MAX_MINUTES = 240;
-const POMO_MIN_EVERY   = 1;
-const POMO_MAX_EVERY   = 16;
+const POMO_MIN_CYCLES  = 1;
+const POMO_MAX_CYCLES  = 16;
 
 let oledPomo = { ...POMO_DEFAULTS };
 // null = not asked yet. False means the board answered but rejected
 // OLED_SET_POMODORO, i.e. firmware predating the command.
 let oledPomoSupported = null;
 
-let oledPomoPhase     = "work";     // "work" | "shortBreak" | "longBreak"
+let oledPomoPhase     = "work";     // "work" | "pause"
+let oledPomoDone      = false;      // the last cycle has finished
 let oledPomoRunning   = false;
 let oledPomoStart     = 0;
 let oledPomoAcc       = 0;          // seconds accumulated before current start
 let oledPomoCompleted = 0;
 
 function pomoPhaseSeconds() {
-  if (oledPomoPhase === "shortBreak") return oledPomo.shortBreakMin * 60;
-  if (oledPomoPhase === "longBreak")  return oledPomo.longBreakMin * 60;
-  return oledPomo.workMin * 60;
+  return (oledPomoPhase === "pause" ? oledPomo.pauseMin : oledPomo.workMin) * 60;
 }
 
 function getPomoElapsed() {
@@ -206,16 +206,20 @@ function getPomoRemaining() {
   return Math.max(0, pomoPhaseSeconds() - getPomoElapsed());
 }
 
-// Roll finished phases forward. Same rule as pomo_advance(): only WORK phases
-// count toward the completed tally, and every longEvery of them earns a
-// long break instead of a short one.
+// Roll finished phases forward. Same rule as pomo_advance(): a work phase feeds
+// the completed tally, and the pause after the LAST one ends the session rather
+// than starting another round.
 function pomoTick() {
-  if (!oledPomoRunning) return;
+  if (!oledPomoRunning || oledPomoDone) return;
   let guard = 0;
-  while (getPomoElapsed() >= pomoPhaseSeconds() && guard++ < oledPomo.longEvery * 2) {
+  while (getPomoElapsed() >= pomoPhaseSeconds() && guard++ < oledPomo.cycles * 2) {
     if (oledPomoPhase === "work") {
       oledPomoCompleted++;
-      oledPomoPhase = (oledPomoCompleted % oledPomo.longEvery === 0) ? "longBreak" : "shortBreak";
+      oledPomoPhase = "pause";
+    } else if (oledPomoCompleted >= oledPomo.cycles) {
+      oledPomoDone    = true;
+      oledPomoRunning = false;
+      return;
     } else {
       oledPomoPhase = "work";
     }
@@ -227,7 +231,9 @@ function pomoTick() {
 let oledFlashKeys    = false;
 let oledFlashStart   = 0;
 
-let oledBackKeyIdx     = null;       // physical key index assigned as OLED back/escape; null = unassigned
+// No back key. It duplicated Present Keys, which already toggles the sub-mode
+// both ways, and its assignment UI is gone — so a stale "kf-oled-back" entry
+// could tint a key with no way left to clear it. Old entries are ignored.
 
 const OLED_EVENT_KEYS_KEY = "kf-oled-event-keys";
 let oledEventKeys      = {};    // { eventName: keyIdx }
@@ -373,11 +379,13 @@ function renderOledScreenContent(screenEl) {
         const layers    = getSavedLayers();
         const layer     = layers.find(l => l.id === screen.layerId);
         const idx       = String(layers.indexOf(layer) + 1).padStart(2, "0");
-        const name      = (layer?.name || "").toUpperCase().slice(0, oledNameMax());
-        const showTitle = layer?.showTitle !== false;
+        // The name IS the screen. It used to be a secondary line under a fixed
+        // "LAYER NN", gated behind a Show toggle, so renaming a layer appeared
+        // to do nothing — the big text never changed. Falls back to LAYER NN
+        // only when the layer has no name at all.
+        const name = (layer?.name || "").toUpperCase().slice(0, oledNameMax());
         screenEl.innerHTML = `<div class="oled-layer-screen">
-          <div class="oled-lyr-idx">LAYER ${idx}</div>
-          ${showTitle && name ? `<div class="oled-lyr-name">${name}</div>` : ""}
+          <div class="oled-lyr-name">${escapeHtml(name || `LAYER ${idx}`)}</div>
         </div>`;
       }
       break;
@@ -414,14 +422,15 @@ function renderOledScreenContent(screenEl) {
       break;
     }
     case "pomodoro": {
-      const phaseLabel = oledPomoPhase === "work"
-        ? "POMODORO"
-        : (oledPomoPhase === "longBreak" ? "LONG BREAK" : "BREAK");
+      const phaseLabel = oledPomoDone ? "DONE" : (oledPomoPhase === "work" ? "POMODORO" : "PAUSE");
+      const isBreak    = oledPomoDone || oledPomoPhase !== "work";
       screenEl.innerHTML = `<div class="oled-timer-screen">
         <div class="oled-screen-lbl">${phaseLabel}</div>
-        <div class="oled-time-val${oledPomoPhase === "work" ? "" : " oled-pomo-break"}">${formatTime(getPomoRemaining())}</div>
-        <div class="oled-screen-hint">DONE ${oledPomoCompleted}</div>
-        <div class="oled-screen-hint">${oledPomoRunning ? "↓ pause" : "↓ start"}</div>
+        <div class="oled-time-val${isBreak ? " oled-pomo-break" : ""}">${
+          oledPomoDone ? "00:00" : formatTime(getPomoRemaining())}</div>
+        <div class="oled-screen-hint">${oledPomoCompleted} / ${oledPomo.cycles}</div>
+        <div class="oled-screen-hint">${
+          oledPomoDone ? "↓ restart" : (oledPomoRunning ? "↓ pause" : "↓ start")}</div>
       </div>`;
       break;
     }
@@ -485,6 +494,7 @@ function oledScreenNav(dir) {
   const screen = screens[oledScreenIdx];
   if (screen?.type === "layer") switchToLayer(screen.layerId, { silent: true });
   updateOledDisplay();
+  renderLayerBar();
 }
 
 // Rotation is screen navigation, always. It used to be hijacked by the
@@ -557,7 +567,16 @@ function triggerOledEvent(eventName) {
       if (!oledCdRunning && !oledCdDone) adjustCdField(-1);
       break;
     case "pomoStartStop":
-      if (oledPomoRunning) {
+      // A fixed cycle count gives the session an end, so push needs a way out
+      // of it that is not "reload the app".
+      if (oledPomoDone) {
+        oledPomoDone      = false;
+        oledPomoCompleted = 0;
+        oledPomoPhase     = "work";
+        oledPomoAcc       = 0;
+        oledPomoStart     = performance.now();
+        oledPomoRunning   = true;
+      } else if (oledPomoRunning) {
         oledPomoAcc     = getPomoElapsed();
         oledPomoRunning = false;
       } else {
@@ -658,8 +677,8 @@ function adjustCdField(delta) {
 //
 // The firmware only knows the last of these; the first three live solely in
 // this app. See the note in kf_led_special_blink().
-function isSpecialKeyForScreen(kc, isEventKey, isBackKey) {
-  if (isEventKey || isBackKey) return true;
+function isSpecialKeyForScreen(kc, isEventKey) {
+  if (isEventKey) return true;
 
   const screen = getOledScreens()[oledScreenIdx];
   if (screen?.type === "countdown" && !oledCdRunning && !oledCdDone) {
@@ -680,10 +699,9 @@ function refreshSpecialKeyHints() {
     const el = document.getElementById("key-" + pos.idx);
     if (!el || el.classList.contains("oled-assigning")) continue;
     const isEventKey = Object.values(evMap).some(v => evIdx(v) === pos.idx);
-    const isBackKey  = pos.idx === oledBackKeyIdx;
     el.classList.toggle(
       "key-special-blink",
-      isSpecialKeyForScreen(keycodeAt(pos.idx), isEventKey, isBackKey));
+      isSpecialKeyForScreen(keycodeAt(pos.idx), isEventKey));
   }
 }
 
@@ -885,6 +903,103 @@ function wireEventRows(container) {
   });
 }
 
+// Which screen the board is showing, and the current layer's name, rendered
+// onto the bar above the board. The name is an input rather than a label
+// because renaming in place is one fewer mode than a separate edit button.
+function renderLayerBar() {
+  const bar = document.getElementById("layer-bar");
+  if (!bar) return;
+  const screens = getOledScreens();
+  const screen  = screens[oledScreenIdx] ?? {};
+  const layers  = getSavedLayers();
+
+  const nameInp = document.getElementById("layer-name");
+  const posEl   = document.getElementById("layer-pos");
+  const onLayer = screen.type === "layer";
+
+  if (onLayer) {
+    const layer = layers.find(l => l.id === screen.layerId);
+    // Never clobber what is being typed.
+    if (document.activeElement !== nameInp) nameInp.value = layer?.name ?? "";
+    nameInp.disabled = false;
+    nameInp.placeholder = "Layer name…";
+  } else {
+    nameInp.value = screenDisplayName(screen);
+    nameInp.disabled = true;   // only a layer has a name you can change
+  }
+  posEl.textContent = screens.length ? `${oledScreenIdx + 1} / ${screens.length}` : "";
+
+  // Removing a layer is part of "Screen" now, and the last one cannot go:
+  // zero layers is the state device reset exists to avoid.
+  const delBtn = document.getElementById("layer-del-screen");
+  delBtn.title = onLayer ? "Remove this layer" : "Remove this screen";
+  delBtn.disabled = onLayer
+    ? layers.length <= 1
+    : !["timer", "countdown", "datetime", "pomodoro", "gif", "custom"].includes(screen.type);
+}
+
+function screenDisplayName(screen) {
+  switch (screen?.type) {
+    case "timer":     return "Timer";
+    case "countdown": return "Countdown";
+    case "datetime":  return "Date & Time";
+    case "pomodoro":  return "Pomodoro";
+    case "gif":       return "GIF / Image";
+    case "custom":    return screen.title || "Custom Screen";
+    default:          return "";
+  }
+}
+
+// Jump the OLED nav to a specific layer's screen, so creating a layer lands you
+// on it rather than leaving the bar showing the one you were on.
+function goToLayerScreen(layerId) {
+  const i = getOledScreens().findIndex(s => s.type === "layer" && s.layerId === layerId);
+  if (i >= 0) {
+    oledScreenIdx = i;
+    oledSubMode = "nav";
+    updateOledDisplay();
+    renderOledPill();
+  }
+}
+
+async function removeCurrentScreen() {
+  const screens = getOledScreens();
+  const screen  = screens[oledScreenIdx];
+  if (!screen) return;
+
+  // A layer is a screen in this model, so "remove this screen" removes it —
+  // there is no separate delete button any more. Confirmed, because unlike a
+  // timer screen a layer carries a whole keymap and LED profile.
+  if (screen.type === "layer") {
+    const layers = getSavedLayers();
+    if (layers.length <= 1) return;
+    const layer = layers.find(l => l.id === screen.layerId);
+    const ok = await confirmModal({
+      title: `Delete ${layer?.name || "this layer"}?`,
+      body: "This layer's keymap, colours, icons and macros go with it. It "
+          + "cannot be undone. Export from the device card on Home first if you "
+          + "want to keep a copy.",
+      confirmLabel: "Delete layer",
+    });
+    if (!ok) return;
+    deleteSavedLayer(screen.layerId);
+    oledScreenIdx = Math.max(0, Math.min(oledScreenIdx, getOledScreens().length - 1));
+    updateOledDisplay();
+    renderLayerBar();
+    renderOledPill();
+    return;
+  }
+  const wasLast = oledScreenIdx >= screens.length - 1;
+  if (screen.type === "countdown") resetCountdown();
+  oledCustomScreens = oledCustomScreens.filter(s => s.id !== screen.id);
+  saveOledCustomScreens();
+  if (wasLast) oledScreenIdx = Math.max(0, oledScreenIdx - 1);
+  updateOledDisplay();
+  renderLayerBar();
+  renderOledPill();
+  scheduleLiveSync("oled");
+}
+
 function renderOledPillNav() {
   const screens = getOledScreens();
   const screen  = screens[oledScreenIdx] ?? {};
@@ -907,24 +1022,6 @@ function renderOledPillNav() {
   const nameEl = document.getElementById("oled-screen-name");
   if (nameEl) nameEl.textContent = `${oledScreenIdx + 1} / ${screens.length} — ${name}`;
 
-  const removable = ["timer", "countdown", "datetime", "pomodoro", "gif", "custom"].includes(screen.type);
-  const oldBtn = document.getElementById("oled-remove-screen");
-  if (oldBtn) {
-    const newBtn = oldBtn.cloneNode(true);
-    newBtn.style.display = removable ? "" : "none";
-    oldBtn.parentNode.replaceChild(newBtn, oldBtn);
-    if (removable) {
-      newBtn.addEventListener("click", (e) => {
-        e.stopPropagation();
-        const wasLast = oledScreenIdx >= getOledScreens().length - 1;
-        if (screen.type === "countdown") { oledCdRunning = false; oledCdDone = false; oledCdAcc = 0; }
-        oledCustomScreens = oledCustomScreens.filter(s => s.id !== screen.id);
-        saveOledCustomScreens();
-        if (wasLast) oledScreenIdx = Math.max(0, oledScreenIdx - 1);
-        updateOledDisplay(); renderOledPillNav(); renderOledPillContent();
-      });
-    }
-  }
 }
 
 function renderOledPillContent() {
@@ -942,24 +1039,17 @@ function renderOledPillContent() {
           <span class="pill-label">TITLE</span>
           <input class="oled-title-inp" id="oled-title-inp" type="text"
             value="${layer?.name || ""}" placeholder="Layer name…" maxlength="${oledNameMax()}" />
-          <label class="oled-show-title-wrap" title="Show title on OLED">
-            <input type="checkbox" id="oled-show-title" ${showTitle ? "checked" : ""} />
-            <span>Show</span>
-          </label>
         </div>
         <div class="oled-pill-hint">
           Layer name shown on OLED (max ${oledNameMax()} chars). Present Keys cycles through key assignments.
         </div>
         <div class="oled-pill-section" style="padding-bottom:6px">
-          <span class="pill-label">OLED Events</span>
+          <span class="pill-label">SCREEN EVENTS</span>
         </div>
         ${eventRowHTML("presentKeys", "Present Keys")}
         ${sleepRowHTML()}`;
       document.getElementById("oled-title-inp")?.addEventListener("input", (e) => {
         if (layer) { renameSavedLayer(layer.id, e.target.value); updateOledDisplay(); }
-      });
-      document.getElementById("oled-show-title")?.addEventListener("change", (e) => {
-        if (layer) { setLayerShowTitle(layer.id, e.target.checked); updateOledDisplay(); }
       });
       wireEventRows(container);
       wireSleepRow(container);
@@ -971,7 +1061,7 @@ function renderOledPillContent() {
           Timer resets when you navigate to another screen.
         </div>
         <div class="oled-pill-section" style="padding-bottom:6px">
-          <span class="pill-label">OLED Events</span>
+          <span class="pill-label">SCREEN EVENTS</span>
         </div>
         ${eventRowHTML("timerStartStop", "Start / Stop")}
         ${eventRowHTML("timerReset", "Reset")}
@@ -1001,7 +1091,7 @@ function renderOledPillContent() {
           encoder moves between screens. Bind any key below to do the same.
         </div>
         <div class="oled-pill-section" style="padding-bottom:6px">
-          <span class="pill-label">OLED Events</span>
+          <span class="pill-label">SCREEN EVENTS</span>
         </div>
         ${eventRowHTML("cdEvent", "Start / Stop")}
         ${eventRowHTML("cdLeft", "Field ←")}
@@ -1023,7 +1113,7 @@ function renderOledPillContent() {
       const unsupported = oledPomoSupported === false
         ? `<div class="oled-pill-hint oled-pomo-unsupported">
              This board's firmware predates adjustable durations, so it is still
-             running the built-in ${POMO_DEFAULTS.workMin}/${POMO_DEFAULTS.shortBreakMin}/${POMO_DEFAULTS.longBreakMin}.
+             running the built-in ${POMO_DEFAULTS.workMin}/${POMO_DEFAULTS.pauseMin} x ${POMO_DEFAULTS.cycles}.
              Values set here apply to the preview above; flash the current firmware to use them on the board.
            </div>`
         : "";
@@ -1034,27 +1124,22 @@ function renderOledPillContent() {
               min="${POMO_MIN_MINUTES}" max="${POMO_MAX_MINUTES}" step="1" value="${oledPomo.workMin}" />
           </label>
           <label class="oled-cd-field-lbl">PAUSE
-            <input class="oled-cd-num" id="oled-pomo-short" type="number"
-              min="${POMO_MIN_MINUTES}" max="${POMO_MAX_MINUTES}" step="1" value="${oledPomo.shortBreakMin}" />
+            <input class="oled-cd-num" id="oled-pomo-pause" type="number"
+              min="${POMO_MIN_MINUTES}" max="${POMO_MAX_MINUTES}" step="1" value="${oledPomo.pauseMin}" />
           </label>
-        </div>
-        <div class="oled-pill-section oled-pomo-setrow">
-          <label class="oled-cd-field-lbl">LONG PAUSE
-            <input class="oled-cd-num" id="oled-pomo-long" type="number"
-              min="${POMO_MIN_MINUTES}" max="${POMO_MAX_MINUTES}" step="1" value="${oledPomo.longBreakMin}" />
-          </label>
-          <label class="oled-cd-field-lbl">EVERY
-            <input class="oled-cd-num" id="oled-pomo-every" type="number"
-              min="${POMO_MIN_EVERY}" max="${POMO_MAX_EVERY}" step="1" value="${oledPomo.longEvery}" />
+          <label class="oled-cd-field-lbl">CYCLES
+            <input class="oled-cd-num" id="oled-pomo-cycles" type="number"
+              min="${POMO_MIN_CYCLES}" max="${POMO_MAX_CYCLES}" step="1" value="${oledPomo.cycles}" />
           </label>
         </div>
         <div class="oled-pill-hint">
-          Minutes. After every ${oledPomo.longEvery} work ${oledPomo.longEvery === 1 ? "phase" : "phases"} the long pause
-          replaces the short one. Changing a duration does not restart a running phase.
+          Minutes, then how many work + pause rounds make a session. After the
+          last one the board stops rather than looping. Changing a duration does
+          not restart a running phase.
         </div>
         ${unsupported}
         <div class="oled-pill-section" style="padding-bottom:6px">
-          <span class="pill-label">OLED Events</span>
+          <span class="pill-label">SCREEN EVENTS</span>
         </div>
         ${eventRowHTML("pomoStartStop", "Start / Pause")}
         ${eventRowHTML("presentKeys", "Present Keys")}
@@ -1066,16 +1151,15 @@ function renderOledPillContent() {
           e.target.value = v;
           oledPomo[key] = v;
           savePomodoro();
-          // The hint quotes longEvery, so it has to be re-rendered with it.
-          if (key === "longEvery") renderOledPillContent();
+          // The hint quotes the cycle count, so it has to be re-rendered with it.
+          if (key === "cycles") renderOledPillContent();
           updateOledDisplay();
           scheduleLiveSync("oled");
         });
       };
-      wirePomo("oled-pomo-work",  "workMin",       POMO_MIN_MINUTES, POMO_MAX_MINUTES);
-      wirePomo("oled-pomo-short", "shortBreakMin", POMO_MIN_MINUTES, POMO_MAX_MINUTES);
-      wirePomo("oled-pomo-long",  "longBreakMin",  POMO_MIN_MINUTES, POMO_MAX_MINUTES);
-      wirePomo("oled-pomo-every", "longEvery",     POMO_MIN_EVERY,   POMO_MAX_EVERY);
+      wirePomo("oled-pomo-work",   "workMin",  POMO_MIN_MINUTES, POMO_MAX_MINUTES);
+      wirePomo("oled-pomo-pause",  "pauseMin", POMO_MIN_MINUTES, POMO_MAX_MINUTES);
+      wirePomo("oled-pomo-cycles", "cycles",   POMO_MIN_CYCLES,  POMO_MAX_CYCLES);
       wireEventRows(container);
       wireSleepRow(container);
       break;
@@ -1086,7 +1170,7 @@ function renderOledPillContent() {
           Shows current time and date.
         </div>
         <div class="oled-pill-section" style="padding-bottom:6px">
-          <span class="pill-label">OLED Events</span>
+          <span class="pill-label">SCREEN EVENTS</span>
         </div>
         ${eventRowHTML("presentKeys", "Present Keys")}
         ${sleepRowHTML()}`;
@@ -1114,7 +1198,7 @@ function renderOledPillContent() {
           can exist.</span>
         </div>
         <div class="oled-pill-section" style="padding-bottom:6px">
-          <span class="pill-label">OLED Events</span>
+          <span class="pill-label">SCREEN EVENTS</span>
         </div>
         ${eventRowHTML("presentKeys", "Present Keys")}
         ${sleepRowHTML()}`;
@@ -1148,7 +1232,7 @@ function renderOledPillContent() {
           <textarea class="oled-body-inp" id="oled-custom-body" placeholder="Body text shown below title…" maxlength="200">${screen.body || ""}</textarea>
         </div>
         <div class="oled-pill-section" style="padding-bottom:6px">
-          <span class="pill-label">OLED Events</span>
+          <span class="pill-label">SCREEN EVENTS</span>
         </div>
         ${eventRowHTML("presentKeys", "Present Keys")}
         ${sleepRowHTML()}`;
@@ -1178,8 +1262,10 @@ function applyOledFont(fontId) {
   localStorage.setItem("kf-oled-font", fontId);
   const font = getOledFont();
   document.documentElement.style.setProperty("--oled-lyr-font-size", font.previewPx);
-  const slInp = document.getElementById("sl-new-input");
-  if (slInp) slInp.maxLength = font.nameMax;
+  // The layer-bar name field is what feeds the OLED title, so it carries the
+  // font's character limit.
+  const nameInp = document.getElementById("layer-name");
+  if (nameInp) nameInp.maxLength = font.nameMax;
   document.querySelectorAll(".oled-font-btn").forEach(btn => {
     btn.classList.toggle("active", btn.dataset.font === fontId);
   });
@@ -1256,12 +1342,6 @@ function buildTooltipHTML(idx) {
     </div>`;
   }
 
-  if (oledBackKeyIdx === idx) {
-    html += `<div class="ktt-row">
-      <span class="ktt-label">ROLE</span>
-      <span class="ktt-val">OLED back / escape</span>
-    </div>`;
-  }
 
   if (macro) {
     html += `<div class="ktt-row">
@@ -1520,6 +1600,7 @@ function renderPalette(containerId, palette, storageKey, onChange) {
       localStorage.setItem(storageKey, JSON.stringify(palette));
       renderPalette(containerId, palette, storageKey, onChange);
       onChange();
+      scheduleLiveSync("anim");
     });
     addEl.appendChild(addInp);
   }
@@ -1547,6 +1628,7 @@ function renderPalette(containerId, palette, storageKey, onChange) {
       localStorage.setItem(storageKey, JSON.stringify(palette));
       renderPalette(containerId, palette, storageKey, onChange);
       onChange();
+      scheduleLiveSync("anim");
     });
     swatch.appendChild(inp);
 
@@ -1560,6 +1642,7 @@ function renderPalette(containerId, palette, storageKey, onChange) {
       localStorage.setItem(storageKey, JSON.stringify(palette));
       renderPalette(containerId, palette, storageKey, onChange);
       onChange();
+      scheduleLiveSync("anim");
     });
     swatch.appendChild(del);
 
@@ -1603,22 +1686,6 @@ function renderKlAnimChips() {
 function hexToRgb(hex) {
   return { r: parseInt(hex.slice(1,3),16), g: parseInt(hex.slice(3,5),16), b: parseInt(hex.slice(5,7),16) };
 }
-function rgbToHsl(r, g, b) {
-  r /= 255; g /= 255; b /= 255;
-  const max = Math.max(r,g,b), min = Math.min(r,g,b);
-  const l = (max + min) / 2;
-  let h = 0, s = 0;
-  if (max !== min) {
-    const d = max - min;
-    s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
-    switch (max) {
-      case r: h = ((g - b) / d + (g < b ? 6 : 0)) / 6; break;
-      case g: h = ((b - r) / d + 2) / 6; break;
-      case b: h = ((r - g) / d + 4) / 6; break;
-    }
-  }
-  return { h, s, l };
-}
 function hslToRgb(h, s, l) {
   if (s === 0) { const v = Math.round(l * 255); return { r: v, g: v, b: v }; }
   const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
@@ -1632,13 +1699,6 @@ function hslToRgb(h, s, l) {
   };
   return { r: Math.round(h2r(h+1/3)*255), g: Math.round(h2r(h)*255), b: Math.round(h2r(h-1/3)*255) };
 }
-function shiftHue(hex, degrees) {
-  const { r, g, b } = hexToRgb(hex);
-  const { h, s, l } = rgbToHsl(r, g, b);
-  const rgb = hslToRgb((h + degrees / 360 + 1) % 1, s, l);
-  return `${rgb.r},${rgb.g},${rgb.b}`;
-}
-
 let ugAnimFrame = null;
 let ugAnimStart = 0;
 let lastKeyClickTime = 0;
@@ -1675,7 +1735,7 @@ function applyCornerGlow(tl, tr, bl, br) {
 function computeCornerStates(elapsed) {
   const duration = rateToDuration(ugRate);
   const t        = (elapsed % duration) / duration;
-  const maxOp    = 0.15 + (ugIntensity / 255) * 0.85;
+  const maxOp    = (0.15 + (ugIntensity / 255) * 0.85) * (0.12 + (ledBrightness / 255) * 0.88);
   // Palette: time-based — all corners advance through colors together each cycle
   const usePalette = ugPalette.length > 0 && ugAnimation !== "solid" && ugAnimation !== "rainbow";
   const paletteIdx = usePalette ? Math.floor(elapsed / duration) % ugPalette.length : -1;
@@ -1695,13 +1755,17 @@ function computeCornerStates(elapsed) {
     }
 
     case "rainbow": {
-      // Rainbow ignores palette — uses corner pickers with per-corner hue shifting
-      const hueOffset  = t * 360;
-      const phaseShift = [0, 90, 270, 180];
-      return cornerColors.map((hex, i) => ({
-        rgb:     shiftHue(hex, hueOffset + phaseShift[i]),
-        opacity: maxOp * 0.75,
-      }));
+      // Generates its own spectrum rather than hue-shifting the corner colours.
+      // shiftHue() preserves saturation, so a white or grey corner had no hue
+      // to rotate and stayed exactly as it was — the animation silently did
+      // nothing once the default became white. This matches the per-key rainbow
+      // and the 2026-06-25 decision that rainbow ignores the configured colours
+      // and produces its own HSL spectrum.
+      const phaseShift = [0, 0.25, 0.75, 0.5]; // TL, TR, BR, BL around the board
+      return phaseShift.map((phase) => {
+        const { r, g, b } = hslToRgb((t + phase) % 1, 1, 0.5);
+        return { rgb: `${r},${g},${b}`, opacity: maxOp * 0.75 };
+      });
     }
 
     case "wave": {
@@ -1907,7 +1971,14 @@ function klAnimTick(now) {
       continue;
     }
 
-    const { rgb, opacity } = result;
+    // The board scales every channel by brightness (kf_led_overlay_render),
+    // so the preview has to as well or the slider looks like it only moves the
+    // underglow. Floored a little above zero: at 0 the board really is dark,
+    // but a keycap with no outline at all reads as "not selected" rather than
+    // "unlit", and the editor still has to be usable.
+    const bScale = 0.12 + (ledBrightness / 255) * 0.88;
+    const { rgb } = result;
+    const opacity = result.opacity * bScale;
     if (isSel) {
       el.style.borderColor = `rgba(${rgb},1)`;
       el.style.boxShadow   = `0 0 14px rgba(${rgb},${Math.min(0.99, opacity * 1.5).toFixed(3)}), 0 0 28px rgba(${rgb},${(opacity * 0.8).toFixed(3)})`;
@@ -2031,6 +2102,7 @@ async function init() {
     ledBrightness = parseInt(e.target.value, 10) || 0;
     localStorage.setItem(BRIGHTNESS_KEY, String(ledBrightness));
     renderBrightness();
+    applyCornerColors();
     scheduleLiveSync("leds");
   });
 
@@ -2147,8 +2219,6 @@ async function init() {
   try { oledCustomScreens = JSON.parse(localStorage.getItem(OLED_CUSTOM_KEY) || "[]"); } catch {}
   try { oledSleepScreens = JSON.parse(localStorage.getItem(OLED_SLEEP_KEY)) || {}; } catch { oledSleepScreens = {}; }
   resetCountdown();
-  const savedBack = localStorage.getItem(OLED_BACK_KEY);
-  if (savedBack !== null) oledBackKeyIdx = Number(savedBack);
   try {
     const raw = JSON.parse(localStorage.getItem(OLED_EVENT_KEYS_KEY) || "{}");
     // Discard the old pre-per-screen flat format (top-level values were numbers)
@@ -2175,102 +2245,26 @@ async function init() {
   startKlAnimation();
   startOledAnim();
 
-  // ── Saved Layers ──────────────────────────────────────────────────────────
-  const slWrap       = document.getElementById("sl-wrap");
-  const slDropdown   = document.getElementById("sl-dropdown");
-  const slPlus       = document.getElementById("sl-plus");
-  const slNewRow     = document.getElementById("sl-new-row");
-  const slNewInput   = document.getElementById("sl-new-input");
-  const slImportFile = document.getElementById("sl-import-file");
-
-  slImportFile?.addEventListener("change", (e) => {
-    const file = e.target.files?.[0];
-    if (file) importLayer(file);
-    e.target.value = "";
+  // ── Layer bar ─────────────────────────────────────────────────────────────
+  // The board's own switcher. Replaces the top-right Saved Layers dropdown:
+  // switching screens is the common action, so it belongs on the board rather
+  // than behind a hover menu in a corner. Everything that acts on the CURRENT
+  // layer sits with its name; export/import are per-device and moved to the
+  // Home device card.
+  document.getElementById("layer-prev").addEventListener("click", (e) => {
+    e.stopPropagation(); oledScreenNav(-1); renderLayerBar(); renderOledPill();
+  });
+  document.getElementById("layer-next").addEventListener("click", (e) => {
+    e.stopPropagation(); oledScreenNav(1); renderLayerBar(); renderOledPill();
   });
 
-  function openDropdown() {
-    slDropdown.style.display = "flex"; // inline style survives CSS hover loss during drag
-    if (!dragSrcId) renderSavedLayers();
-  }
-
-  function closeDropdown() {
-    slDropdown.style.display = "";
-    slNewRow.classList.remove("open");
-    slNewInput.classList.remove("error");
-  }
-
-  slWrap.addEventListener("mouseenter", openDropdown);
-
-  slWrap.addEventListener("mouseleave", () => {
-    // Defer so dragstart can fire and set dragSrcId before we evaluate.
-    // In Chromium, mouseleave fires before dragstart, so without setTimeout
-    // dragSrcId is still null and the dropdown closes before the drag begins.
-    setTimeout(() => {
-      if (dragSrcId || slWrap.matches(":hover")) return;
-      closeDropdown();
-    }, 0);
-  });
-
-  // + click: add a new blank layer immediately, then open rename input
-  slPlus.addEventListener("click", (e) => {
+  document.getElementById("layer-add-screen").addEventListener("click", (e) => {
     e.stopPropagation();
-    const layers = getSavedLayers();
-    const defaultName = `Layer ${String(layers.length + 1).padStart(2, "0")}`;
-    switchToBlankLayer();
-    saveCurrentAsLayer(defaultName);
-    renderSavedLayers();
-    slNewInput.value = defaultName;
-    slNewInput.select();
-    slNewInput.classList.remove("error");
-    slNewRow.classList.add("open");
-    slNewInput.focus();
+    openScreenPicker();
   });
-
-  // Typing in the rename input renames the active layer live; Enter confirms
-  slNewInput.addEventListener("input", () => {
-    const name = slNewInput.value.trim();
-    if (name && activeProfileId) {
-      renameSavedLayer(activeProfileId, name);
-      renderBoard(); // refresh OLED
-      renderSavedLayers();
-    }
-  });
-
-  slNewInput.addEventListener("keydown", (e) => {
-    if (e.key !== "Enter") return;
-    const name = slNewInput.value.trim();
-    if (!name) { slNewInput.classList.add("error"); return; }
-    slNewInput.classList.remove("error");
-    renameSavedLayer(activeProfileId, name);
-    slNewRow.classList.remove("open");
-    renderSavedLayers();
-    renderBoard();
-  });
-
-  document.addEventListener("mousedown", (e) => {
-    dragStartPos = { x: e.clientX, y: e.clientY };
-    dragFromKey  = !!e.target.closest(".key, .encoder-knob");
-    clickStartedInKeyPill = !!e.target.closest("#key-pills");
-  });
-  document.addEventListener("mousemove", (e) => {
-    if (!dragStartPos || isDragging || !dragFromKey) return;
-    const dx = e.clientX - dragStartPos.x;
-    const dy = e.clientY - dragStartPos.y;
-    if (dx * dx + dy * dy > 25) isDragging = true; // 5px threshold
-  });
-  document.addEventListener("mouseup", () => { wasDragging = isDragging; isDragging = false; dragStartPos = null; dragFromKey = false; });
-  window.addEventListener("blur", () => { wasDragging = false; isDragging = false; dragStartPos = null; dragFromKey = false; });
-
-  document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") {
-      keySelectionOrder = [];
-      selectedKeys.clear();
-      closeKeyLedPill();
-      closeUnderglowPill();
-      closeOledPill();
-      renderBoard();
-    }
+  document.getElementById("layer-del-screen").addEventListener("click", (e) => {
+    e.stopPropagation();
+    removeCurrentScreen();
   });
 
   // ── Underglow ring click ───────────────────────────────────────────────────
@@ -2372,22 +2366,6 @@ async function init() {
     arrow.textContent = opening ? "▾" : "▸";
   });
 
-  // ── Back key assignment ───────────────────────────────────────────────────
-  document.getElementById("kc-back-assign").addEventListener("click", () => {
-    const [idx] = selectedKeys;
-    if (idx === undefined) return;
-    oledBackKeyIdx = idx;
-    localStorage.setItem(OLED_BACK_KEY, String(idx));
-    updateBackKeyRow();
-    renderBoard();
-  });
-  document.getElementById("kc-back-clear").addEventListener("click", () => {
-    oledBackKeyIdx = null;
-    localStorage.removeItem(OLED_BACK_KEY);
-    updateBackKeyRow();
-    renderBoard();
-  });
-
   // ── Per-key macro binding ─────────────────────────────────────────────────
   document.getElementById("kc-macro-select")?.addEventListener("change", (e) => {
     const [idx] = selectedKeys;
@@ -2461,17 +2439,7 @@ async function init() {
     scheduleAutoSave();
   });
 
-  // ── OLED pill controls ────────────────────────────────────────────────────
-  document.getElementById("oled-nav-prev").addEventListener("click", (e) => {
-    e.stopPropagation(); oledScreenNav(-1); renderOledPill();
-  });
-  document.getElementById("oled-nav-next").addEventListener("click", (e) => {
-    e.stopPropagation(); oledScreenNav(1); renderOledPill();
-  });
-  document.getElementById("oled-add-screen").addEventListener("click", (e) => {
-    e.stopPropagation();
-    openScreenPicker();
-  });
+  // Screen navigation and add/remove live on the layer bar above the board now.
 
   // OLED font picker
   document.getElementById("oled-font-btns").addEventListener("click", (e) => {
@@ -2582,18 +2550,16 @@ function renderBoard() {
       k.title = "";
       const isEmpty = kc === "KC_NO" || kc === "KC_TRNS";
       const isCycleActive  = oledSubMode === "keycycle" && pos.idx === (BOARD_POSITIONS[oledKeyCycleIdx]?.idx);
-      const isBackKey      = pos.idx === oledBackKeyIdx;
       const bsk            = currentOledScreenKey();
       const bScreenEvMap   = bsk ? (oledEventKeys[bsk] || {}) : {};
       const evEntry        = Object.values(bScreenEvMap).find(v => evIdx(v) === pos.idx);
       const isEventKey     = !!evEntry;
-      const isAssigning    = pendingEventAssign !== null && !isEventKey && !isBackKey;
-      const isSpecial      = isSpecialKeyForScreen(kc, isEventKey, isBackKey);
+      const isAssigning    = pendingEventAssign !== null && !isEventKey;
+      const isSpecial      = isSpecialKeyForScreen(kc, isEventKey);
       k.className = "key"
         + (isSel ? " sel" : "")
         + (isEmpty ? " empty" : "")
         + (isCycleActive ? " oled-key-active" : "")
-        + (isBackKey ? " oled-back-key" : "")
         + (isEventKey ? " oled-event-key" : "")
         + (isSpecial && !isAssigning ? " key-special-blink" : "")
         + (isAssigning ? " oled-assigning" : "");
@@ -2662,7 +2628,6 @@ function onKeyDown(idx) {
   const sk          = currentOledScreenKey();
   const screenEvMap = sk ? (oledEventKeys[sk] || {}) : {};
   const eventHit    = Object.entries(screenEvMap).find(([, v]) => evIdx(v) === idx);
-  const isBackExit  = oledBackKeyIdx === idx && oledSubMode !== "nav";
 
   hideKeyTooltip();
   lastKeyClickTime = performance.now();
@@ -2691,14 +2656,7 @@ function onKeyDown(idx) {
   // Fire the OLED role AFTER selecting, so the key is configurable either way.
   // Back-key exit wins over an event binding: leaving a sub-mode is the more
   // specific intent when a key happens to be both.
-  if (isBackExit) {
-    oledSubMode = "nav";
-    oledKeyCycleIdx = 0;
-    updateOledDisplay();
-    renderBoard();
-    // renderBoard() rebuilt the DOM, so re-apply the selection highlight.
-    document.getElementById("key-" + idx)?.classList.add("sel");
-  } else if (handleCountdownArrow(idx)) {
+  if (handleCountdownArrow(idx)) {
     // Consumed by the countdown screen. Nothing else to do — the key stays
     // selected so it is still configurable while doubling as a control.
   } else if (eventHit) {
@@ -2720,18 +2678,9 @@ function onKeyEnter(idx) {
 }
 
 function updateBackKeyRow() {
-  const row = document.getElementById("kc-back-row");
-  if (!row) return;
-  const n = selectedKeys.size;
-  const single = n === 1 && !selectedKeys.has(ENCODER_IDX);
-  document.getElementById("kc-layer-events").style.display = single ? "" : "none";
-  if (!single) return;
-  const [idx] = selectedKeys;
-  const isBack = oledBackKeyIdx === idx;
-  document.getElementById("kc-back-val").textContent = isBack ? `Key ${idx}` : "—";
-  document.getElementById("kc-back-assign").style.display = isBack ? "none" : "";
-  document.getElementById("kc-back-clear").style.display  = isBack ? "" : "none";
-  renderKeyMacroRow();
+  // The layer-events block moved out of the key pill; a screen's actions are
+  // assigned from its own SCREEN EVENTS rows now. Kept as a no-op rather than
+  // hunting every call site, since it is called from several render paths.
 }
 
 function syncKeyLedPill() {
@@ -2846,15 +2795,6 @@ function renameSavedLayer(id, name) {
   }
 }
 
-function setLayerShowTitle(id, show) {
-  const layers = getSavedLayers();
-  const layer = layers.find(l => l.id === id);
-  if (layer) {
-    layer.showTitle = show;
-    localStorage.setItem(layersKeyScoped(), JSON.stringify(layers));
-  }
-}
-
 function deleteSavedLayer(id) {
   const layers = getSavedLayers().filter(l => l.id !== id);
   localStorage.setItem(layersKeyScoped(), JSON.stringify(layers));
@@ -2873,8 +2813,58 @@ function deleteSavedLayer(id) {
     invoke("set_anim", { anim: buildAnimState() });
   }
 
-  renderSavedLayers();
+  renderLayerBar();
   renderBoard();
+}
+
+// Every layer this device owns, as one document. Reading the scoped key
+// directly rather than getSavedLayers(), which is relative to whichever device
+// is active — Home can export a device whose editor was never opened.
+function exportDeviceLayers(device) {
+  const scope = deviceKey(device);
+  let layers = [];
+  try { layers = JSON.parse(localStorage.getItem(`${LAYERS_KEY}::${scope}`)) || []; } catch {}
+  const doc = {
+    kind: "keyfigurator-layers",
+    version: 1,
+    device: { product_id: device.product_id, hardware: device.hardware },
+    exportedAt: new Date().toISOString(),
+    layers,
+  };
+  const url = URL.createObjectURL(new Blob([JSON.stringify(doc, null, 2)], { type: "application/json" }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `${(device.product_name || "device").replace(/\s+/g, "-")}-layers.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+// Appends rather than replaces, and re-ids on the way in so importing a file
+// exported from this same device cannot collide with what is already here.
+async function importDeviceLayers(device, file) {
+  const scope = deviceKey(device);
+  let text;
+  try { text = await file.text(); } catch { return; }
+  let incoming;
+  try {
+    const doc = JSON.parse(text);
+    incoming = Array.isArray(doc) ? doc : (doc.layers || []);
+  } catch {
+    await confirmModal({
+      title: "Could not read that file",
+      body: "It is not valid JSON, so there is nothing to import.",
+      confirmLabel: "OK",
+    });
+    return;
+  }
+  if (!incoming.length) return;
+
+  let existing = [];
+  try { existing = JSON.parse(localStorage.getItem(`${LAYERS_KEY}::${scope}`)) || []; } catch {}
+  const stamped = incoming.map((l, i) => ({ ...l, id: `${Date.now()}-${i}` }));
+  localStorage.setItem(`${LAYERS_KEY}::${scope}`, JSON.stringify([...existing, ...stamped]));
+  if (activeDevice && deviceKey(activeDevice) === scope) renderLayerBar();
+  renderDeviceList();
 }
 
 function exportLayer(layer) {
@@ -2905,7 +2895,7 @@ function importLayer(file) {
         iconImages: data.iconImages || Array(21).fill(null),
       });
       localStorage.setItem(layersKeyScoped(), JSON.stringify(layers));
-      renderSavedLayers();
+      renderLayerBar();
     } catch (err) {
       alert("Could not import: " + err.message);
     }
@@ -2941,15 +2931,12 @@ async function switchToLayer(id, { silent = false } = {}) {
   renderBoard();
   flashBoard();
   await invoke("set_keymap", { map: keymap });
-  renderSavedLayers();
+  renderLayerBar();
   if (!silent) {
-    const slNewRow   = document.getElementById("sl-new-row");
-    const slNewInput = document.getElementById("sl-new-input");
-    slNewInput.value = layer.name;
-    slNewInput.classList.remove("error");
-    slNewRow.classList.add("open");
-    slNewInput.select();
-    slNewInput.focus();
+    // The bar's name field is always editable, so "selected for rename" is the
+    // whole interaction — no row to open.
+    const nameInp = document.getElementById("layer-name");
+    if (nameInp && !nameInp.disabled) { nameInp.select(); nameInp.focus(); }
   }
 }
 
@@ -2974,109 +2961,6 @@ function switchToBlankLayer() {
   flashBoard();
 }
 
-function renderSavedLayers() {
-  const list = document.getElementById("sl-list");
-  const layers = getSavedLayers();
-
-  if (layers.length === 0) {
-    list.innerHTML = `<div style="color:var(--muted);font-size:12px;text-align:center;padding:6px 0">No saved layers yet</div>`;
-    return;
-  }
-
-  list.innerHTML = "";
-  for (const [i, layer] of layers.entries()) {
-    const item = document.createElement("div");
-    item.className = "sl-item" + (layer.id === activeProfileId ? " active-profile" : "");
-    item.dataset.layerId = layer.id;
-
-    const idx = document.createElement("span");
-    idx.className = "sl-item-idx";
-    idx.textContent = String(i + 1).padStart(2, "0");
-
-    const name = document.createElement("span");
-    name.className = "sl-item-name";
-    name.textContent = layer.name;
-
-    const exp = document.createElement("button");
-    exp.className = "sl-exp";
-    exp.textContent = "↓";
-    exp.title = "Export as JSON";
-    exp.addEventListener("click", (e) => { e.stopPropagation(); exportLayer(layer); });
-
-    const del = document.createElement("button");
-    del.className = "sl-del";
-    del.textContent = "✕";
-    del.title = "Delete";
-    del.addEventListener("click", (e) => { e.stopPropagation(); deleteSavedLayer(layer.id); });
-
-    item.appendChild(idx);
-    item.appendChild(name);
-    item.appendChild(exp);
-    item.appendChild(del);
-
-    // Switch on click
-    item.addEventListener("click", () => switchToLayer(layer.id));
-
-    // Drag to reorder — mouse-event based because WebView2 (Tauri/Windows) intercepts
-    // the HTML5 dragover event at the OS level for file-drop, so drag/drop never fires.
-    item.addEventListener("mousedown", (e) => {
-      if (e.target.closest(".sl-del")) return;
-      e.preventDefault();
-
-      dragSrcId = layer.id;
-      item.classList.add("dragging");
-
-      const rect = item.getBoundingClientRect();
-      const offsetY = e.clientY - rect.top;
-
-      const ghost = item.cloneNode(true);
-      Object.assign(ghost.style, {
-        position: "fixed", pointerEvents: "none", zIndex: "9999",
-        opacity: "0.85", width: rect.width + "px",
-        left: rect.left + "px", top: (e.clientY - offsetY) + "px",
-        margin: "0", borderRadius: "8px",
-        background: "rgba(255,180,84,0.15)",
-        boxShadow: "0 4px 16px rgba(0,0,0,0.4)",
-      });
-      document.body.appendChild(ghost);
-
-      const onMove = (me) => {
-        ghost.style.top = (me.clientY - offsetY) + "px";
-        ghost.style.visibility = "hidden";
-        const target = document.elementFromPoint(me.clientX, me.clientY)?.closest("[data-layer-id]");
-        ghost.style.visibility = "";
-        list.querySelectorAll(".drag-over").forEach(el => el.classList.remove("drag-over"));
-        if (target && target.dataset.layerId !== layer.id) target.classList.add("drag-over");
-      };
-
-      const onUp = (ue) => {
-        document.removeEventListener("mousemove", onMove);
-        document.removeEventListener("mouseup", onUp);
-        ghost.remove();
-        item.classList.remove("dragging");
-        list.querySelectorAll(".drag-over").forEach(el => el.classList.remove("drag-over"));
-
-        const target = document.elementFromPoint(ue.clientX, ue.clientY)?.closest("[data-layer-id]");
-        if (target && target.dataset.layerId !== layer.id) {
-          reorderLayers(layer.id, target.dataset.layerId);
-          renderSavedLayers();
-        }
-
-        dragSrcId = null;
-        setTimeout(() => {
-          if (dragSrcId || document.getElementById("sl-wrap").matches(":hover")) return;
-          closeDropdown();
-        }, 0);
-      };
-
-      document.addEventListener("mousemove", onMove);
-      document.addEventListener("mouseup", onUp);
-    });
-
-    list.appendChild(item);
-  }
-}
-
 function openKeyLedPill()  { document.getElementById("key-pills").classList.add("visible"); }
 function closeKeyLedPill() {
   document.getElementById("key-pills").classList.remove("visible");
@@ -3098,6 +2982,17 @@ function openScreenPicker() {
   const existing = new Set(oledCustomScreens.map(s => s.type));
 
   const TYPES = [
+    // A layer IS a screen in this model — the OLED list is layers followed by
+    // custom screens — so adding one belongs here rather than behind a separate
+    // "+" button. Always offered: unlike the custom types there is no limit of
+    // one, and it is not filtered by `existing` below.
+    {
+      type: "layer", label: "Layer", desc: "A new keymap + LED profile",
+      preview: `<div style="color:#ffb454;font-family:monospace;text-align:center">
+        <div style="font-size:7px;font-weight:bold;letter-spacing:.08em">LAYER 02</div>
+        <div style="font-size:6px;opacity:.35;margin-top:3px">blank keymap</div>
+        <div style="font-size:6px;opacity:.25">white LEDs</div></div>`,
+    },
     {
       type: "timer", label: "Timer", desc: "Stopwatch",
       preview: `<div style="color:#ffb454;font-family:monospace;text-align:center">
@@ -3197,17 +3092,37 @@ function openScreenPicker() {
 
   addBtn.addEventListener("click", () => {
     let i = 0;
+    let newLayerId = null;
     for (const type of selected) {
+      // A layer is not a custom screen — it is a whole profile, and its screen
+      // is derived from the saved-layer list rather than stored alongside the
+      // others. Creating it has to go through the same path the old "+" used.
+      if (type === "layer") {
+        const name = `Layer ${String(getSavedLayers().length + 1).padStart(2, "0")}`;
+        switchToBlankLayer();
+        saveCurrentAsLayer(name);
+        newLayerId = activeProfileId;
+        continue;
+      }
       const s = { id: `${Date.now()}-${i++}`, type };
       if (type === "custom") { s.title = ""; s.body = ""; s.imageDataUrl = null; }
       if (type === "gif")    { s.imageDataUrl = null; }
       oledCustomScreens.push(s);
     }
     saveOledCustomScreens();
-    oledScreenIdx = getOledScreens().length - 1;
     close();
-    updateOledDisplay();
-    renderOledPill();
+    // Land on what was just created. A new layer wins if both were added, since
+    // that is the one with a name waiting to be typed.
+    if (newLayerId) {
+      goToLayerScreen(newLayerId);
+      renderLayerBar();
+      document.getElementById("layer-name")?.select();
+    } else {
+      oledScreenIdx = getOledScreens().length - 1;
+      updateOledDisplay();
+      renderLayerBar();
+      renderOledPill();
+    }
   });
 
   document.body.appendChild(overlay);
@@ -3332,10 +3247,33 @@ function buildAnimState() {
   return { name: klAnimation, speed: klRate, color: hexToRgbArr(tint) };
 }
 
+// The underglow's own animation. No colour: the firmware reuses the corner
+// colours SET_LEDS already pushed, and rainbow generates its own spectrum —
+// exactly like the app preview does.
+// Cycle Colors, per target. The board ignores it while the target's animation
+// is Solid or Rainbow, matching `noCycle` in ANIMATIONS — so the app does not
+// need to filter here, and the two cannot disagree about when it is live.
+function buildKeyPalette() {
+  return { colors: klPalette.map(hexToRgbArr), rate: klRate };
+}
+function buildUgPalette() {
+  return { colors: ugPalette.map(hexToRgbArr), rate: ugRate };
+}
+
+function buildUgAnimState() {
+  return { name: ugAnimation, speed: ugRate, intensity: ugIntensity };
+}
+
+// The app lays the corners out reading-order (TL, TR, BL, BR) because that is
+// how they sit on screen; the firmware's LED slots 21..24 run around the board
+// (TL, TR, BR, BL). Indices 2 and 3 therefore swap on the way out — without
+// this the bottom two corners are crossed on the hardware.
+const UG_APP_TO_WIRE = [0, 1, 3, 2];
+
 function buildLedState() {
   return {
     keys: keyLedColors.map(hexToRgbArr),
-    underglow: cornerColors.slice(0, 4).map(hexToRgbArr),
+    underglow: UG_APP_TO_WIRE.map(i => hexToRgbArr(cornerColors[i])),
     brightness: ledBrightness,
   };
 }
@@ -3406,6 +3344,55 @@ function confirmModal({ title, body, confirmLabel = "Confirm" }) {
   });
 }
 
+// Same dialog as confirmModal, with a text field. Adding this rather than
+// leaving createLibrary() on window.prompt(): a native prompt is unstyled,
+// looks nothing like the macro editor beside it, and blocks the webview.
+// Resolves null on cancel, the trimmed string otherwise.
+function promptModal({ title, label, value = "", placeholder = "", confirmLabel = "Create" }) {
+  const el = document.getElementById("confirm-dialog");
+  if (!el) return Promise.resolve(null);
+
+  document.getElementById("confirm-title").textContent = title;
+  const body = document.getElementById("confirm-body");
+  body.innerHTML = `
+    <label class="prompt-field">
+      <span class="pill-label">${escapeHtml(label)}</span>
+      <input type="text" id="confirm-input" class="macro-name-inp"
+             placeholder="${escapeHtml(placeholder)}" maxlength="40" />
+    </label>`;
+  const inp = document.getElementById("confirm-input");
+  inp.value = value;
+
+  const ok = document.getElementById("confirm-ok");
+  ok.textContent = confirmLabel;
+
+  return new Promise((resolve) => {
+    const cancel = document.getElementById("confirm-cancel");
+    const finish = (answer) => {
+      el.classList.remove("open");
+      body.innerHTML = "";
+      cancel.removeEventListener("click", onCancel);
+      ok.removeEventListener("click", onOk);
+      el.removeEventListener("click", onBackdrop);
+      document.removeEventListener("keydown", onKey);
+      resolve(answer);
+    };
+    const onCancel   = () => finish(null);
+    const onOk       = () => finish(inp.value.trim() || null);
+    const onBackdrop = (e) => { if (e.target === el) finish(null); };
+    const onKey      = (e) => {
+      if (e.key === "Escape") finish(null);
+      if (e.key === "Enter" && document.activeElement === inp) onOk();
+    };
+    cancel.addEventListener("click", onCancel);
+    ok.addEventListener("click", onOk);
+    el.addEventListener("click", onBackdrop);
+    document.addEventListener("keydown", onKey);
+    el.classList.add("open");
+    inp.focus();
+  });
+}
+
 function confirmDarkSave() {
   const tail = ledBrightness === 0
     ? "Raise the brightness, or pick an animation, or save anyway."
@@ -3447,10 +3434,9 @@ function buildOledConfig() {
     sleep_mask: buildSleepMask(),
     sleep_timeout_s: OLED_SLEEP_TIMEOUT_S,
     pomodoro: {
-      work_min:        oledPomo.workMin,
-      short_break_min: oledPomo.shortBreakMin,
-      long_break_min:  oledPomo.longBreakMin,
-      long_every:      oledPomo.longEvery,
+      work_min:  oledPomo.workMin,
+      pause_min: oledPomo.pauseMin,
+      cycles:    oledPomo.cycles,
     },
   };
 }
@@ -3529,6 +3515,9 @@ async function pushStateToBoard() {
   // the board shows those colours (solid) or runs its own effect, so sending it
   // last means the mode always wins.
   await invoke("set_anim", { anim: buildAnimState() });
+  await invoke("set_ug_anim", { ug: buildUgAnimState() });
+  await invoke("set_palette", { target: 0, palette: buildKeyPalette() });
+  await invoke("set_palette", { target: 1, palette: buildUgPalette() });
   try { notePomodoroSupport(await invoke("oled_push", { config: buildOledConfig() })); }
   catch (e) { console.warn("oled_push failed", e); }
   // Force: a full push follows a reconnect or a Save, where the board's buffer
@@ -3576,7 +3565,12 @@ async function runLiveSync() {
     if (parts.has("keymap") && keymap) await invoke("set_keymap", { map: keymap });
     if (parts.has("leds")) await invoke("set_leds", { leds: buildLedState() });
     // After leds, for the same reason pushStateToBoard sends it last.
-    if (parts.has("anim")) await invoke("set_anim", { anim: buildAnimState() });
+    if (parts.has("anim")) {
+      await invoke("set_anim", { anim: buildAnimState() });
+      await invoke("set_ug_anim", { ug: buildUgAnimState() });
+      await invoke("set_palette", { target: 0, palette: buildKeyPalette() });
+      await invoke("set_palette", { target: 1, palette: buildUgPalette() });
+    }
     if (parts.has("oled")) {
       notePomodoroSupport(await invoke("oled_push", { config: buildOledConfig() }));
       // Not forced: skips the multi-second transfer unless the image changed.
@@ -3655,6 +3649,10 @@ function renderDeviceList() {
           <span>${TRANSPORT_ICON[d.transport] ?? "🔌"}</span>
           <span>${(d.transport || "usb").toUpperCase()}</span>
         </div>
+        <button class="device-io" data-io="export" title="Export this device's layers to a file">↓</button>
+        <label class="device-io" title="Import layers into this device">↑
+          <input type="file" class="device-import" accept=".json,application/json" style="display:none" />
+        </label>
         <button class="device-reset" title="Reset this device to defaults">Reset</button>
         <button class="device-del" title="Remove this device from the list">✕</button>
       </div>`;
@@ -3667,6 +3665,20 @@ function renderDeviceList() {
     card.querySelector(".device-reset").addEventListener("click", (e) => {
       e.stopPropagation();
       resetDevice(d);
+    });
+    // Layer export/import are per-device: they move whole sets of layers
+    // between boards, which is a device-level action rather than one that
+    // belongs beside a single layer's name.
+    card.querySelector('[data-io="export"]').addEventListener("click", (e) => {
+      e.stopPropagation();
+      exportDeviceLayers(d);
+    });
+    const imp = card.querySelector(".device-import");
+    imp.addEventListener("click", (e) => e.stopPropagation());
+    imp.addEventListener("change", (e) => {
+      const f = e.target.files?.[0];
+      if (f) importDeviceLayers(d, f);
+      e.target.value = "";
     });
     list.appendChild(card);
   }
@@ -3726,7 +3738,7 @@ async function resetDevice(device) {
   activeProfileId = seed.id;
 
   if (activeDevice && deviceKey(activeDevice) === scope) {
-    renderSavedLayers();
+    renderLayerBar();
     renderOledPill();
     renderBoard();
   }
@@ -3754,15 +3766,17 @@ async function pushDefaultsToBoard() {
     // After the colours, for the same reason pushStateToBoard sends it last:
     // the animation decides whether those colours are what the board shows.
     await invoke("set_anim", { anim: { name: "solid", speed: 128, color: [255, 180, 84] } });
+    await invoke("set_ug_anim", { ug: { name: "solid", speed: 128, intensity: 180 } });
+    await invoke("set_palette", { target: 0, palette: { colors: [], rate: 128 } });
+    await invoke("set_palette", { target: 1, palette: { colors: [], rate: 128 } });
     await invoke("oled_push", {
       config: {
         layers: [], screens: [], countdown: [0, 0, 0],
         sleep_mask: 0, sleep_timeout_s: OLED_SLEEP_TIMEOUT_S,
         pomodoro: {
-          work_min:        POMO_DEFAULTS.workMin,
-          short_break_min: POMO_DEFAULTS.shortBreakMin,
-          long_break_min:  POMO_DEFAULTS.longBreakMin,
-          long_every:      POMO_DEFAULTS.longEvery,
+          work_min:  POMO_DEFAULTS.workMin,
+          pause_min: POMO_DEFAULTS.pauseMin,
+          cycles:    POMO_DEFAULTS.cycles,
         },
       },
     });
@@ -3855,7 +3869,7 @@ function clearScanNotice() {
 // into the list as if it were a real device.
 const DEMO_DEVICE = {
   product_id: 0x01,
-  product_name: "Macro Pad Pro (demo)",
+  product_name: "Lunar x MacroPad (demo)",
   hardware: "1.0.0",
   firmware: "0.2.0",
   transport: "usb",
@@ -3925,7 +3939,6 @@ function resetInMemoryState() {
   oledCustomScreens = [];
   oledEventKeys     = {};
   oledSleepScreens  = {};
-  oledBackKeyIdx    = null;
   oledPomo          = { ...POMO_DEFAULTS };
   oledScreenIdx     = 0;
   oledSubMode       = "nav";
@@ -3956,7 +3969,7 @@ function enterEditor(device) {
   renderBrightness();
   const brightInp = document.getElementById("led-brightness");
   if (brightInp) brightInp.value = String(ledBrightness);
-  renderSavedLayers();
+  renderLayerBar();
   renderOledPill();
   renderBoard();
   // Bindings live in backend memory, not on disk — re-push this device's on
@@ -4217,7 +4230,6 @@ function snapshotDeviceState() {
       countdown:     { h: oledCdH, m: oledCdM, s: oledCdS },
       pomodoro:      { ...oledPomo },
       sleepScreens:  { ...oledSleepScreens },
-      backKeyIdx:    oledBackKeyIdx,
       eventKeys:     oledEventKeys,
     },
   };
@@ -4277,18 +4289,19 @@ function loadDeviceState() {
       const p = s.oled.pomodoro;
       const min = (v, d, lo, hi) =>
         Number.isFinite(v) ? Math.max(lo, Math.min(hi, v)) : d;
+      // Older blobs carry shortBreakMin/longBreakMin/longEvery. pauseMin falls
+      // back to the old short break, which is what it replaced; the long break
+      // has no successor and is simply dropped.
       oledPomo = {
-        workMin:       min(p.workMin,       POMO_DEFAULTS.workMin,       POMO_MIN_MINUTES, POMO_MAX_MINUTES),
-        shortBreakMin: min(p.shortBreakMin, POMO_DEFAULTS.shortBreakMin, POMO_MIN_MINUTES, POMO_MAX_MINUTES),
-        longBreakMin:  min(p.longBreakMin,  POMO_DEFAULTS.longBreakMin,  POMO_MIN_MINUTES, POMO_MAX_MINUTES),
-        longEvery:     min(p.longEvery,     POMO_DEFAULTS.longEvery,     POMO_MIN_EVERY,   POMO_MAX_EVERY),
+        workMin:  min(p.workMin,  POMO_DEFAULTS.workMin,  POMO_MIN_MINUTES, POMO_MAX_MINUTES),
+        pauseMin: min(p.pauseMin ?? p.shortBreakMin, POMO_DEFAULTS.pauseMin, POMO_MIN_MINUTES, POMO_MAX_MINUTES),
+        cycles:   min(p.cycles   ?? p.longEvery,     POMO_DEFAULTS.cycles,   POMO_MIN_CYCLES,  POMO_MAX_CYCLES),
       };
     } else {
       oledPomo = { ...POMO_DEFAULTS };
     }
     oledSleepScreens = (s.oled.sleepScreens && typeof s.oled.sleepScreens === "object")
       ? { ...s.oled.sleepScreens } : {};
-    if (s.oled.backKeyIdx !== undefined) oledBackKeyIdx = s.oled.backKeyIdx;
     if (s.oled.eventKeys)                oledEventKeys  = s.oled.eventKeys;
   }
   return true;
@@ -4558,11 +4571,17 @@ function renderLibraryTiles() {
   }
 }
 
-function createLibrary() {
-  const name = prompt("Library name:", "New Library");
+async function createLibrary() {
+  const name = await promptModal({
+    title: "New library",
+    label: "Library name",
+    value: "",
+    placeholder: "e.g. Git shortcuts",
+    confirmLabel: "Create library",
+  });
   if (name === null) return;
   const libs = getLibraries();
-  const lib = { id: `lib${Date.now()}`, name: name.trim() || "New Library", description: "", macros: [] };
+  const lib = { id: `lib${Date.now()}`, name, description: "", macros: [] };
   libs.push(lib);
   saveLibraries(libs);
   // Drop straight into it — creating a library is always followed by filling it.

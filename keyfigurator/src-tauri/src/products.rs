@@ -3,7 +3,7 @@
 //! Identity is three independent layers, and they matter separately:
 //!
 //! ```text
-//!   Product   0x01  "Macro Pad Pro"   ← which product line
+//!   Product   0x01  "Lunar x MacroPad"   ← which product line
 //!     └─ Hardware  1.0.0              ← which PCB revision
 //!          └─ Firmware  0.2.0         ← which build is running
 //! ```
@@ -72,7 +72,7 @@ pub struct ProductSpec {
 /// exists and shipped, so it is a fact table, not configuration.
 pub const PRODUCTS: &[ProductSpec] = &[ProductSpec {
     product_id: 0x01,
-    name: "Macro Pad Pro",
+    name: "Lunar x MacroPad",
     hardware: Version::new(1, 0, 0),
     capabilities: Capabilities {
         // Rev 1.0.0: encoder push is not present on this board.
@@ -114,7 +114,7 @@ mod tests {
     #[test]
     fn the_tested_board_is_in_the_table() {
         let spec = lookup(0x01, Version::new(1, 0, 0)).expect("product 0x01 hw 1.0.0");
-        assert_eq!(spec.name, "Macro Pad Pro");
+        assert_eq!(spec.name, "Lunar x MacroPad");
         assert_eq!(spec.capabilities.key_count, 21);
     }
 

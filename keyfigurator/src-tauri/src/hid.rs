@@ -17,7 +17,7 @@
 //!   moment it is plugged in.
 
 use crate::kf_protocol::{self as kf, BoardModel, REPORT_LEN};
-use crate::model::{AnimState, KeyMap, Layer, LedState, OledConfig, PomodoroConfig};
+use crate::model::{AnimState, KeyMap, Layer, LedState, OledConfig, Palette, PomodoroConfig, UnderglowAnim};
 use crate::products::Version;
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -219,6 +219,36 @@ pub trait HidTransport: Send + Sync {
     }
 
     /// Push the full OLED config (RAM-only on the board, so re-push on reconnect).
+    /// Push a "Cycle Colors" palette for one target (keys or underglow).
+    ///
+    /// Length first, then the colours: the board reads length as "how many of
+    /// these are live", so raising it before the data is written would show
+    /// stale entries for a frame.
+    fn set_palette(&mut self, target: u8, pal: &Palette) -> Result<(), HidError> {
+        let n = pal.colors.len().min(kf::PALETTE_MAX);
+        let resp = self.transceive(&kf::set_palette_len_frame(target, n as u8, pal.rate))?;
+        expect_ok(&resp)?;
+        for f in kf::set_palette_frames(target, &pal.colors[..n]) {
+            let resp = self.transceive(&f)?;
+            expect_ok(&resp)?;
+        }
+        Ok(())
+    }
+
+    /// Push the underglow's own animation.
+    ///
+    /// Separate command because the board renders those four LEDs itself: QMK
+    /// has one effect for the whole matrix, so `set_anim` could never give the
+    /// underglow something different from the keys.
+    fn set_ug_anim(&mut self, ug: &UnderglowAnim) -> Result<(), HidError> {
+        let resp = self.transceive(&kf::set_ug_anim_frame(
+            kf::anim_id(&ug.name),
+            ug.speed,
+            ug.intensity,
+        ))?;
+        expect_ok(&resp)
+    }
+
     /// Push the whole OLED config.
     ///
     /// Returns whether the board accepted the pomodoro durations. `false` means
@@ -230,6 +260,12 @@ pub trait HidTransport: Send + Sync {
             let resp = self.transceive(&kf::oled_set_layer_frame(li as u8, l.show_title, &l.name))?;
             expect_ok(&resp)?;
         }
+        // Tell the board how many layer screens to show BEFORE the screen list,
+        // so navigation is never briefly sized against the old count. Failure is
+        // not fatal — older firmware simply keeps showing four.
+        let n = cfg.layers.len().clamp(1, kf::LAYER_COUNT) as u8;
+        let _ = self.transceive(&kf::oled_set_layer_count_frame(n))?;
+
         let types: Vec<u8> = cfg
             .screens
             .iter()
@@ -678,6 +714,61 @@ mod tests {
         assert!(!hid.board.oled_img_ready);
     }
 
+    /// Walk the whole Save-to-Board sequence against a physically attached
+    /// board, reporting which step fails rather than just that one did.
+    ///
+    ///   cargo test real_board_save -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn real_board_save() {
+        let (host_cmd_tx, _rx) = channel::<u8>();
+        let (conn_tx, _c) = channel::<bool>();
+        let mut real = RealHid::start(host_cmd_tx, conn_tx);
+        let mut waited = 0;
+        while !real.is_connected() && waited < 6000 {
+            std::thread::sleep(Duration::from_millis(100));
+            waited += 100;
+        }
+        if !real.is_connected() {
+            println!("NO BOARD ATTACHED — skipping");
+            return;
+        }
+        println!("identity: {:?}", real.identity());
+        println!("ping:     {:?}", real.ping());
+
+        let mut map = KeyMap::default_21key();
+        map.layers[0].keys[0] = "KC_A".into();
+        println!("set_keymap:  {:?}", real.set_keymap(&map));
+
+        let leds = LedState {
+            keys: vec![[255, 0, 0]; kf::KEY_COUNT],
+            underglow: vec![[0, 255, 0]; kf::UNDERGLOW_COUNT],
+            brightness: 255,
+        };
+        println!("set_leds:    {:?}", real.set_leds(&leds));
+        println!("set_anim:    {:?}", real.set_anim(&AnimState::default()));
+        println!("set_ug_anim: {:?}", real.set_ug_anim(&UnderglowAnim::default()));
+
+        let cfg = OledConfig {
+            layers: vec![crate::model::OledLayer { name: "PROBE".into(), show_title: true }],
+            screens: vec![crate::model::OledScreen {
+                kind: "pomodoro".into(), title: String::new(), body: String::new(),
+            }],
+            countdown: (0, 0, 0),
+            pomodoro: PomodoroConfig::default(),
+            sleep_mask: 0,
+            sleep_timeout_s: 60,
+        };
+        println!("push_oled:   {:?}", real.push_oled(&cfg));
+        println!("eeprom:      {:?}", real.eeprom_commit());
+
+        // Read the keymap back: the only way to know SET actually landed.
+        match real.get_keymap() {
+            Ok(m) => println!("readback layer0[0] = {:?} (expected KC_A)", m.layers[0].keys[0]),
+            Err(e) => println!("get_keymap FAILED: {e}"),
+        }
+    }
+
     /// Probe a physically attached board and print what PING returns.
     ///
     /// `#[ignore]` because it needs real hardware. Run with:
@@ -735,7 +826,7 @@ mod tests {
         let id = hid.identity().unwrap();
 
         assert_eq!(id.product_id, 0x01);
-        assert_eq!(id.product_name, "Macro Pad Pro");
+        assert_eq!(id.product_name, "Lunar x MacroPad");
         assert_eq!(id.hardware.to_string(), "1.0.0");
         assert_eq!(id.firmware.to_string(), "0.2.0");
 
@@ -938,6 +1029,62 @@ mod tests {
             !hid.push_pomodoro(&cfg.pomodoro).unwrap(),
             "and the UI is told the board does not support it"
         );
+    }
+
+    /// Cycle Colors has to survive the chunk boundary: 20 colours is three
+    /// frames, and an off-by-one in the offset would corrupt entries 9 and 18
+    /// while the first eight looked perfect.
+    #[test]
+    fn palette_round_trips_across_chunk_boundaries() {
+        let mut hid = MockHid::new();
+        assert_eq!(hid.board.palettes[0].len, 0, "no cycling until asked");
+
+        let colors: Vec<crate::model::Rgb> =
+            (0..kf::PALETTE_MAX).map(|i| [i as u8, 255 - i as u8, 7]).collect();
+        hid.set_palette(kf::PALETTE_TARGET_KEYS, &Palette { colors: colors.clone(), rate: 200 })
+            .unwrap();
+
+        let p = &hid.board.palettes[kf::PALETTE_TARGET_KEYS as usize];
+        assert_eq!(p.len as usize, kf::PALETTE_MAX);
+        assert_eq!(p.rate, 200);
+        for (i, want) in colors.iter().enumerate() {
+            assert_eq!(&p.rgb[i], want, "entry {i} survived chunking");
+        }
+    }
+
+    /// The two targets are independent — the underglow's list must not land on
+    /// top of the keys'.
+    #[test]
+    fn palette_targets_do_not_collide() {
+        let mut hid = MockHid::new();
+        hid.set_palette(kf::PALETTE_TARGET_KEYS, &Palette { colors: vec![[1, 2, 3]], rate: 10 })
+            .unwrap();
+        hid.set_palette(
+            kf::PALETTE_TARGET_UNDERGLOW,
+            &Palette { colors: vec![[9, 8, 7], [6, 5, 4]], rate: 20 },
+        )
+        .unwrap();
+
+        assert_eq!(hid.board.palettes[0].len, 1);
+        assert_eq!(hid.board.palettes[0].rgb[0], [1, 2, 3]);
+        assert_eq!(hid.board.palettes[0].rate, 10);
+        assert_eq!(hid.board.palettes[1].len, 2);
+        assert_eq!(hid.board.palettes[1].rgb[1], [6, 5, 4]);
+        assert_eq!(hid.board.palettes[1].rate, 20);
+    }
+
+    /// An empty palette is how the app says "stop cycling", so it must clear
+    /// the length rather than being ignored as a no-op.
+    #[test]
+    fn empty_palette_clears_cycling() {
+        let mut hid = MockHid::new();
+        hid.set_palette(kf::PALETTE_TARGET_KEYS, &Palette { colors: vec![[1, 2, 3]], rate: 10 })
+            .unwrap();
+        assert_eq!(hid.board.palettes[0].len, 1);
+
+        hid.set_palette(kf::PALETTE_TARGET_KEYS, &Palette { colors: vec![], rate: 10 })
+            .unwrap();
+        assert_eq!(hid.board.palettes[0].len, 0);
     }
 
     /// Sleep is opt-in per screen, so an unconfigured board must never blank
