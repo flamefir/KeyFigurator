@@ -241,6 +241,24 @@ const KC_CATEGORIES = [
 ];
 const KC_ALL_FLAT = KC_CATEGORIES.flatMap(c => c.keys);
 
+// RATE is a SPEED: 0 = slowest, 255 = fastest. That is what the wire carries and
+// what QMK's rgb_matrix speed means, so the preview has to agree.
+//
+// The preview needs a DURATION, which is the inverse of speed — a high rate must
+// produce a SHORT cycle. The original formula had it the right way round for
+// duration but the wrong way round for the label, so the app previewed fast
+// while the board ran slow at the same slider value.
+//
+// One helper rather than the four copies of this expression that let the two
+// sides drift apart in the first place.
+const ANIM_MIN_DUR = 0.3; // seconds, at rate 255
+const ANIM_MAX_DUR = 8.0; // seconds, at rate 0
+
+function rateToDuration(rate) {
+  const r = Math.min(255, Math.max(0, Number(rate) || 0));
+  return ANIM_MIN_DUR + ((255 - r) / 255) * (ANIM_MAX_DUR - ANIM_MIN_DUR);
+}
+
 // noCycle: disables Cycle Colors palette when active
 // keyOnly: excluded from underglow chip list (selection-order anim)
 const ANIMATIONS = [
@@ -484,10 +502,19 @@ function triggerOledEvent(eventName) {
       if (oledSubMode === "keycycle") {
         oledSubMode = "nav"; oledKeyCycleIdx = 0;
       } else {
+        // Present Keys only renders on a layer screen, so we have to be ON one.
+        // Prefer the active profile's screen, but fall back to any layer screen:
+        // requiring activeProfileId meant that with no saved layer the mode was
+        // entered and then rendered nothing, looking like a dead key.
         const pscreens = getOledScreens();
         if (pscreens[oledScreenIdx]?.type !== "layer") {
-          const layerScrIdx = pscreens.findIndex(s => s.type === "layer" && s.layerId === activeProfileId);
-          if (layerScrIdx !== -1) oledScreenIdx = layerScrIdx;
+          let layerScrIdx = pscreens.findIndex(s => s.type === "layer" && s.layerId === activeProfileId);
+          if (layerScrIdx === -1) layerScrIdx = pscreens.findIndex(s => s.type === "layer");
+          if (layerScrIdx === -1) {
+            console.warn("Present Keys needs a layer screen; none exists (no saved layers yet)");
+            break;
+          }
+          oledScreenIdx = layerScrIdx;
         }
         oledSubMode = "keycycle"; oledKeyCycleIdx = 0;
       }
@@ -1139,7 +1166,7 @@ function updateKlColorVars() {
   document.documentElement.style.setProperty("--kl-color", hexToRgbTriple(hex));
   const cycleHex = klPalette.length > 0 ? klPalette[0] : hex;
   document.documentElement.style.setProperty("--kl-cycle-color", hexToRgbTriple(cycleHex));
-  const dur = (0.3 + (klRate / 255) * 7.7).toFixed(2);
+  const dur = rateToDuration(klRate).toFixed(2);
   document.documentElement.style.setProperty("--kl-anim-dur", dur + "s");
 }
 
@@ -1376,7 +1403,7 @@ function applyCornerGlow(tl, tr, bl, br) {
 }
 
 function computeCornerStates(elapsed) {
-  const duration = 0.3 + (ugRate / 255) * 7.7;
+  const duration = rateToDuration(ugRate);
   const t        = (elapsed % duration) / duration;
   const maxOp    = 0.15 + (ugIntensity / 255) * 0.85;
   // Palette: time-based — all corners advance through colors together each cycle
@@ -1486,7 +1513,7 @@ function computeKeyLedColor(idx, row, col, elapsed, isSel) {
   // actually render, since QMK has a single board-wide effect.
   const animation = klAnimation, rate = klRate, intensity = klIntensity, palette = klPalette;
 
-  const duration = 0.3 + (rate / 255) * 7.7;
+  const duration = rateToDuration(rate);
   const t        = (elapsed % duration) / duration;
   const maxOp    = 0.15 + (intensity / 255) * 0.85;
   const ownColor = keyLedColors[idx] || "#ffffff";
@@ -1576,7 +1603,7 @@ function klAnimTick(now) {
 
   // Step the cycle-preview chip through the palette at the current rate
   if (klPalette.length > 1) {
-    const dur = 0.3 + (klRate / 255) * 7.7;
+    const dur = rateToDuration(klRate);
     const pi  = Math.floor(elapsed / dur) % klPalette.length;
     document.documentElement.style.setProperty("--kl-cycle-color", hexToRgbTriple(klPalette[pi]));
   }
@@ -2373,20 +2400,15 @@ function onKeyDown(idx) {
     return;
   }
 
-  // Event key: trigger the bound OLED event for the current screen
-  const sk        = currentOledScreenKey();
+  // A key can also be bound to an OLED event, or be the back key. Both used to
+  // `return` here, which meant such a key could never be SELECTED — and so
+  // never configured: no keycode, LED, icon or macro. Having a role must not
+  // cost the key its settings, so the OLED behaviour is noted and fired at the
+  // end, after the normal selection has happened.
+  const sk          = currentOledScreenKey();
   const screenEvMap = sk ? (oledEventKeys[sk] || {}) : {};
-  const eventHit  = Object.entries(screenEvMap).find(([, v]) => evIdx(v) === idx);
-  if (eventHit) { triggerOledEvent(eventHit[0]); return; }
-
-  // Back key pressed while in OLED sub-mode — exit to nav without touching LED selection.
-  if (oledBackKeyIdx === idx && oledSubMode !== "nav") {
-    oledSubMode = "nav";
-    oledKeyCycleIdx = 0;
-    updateOledDisplay();
-    renderBoard();
-    return;
-  }
+  const eventHit    = Object.entries(screenEvMap).find(([, v]) => evIdx(v) === idx);
+  const isBackExit  = oledBackKeyIdx === idx && oledSubMode !== "nav";
 
   hideKeyTooltip();
   lastKeyClickTime = performance.now();
@@ -2411,6 +2433,21 @@ function onKeyDown(idx) {
   syncKeyLedPill();
   openKeyLedPill();
   flashKey(idx);
+
+  // Fire the OLED role AFTER selecting, so the key is configurable either way.
+  // Back-key exit wins over an event binding: leaving a sub-mode is the more
+  // specific intent when a key happens to be both.
+  if (isBackExit) {
+    oledSubMode = "nav";
+    oledKeyCycleIdx = 0;
+    updateOledDisplay();
+    renderBoard();
+    // renderBoard() rebuilt the DOM, so re-apply the selection highlight.
+    document.getElementById("key-" + idx)?.classList.add("sel");
+  } else if (eventHit) {
+    triggerOledEvent(eventHit[0]);
+    document.getElementById("key-" + idx)?.classList.add("sel");
+  }
 }
 
 function onKeyEnter(idx) {
