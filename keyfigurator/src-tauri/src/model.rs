@@ -79,6 +79,72 @@ pub struct LedState {
 /// Number of underglow corners — matches `kf_protocol::UNDERGLOW_COUNT`.
 pub const UNDERGLOW_COUNT: usize = 4;
 
+/// The board's global LED animation.
+///
+/// Deliberately NOT per-key. QMK's RGB matrix runs one effect for the whole
+/// board, so animation is global and only *colour* is per-key. The app's editor
+/// mirrors that shape so its preview cannot promise something the board will
+/// not reproduce.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AnimState {
+    /// One of: solid, rainbow, snake, breathe, wave, reactive, sparkle.
+    /// Mapped to a stable wire id by `kf_protocol::anim_id`.
+    pub name: String,
+    /// QMK rgb matrix animation speed, 0-255.
+    pub speed: u8,
+    /// Base colour the effect is tinted with. Converted to QMK's HSV on the way
+    /// out, since `rgb_matrix_sethsv_noeeprom` takes HSV.
+    pub color: Rgb,
+}
+
+impl Default for AnimState {
+    fn default() -> Self {
+        Self {
+            name: "solid".to_string(),
+            speed: 128,
+            color: [255, 180, 84], // brand amber #ffb454
+        }
+    }
+}
+
+impl AnimState {
+    pub fn hsv(&self) -> (u8, u8, u8) {
+        rgb_to_hsv(self.color)
+    }
+}
+
+/// RGB → QMK's HSV space, in which hue is 0-255 rather than 0-360 degrees.
+///
+/// Integer-only, via a 0..1530 (6 × 255) sixths-of-the-wheel intermediate, so
+/// the pure primaries land exactly on QMK's expected 0 / 85 / 170.
+pub fn rgb_to_hsv(rgb: Rgb) -> (u8, u8, u8) {
+    let [r, g, b] = rgb;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let v = max;
+    if max == 0 {
+        return (0, 0, 0); // black: hue and saturation are meaningless
+    }
+    let delta = max - min;
+    let s = ((delta as u16 * 255) / max as u16) as u8;
+    if delta == 0 {
+        return (0, 0, v); // greys: no hue
+    }
+
+    let (rf, gf, bf, d) = (r as i32, g as i32, b as i32, delta as i32);
+    let h1530 = if max == r {
+        (((gf - bf) * 255) / d + 1530) % 1530
+    } else if max == g {
+        ((bf - rf) * 255) / d + 510
+    } else {
+        ((rf - gf) * 255) / d + 1020
+    };
+    // Round rather than truncate, so #ffb454 gives hue 24 (matching
+    // RGB_MATRIX_DEFAULT_HUE) instead of 23.
+    let h = ((h1530 * 255 + 765) / 1530) as u8;
+    (h, s, v)
+}
+
 impl LedState {
     pub fn all_off(key_count: usize) -> Self {
         Self {
@@ -140,7 +206,14 @@ pub struct HostBinding {
     pub index: u8,
     pub label: String,
     /// The program + args to run, e.g. ["git", "commit", "-am", "wip"].
+    /// Ignored when `script` is set.
+    #[serde(default)]
     pub command: Vec<String>,
+    /// A shell script authored in the macro library. Takes precedence over
+    /// `command`, and runs through a shell rather than being spawned directly —
+    /// a script needs pipes, redirects and multiple lines to mean anything.
+    #[serde(default)]
+    pub script: Option<String>,
     /// Working directory to run it in (so git knows which repo).
     pub cwd: Option<String>,
 }
@@ -156,6 +229,31 @@ mod tests {
         for l in &m.layers {
             assert_eq!(l.keys.len(), KEY_COUNT);
         }
+    }
+
+    /// QMK's hue axis is 0-255, not degrees, and the firmware's own defaults
+    /// were derived from #ffb454 — so the conversion has to land on exactly
+    /// those numbers or every animation ships the wrong tint.
+    #[test]
+    fn rgb_to_hsv_matches_qmk_hue_space() {
+        assert_eq!(rgb_to_hsv([255, 0, 0]), (0, 255, 255)); // red
+        assert_eq!(rgb_to_hsv([0, 255, 0]), (85, 255, 255)); // green
+        assert_eq!(rgb_to_hsv([0, 0, 255]), (170, 255, 255)); // blue
+        assert_eq!(rgb_to_hsv([255, 255, 255]), (0, 0, 255)); // white: no hue
+        assert_eq!(rgb_to_hsv([0, 0, 0]), (0, 0, 0)); // black
+        assert_eq!(rgb_to_hsv([128, 128, 128]), (0, 0, 128)); // grey
+
+        // Brand amber #ffb454 must reproduce RGB_MATRIX_DEFAULT_{HUE,SAT} = 24, 171.
+        let (h, s, v) = rgb_to_hsv([255, 180, 84]);
+        assert_eq!((h, s), (24, 171));
+        assert_eq!(v, 255);
+    }
+
+    #[test]
+    fn anim_state_defaults_to_solid_amber() {
+        let a = AnimState::default();
+        assert_eq!(a.name, "solid");
+        assert_eq!(a.hsv(), (24, 171, 255));
     }
 
     #[test]

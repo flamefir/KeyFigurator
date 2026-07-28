@@ -55,15 +55,79 @@ The overlay one is an outright bug rather than a missing feature.
 | OLED screen images | `oledCustomScreens[].imageDataUrl` | `0x52` carries text only |
 | Timer / countdown start-stop-reset | `oledTimerRunning`, `oledCdRunning` | duration only (`0x53`) |
 
-## The firmware blocker underneath the LED gap
+## The firmware blocker underneath the LED gap — RETRACTED 2026-07-27
 
-`keyboards/macro_pad_pro/config.h` has **zero** `ENABLE_RGB_MATRIX_*` effect
-defines. `RGB_MATRIX_DEFAULT_MODE` is `RGB_MATRIX_SOLID_COLOR` and that is all
-that is compiled in. So even if the app sent an overlay-off today, the board has
-nothing to fall back to but solid colour. **Firmware effects have to be enabled
-before any animation protocol work is worth doing.**
+> The original audit claimed `config.h` has **zero** `ENABLE_RGB_MATRIX_*`
+> defines and that firmware effects therefore had to be enabled before any
+> animation work. **That was wrong**, and it was wrong in a way worth recording:
+> it read `config.h` alone and missed QMK's data-driven build.
 
-## Open design question (decide before building animations)
+`keyboards/macro_pad_pro/keyboard.json` declares eight effects under
+`rgb_matrix.animations`, and `lib/python/qmk/cli/generate/config_h.py`
+(`generate_led_animations_config`) turns each one into an
+`ENABLE_RGB_MATRIX_<NAME>` define in the generated `info_config.h`. Verified by
+running `qmk generate-config-h -kb macro_pad_pro`: all eight defines are
+emitted. `config.h` is bare here **by design**, not by omission.
+
+The two effects with extra prerequisites are handled too — QMK's
+`quantum/rgb_matrix/post_config.h` derives `RGB_MATRIX_KEYPRESSES` from the
+reactive `ENABLE_*` defines and `RGB_MATRIX_FRAMEBUFFER_EFFECTS` from the
+typing-heatmap one, so nothing is silently dropped.
+
+**There is no firmware blocker.** The board has had a full effect set compiled in
+the whole time. The reason the bench only ever showed solid colour is entirely
+the overlay bug in the row above: the app pushes colours, the firmware latches
+`overlay_on = 1`, and `kf_led_overlay_render()` paints over every running effect
+with no path back.
+
+The one real firmware gap was **coverage**, not existence: two of the app's seven
+animations had no board-side counterpart. Fixed 2026-07-27 by adding `riverflow`
+(backs snake — it flows along chain index, which is what the app's snake does)
+and `pixel_rain` (backs sparkle). The full mapping now lives as a comment in
+`config.h` next to `RGB_MATRIX_DEFAULT_MODE`:
+
+| App animation | Firmware effect |
+|---|---|
+| solid | `SOLID_COLOR` |
+| rainbow | `CYCLE_ALL` |
+| breathe | `BREATHING` |
+| wave | `CYCLE_LEFT_RIGHT` |
+| reactive | `SOLID_REACTIVE_SIMPLE` |
+| snake | `RIVERFLOW` |
+| sparkle | `PIXEL_RAIN` |
+
+`RAINBOW_MOVING_CHEVRON`, `TYPING_HEATMAP` and `SOLID_REACTIVE` are also compiled
+in with no app counterpart — spare capacity for protocol v2, not a gap.
+
+## RESOLVED 2026-07-27 — route 1, animation is global
+
+The open question below was settled by resetting the goal: the app **simulates**
+how the board will look, and pushing makes the board show it. Frame-exact parity
+was never the requirement.
+
+That picks **route 1** and deletes the entire cost of route 2 — no fire-and-forget
+transport rework, no host-side frame pacing, no fighting the OLED's ~34 ms
+blocking full-screen redraw. Protocol v2 is one command, `SET_ANIM`
+(`[anim, speed, h, s, v]`), rather than a subsystem.
+
+The cost is the one thing route 1 cannot express: **per-key animation**. Per-key
+*colour* still crosses the wire exactly. The editor was collapsed to a single
+global animation to match, so the preview cannot promise what the board will not
+reproduce.
+
+Two implementation notes worth keeping:
+- The wire carries **KeyFigurator anim ids, never QMK effect numbers**. QMK builds
+  `rgb_matrix_effects` from whichever effects are compiled in, so those numbers
+  shift the moment `keyboard.json` changes. `kf_anim_to_mode()` owns the mapping.
+- `ANIM_SOLID` is not an effect. It means "render the colours the host pushed",
+  i.e. the overlay. This is what makes the animation picker subsume the separate
+  overlay control instead of the two fighting over one firmware flag.
+
+If per-key animation is ever revisited, VialRGB (already vendored in the fork)
+implements route 2 as a *selectable mode* — `vialrgb_direct_fastset`, 9 LEDs per
+packet, rendered by a normal `VIALRGB_DIRECT` effect. Copy that shape.
+
+## Open design question (historical — resolved above)
 
 QMK's RGB matrix effects are **global** — one mode for the whole board. The app's
 model is *per-key* animation state. Those do not reconcile directly. Two routes:
@@ -81,9 +145,12 @@ route 2 is what the app's current editor model actually implies.
 
 ## Sequencing
 
-1. Overlay off + brightness — protocol v1 as it stands, no firmware change.
-2. Firmware RGB effects, then the animation command (protocol v2, bump
-   `PROTOCOL_VERSION`, mirror in `kf_hid.h` + `kf_protocol.rs`).
+1. ~~Overlay off + brightness~~ — **done 2026-07-27**, plus live-sync-on-edit.
+   Protocol v1 as it stands, no firmware change.
+2. The animation command (protocol v2, bump `PROTOCOL_VERSION`, mirror in
+   `kf_hid.h` + `kf_protocol.rs`). No longer gated on firmware work — the
+   effects are compiled in and every app animation now has a counterpart. The
+   open design question below is the only thing left to settle.
 3. OLED extras (font, images, timer transport) + encoder mode — independent,
    one new command each.
 4. Icons / OLED key assignments — first decide whether they are app-only
@@ -92,3 +159,4 @@ route 2 is what the app's current editor model actually implies.
 
 ## Timeline
 2026-07-26 | audit written after the first hardware link, triggered by "only solid colour works" on the bench.
+2026-07-27 | firmware blocker retracted — the "zero effects compiled in" finding was an artefact of reading `config.h` without QMK's data-driven generation; eight effects were always compiled in. Added `riverflow` + `pixel_rain` so all seven app animations have a board-side counterpart. Overlay off/on, brightness, and live sync shipped, so step 1 is closed and step 2 is unblocked.

@@ -18,8 +18,11 @@ The app speaks the firmware's **KeyFigurator Raw HID protocol** byte-for-byte, p
 a software model of the board (`kf_protocol::BoardModel`) and now **against real hardware** —
 a flashed board enumerates and opens on first try. The USB link is **supervised**: it attaches
 whenever a board is present, survives unplug/replug any number of times per session, and falls
-back to the mock while dark. Remaining work is **peripheral validation on hardware** (a human
-gate — see the hardware domain) and the `/pr` harness.
+back to the mock while dark. **Protocol v1 is now fully exercised**: overlay, brightness, and
+live-sync-on-edit shipped 2026-07-27, so everything the wire can carry, the app sends. The next
+build is protocol **v2 animations**, which needs the board-side-vs-host-streamed decision made
+first (see [[protocol-feature-gaps]]) — it is not blocked on firmware. Also outstanding:
+**peripheral validation on hardware** (a human gate — see the hardware domain) and the `/pr` harness.
 
 ## Backlog
 
@@ -59,16 +62,43 @@ gate — see the hardware domain) and the `/pr` harness.
 ### Protocol feature gaps — see [[protocol-feature-gaps]] for the full audit
 Confirmed on hardware: keycodes, per-key LED colour, underglow colour. Everything below is
 app-side preview only or unsent. **Solid colour is the whole designed surface of protocol v1.**
+The audit's "firmware has zero RGB effects compiled in" finding was **retracted 2026-07-27** —
+it missed QMK's data-driven generation; eight effects were always compiled in from
+`keyboard.json`. Animation work was never firmware-blocked.
 
-Uses protocol v1 as it already stands (no firmware change):
-- [ ] Send overlay off/on (`0xF1`/`0xF2`) — `kf_protocol::overlay_frame` is dead code, so once the app pushes LEDs the board is locked to static colour with no way back to animations
-- [ ] Feed the brightness byte (`0xF0`) — `buildLedState()` hardcodes 255; needs a global brightness control in the UI (the RATE/INTENSITY sliders are animation params, not this)
-- [ ] Live sync on edit — changes reach the board only on attach or via "Save to Board" (was marked done in error; never implemented). Needs a debounced flush hooked to the real mutation points
+### Done — protocol v1 surface closed (2026-07-27)
+- [x] Send overlay off/on (`0xF1`/`0xF2`) — `overlay_frame` is no longer dead code: new `HidTransport::set_overlay` + `set_overlay` command + an "LED SOURCE — App/Board" header toggle. Every push re-asserts the current choice, because colour data implicitly latches `overlay_on = 1` in firmware. Taking the LEDs back re-pushes colours first (the board's own effects have overwritten the overlay buffer)
+- [x] Feed the brightness byte (`0xF0`) — global BRIGHTNESS slider in the header, persisted; `buildLedState()` reads it instead of hardcoding 255
+- [x] Live sync on edit — really implemented this time. Part-scoped (`keymap`/`leds`/`oled`) + 120 ms trailing debounce, so a colour drag re-sends only LED frames instead of the whole bundle; overlapping runs coalesce and a failed push is re-queued rather than dropped. RAM-only — persisting is still "Save to Board"
 
-Needs firmware work first:
-- [ ] Firmware: enable `ENABLE_RGB_MATRIX_*` effects — `config.h` currently compiles in **zero** effects, so there is nothing to fall back to even with overlay-off
-- [ ] Animation over the wire (mode/rate/intensity, per-key + underglow) — protocol v2, bump `PROTOCOL_VERSION`. **Decide first:** board-side QMK effects (global only) vs host-streamed frames (keeps per-key, costs continuous USB). See the audit
-- [ ] Cycle palettes (`klPalette`/`ugPalette`/per-key `palette[]`) — depends on the animation decision
+### Done — protocol v2: global animation (2026-07-27)
+Decision made: **board-side QMK effects, animation is global.** The goal was reset to "the
+app simulates how it will look; pushing makes the board show it" rather than frame-exact
+parity, which removes the need for host-streamed frames entirely (and with it the transport
+rework, frame pacing, and OLED contention — see [[protocol-feature-gaps]]).
+- [x] `SET_ANIM` (`0x21`, protocol v2) — `[anim, speed, h, s, v]`. Carries **stable KeyFigurator
+  anim ids**, not QMK effect numbers, because QMK builds its effect enum from whichever effects
+  are compiled in — sending raw enum values would silently break on any effect-set change.
+  `kf_anim_to_mode()` owns the mapping
+- [x] `ANIM_SOLID` means "show the per-key colours we pushed" (the overlay), every other anim
+  releases the overlay to the board's effect — so the animation picker subsumes the old LED
+  SOURCE toggle, which is now a derived indicator instead of a second control over one flag
+- [x] App: 21 `keyAnimStates` collapsed to one global animation, with migration for layers
+  saved in the old per-key shape. **Per-key colour is untouched and still exact**
+- [x] `rgb_to_hsv` in `model.rs` — QMK's hue axis is 0-255, not degrees; pinned so #ffb454
+  reproduces `RGB_MATRIX_DEFAULT_{HUE,SAT}` exactly
+- [ ] Cycle palettes (`klPalette`/`ugPalette`) — still app-side preview only; the wire carries
+  one tint per animation
+
+### Done — pomodoro + macros + Present Keys (2026-07-27)
+- [x] Pomodoro screen (`KF_SCREEN_POMODORO`) — 25/5 with a long break every 4, state machine on
+  the board so it keeps running with the app closed; app mirrors it as a preview
+- [x] Present Keys blinks the focused key's LED (~2 Hz) so the index on the OLED maps to a
+  physical key. Runs after the overlay, so it shows in animated mode too
+- [x] `MACRO(0..15)` in the keycode codec + palette — the firmware has supported 16 dynamic
+  macros via Vial all along; this makes them assignable from the app
+- [ ] Macro **content** editing — still Vial's job. Needs a second, un-magicked transport path
+  for VIA's `dynamic_keymap_macro_{get,set}_buffer` (`0x0B`/`0x0C`) plus a recorder UI
 
 New command each, independent:
 - [ ] OLED font picker (`oledFontId`)
@@ -85,6 +115,53 @@ Decide scope before building:
 - [ ] `RealHid` read/write timing + report-id framing under load (bulk LED/OLED pushes)
 - [ ] Physical verification: LEDs/OLED actually change, a `HOST(n)` press runs on the host
 - [ ] Confirm underglow corner orientation (TL/TR/BR/BL) on a real board
+
+### Done — OLED image + GIF screens (2026-07-27)
+- [x] `qgf.rs` — a from-scratch Quantum Painter QGF encoder. The board has no PNG/GIF decoder
+  and QGF is the only container Quantum Painter reads, so the conversion must happen host-side;
+  shelling out to `qmk painter-convert-graphics` was not an option since it needs a Python
+  toolchain the user may not have. PALETTE_4BPP uncompressed, one palette shared across frames
+- [x] Upload protocol `0x55`-`0x57` — offset-addressed (a dropped chunk is just re-sent), byte
+  count verified before `qp_load_image_mem` so a short upload cannot load a truncated image
+- [x] **Uploaded once, not per frame** — `qp_animate` plays it on-device, so there is no
+  ongoing USB traffic and the animation keeps running with the app closed
+- [x] A custom screen with an image becomes an IMAGE screen on the wire, reusing the existing
+  upload UI rather than adding a redundant screen type
+- [x] Upload cached against the data URL — live sync would otherwise re-send tens of KB on
+  every keystroke
+- [ ] **One image at a time** (single 72 KB board buffer). A per-slot buffer would be 6×.
+  Multiple image screens would need a RAM pool or streaming from external flash
+
+### Done — device manager, macro libraries, pilot fixes (2026-07-28)
+- [x] **Device identity in three layers** — `GET_IDENTITY` (`0x02`) reports product id +
+  hardware revision + firmware build. `products.rs` is a static capability table keyed on
+  **product + hardware, never firmware** — no update can add an encoder push that was never
+  soldered. Rev 1.0.0 has none, so the table names key index 5 as the default Special Enter
+- [x] **Home page** — device cards (connection dot, versions, transport icon, delete) and a
+  New Device scan. The editor is entered by picking a device, so it always runs against a
+  known revision instead of assuming one
+- [x] **Macro libraries** — browsed like folders (tiles → macros), versioned shareable format,
+  import lands as its own library, per-library export, multi-select, queued Test
+- [x] **Shell-script macros** — a macro is either keystrokes (`MACRO(n)`, board-executed) or a
+  shell script (`HOST(n)`, run by `runner.rs`) authored in a terminal-style editor. This let
+  the separate HOST BINDINGS UI be **deleted** rather than moved: binding a shell macro to a
+  key *is* creating a host binding. Separate slot spaces, since the two ride different keycodes
+- [x] **Per-key macro binding** in key Advanced settings; slots derived not stored, so keycodes
+  and allocation cannot drift apart
+- [x] Pilot fixes: countdown starts 00:00:00 and refuses a zero start · OLED app-link dot
+  replaces the meaningless "USB" label · Present Keys follows a physical press · encoder rotate
+  buttons no longer swallow clicks for the key below · window minWidth 420 → 940
+- [x] **Persistence audit + fix** — it was *not* true. Key colours, icons and keymap only saved
+  through a path that returned early without an active layer, so a fresh install lost every
+  edit on restart; saves ran only on layer switch; and one global key meant two boards
+  overwrote each other. Now one auto-saved blob per device, hooked into `scheduleLiveSync`
+  so a new mutation point cannot sync-but-not-persist
+- [ ] Macro **content** to the board is still the open item — needs the un-magicked VIA
+  transport path (`0x0B`/`0x0C`). Shell macros are unaffected and work end to end today
+
+### Pre-release attention (2026-07-27)
+- [ ] **Protocol v2 is a breaking change** — `PROTOCOL_VERSION` 1 → 2 on both sides and `ping()` hard-errors on mismatch, so the app refuses a board running v1 firmware. Flashing is a release prerequisite, not an option
+- [ ] **EEPROM overlay trap** — `eeprom_commit` persists `overlay_on` and there is no app-exit handler, so "Save to Board" in Solid mode leaves the board booting to a frozen frame with no on-device escape. Fix: release the overlay on exit and/or an encoder gesture forcing `KF_LED_OVERLAY_OFF`
 
 ### Remaining app work
 - [ ] Harness the repo: `/pr` with human HW gate (Rust unit tests exist in kf_protocol/hid/model/runner; Playwright dep present)
@@ -103,3 +180,5 @@ Decide scope before building:
 2026-07-25 | RealHid USB transport — implemented the hidapi transport (enumerate/open + single-owner I/O thread + inbound RUN_HOST_CMD reader); app auto-detects a board and falls back to MockHid. Compiles + falls back cleanly; awaiting a real board for bring-up. Only the physical human gate remains.
 2026-07-26 | first real link + hot-plug — the app connected to a flashed board on first try. Reworked `RealHid` into a session-long supervisor (rescan/attach/detach) behind a new `BoardLink`, so connecting is no longer startup-only; added the `board-connection` event + `board_status` command. Fixed the keycode codec silently blanking keys on bare names (`"A"` → KC_NO). 26 Rust tests pass.
 2026-07-26 | Save to Board fixed + gap audit — "Save to Board" only sent `eeprom_commit`, which persists the LED block the board already holds rather than pulling from the host, so it could never move keys or OLED; it now pushes keymap/LEDs/OLED/time first. That exposed the fact that live-sync-on-edit was never implemented. Audited the whole protocol surface against the editor → [[protocol-feature-gaps]]: solid colour is all protocol v1 carries, and the firmware has zero RGB effects compiled in.
+2026-07-28 | device manager + macro libraries — pilot session turned the app from a single-board editor into a device manager: three-layer identity (`GET_IDENTITY`) with a hardware-keyed capability table, a home page device list, folder-style macro libraries, and shell-script macros that replaced the HOST BINDINGS UI outright. Audited persistence on request and found it was not true — per-key colours/icons/keymap were lost on restart without an active layer, and all devices shared one storage key; now one auto-saved blob per device. 53 Rust tests.
+2026-07-27 | protocol v1 closed + audit correction — shipped the three remaining v1 items: overlay off/on (`set_overlay` through transport → command → an App/Board header toggle), a global brightness slider feeding the `0xF0` byte, and a real part-scoped debounced live sync. Retracted the audit's firmware blocker: `qmk generate-config-h` proves eight effects were always compiled in from `keyboard.json` — the "only solid colour" symptom was 100% the overlay latch, not missing effects. 27 Rust tests pass.

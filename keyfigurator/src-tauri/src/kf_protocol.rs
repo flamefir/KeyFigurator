@@ -23,7 +23,8 @@ pub const KF_MAGIC: u8 = 0xC0;
 /// Fixed QMK Raw HID report size.
 pub const REPORT_LEN: usize = 32;
 
-pub const PROTOCOL_VERSION: u8 = 1;
+/// v2 added SET_ANIM (global animation).
+pub const PROTOCOL_VERSION: u8 = 2;
 
 /// 20 keys + encoder push at index 20 (KeyFigurator index space, == BOARD_POSITIONS).
 pub const KEY_COUNT: usize = 21;
@@ -45,9 +46,11 @@ pub const USAGE: u16 = 0x61;
 
 // Commands (host -> board unless noted).
 pub const CMD_PING: u8 = 0x01;
+pub const CMD_GET_IDENTITY: u8 = 0x02;
 pub const CMD_GET_KEYMAP: u8 = 0x10;
 pub const CMD_SET_KEYMAP: u8 = 0x11;
 pub const CMD_SET_LEDS: u8 = 0x20;
+pub const CMD_SET_ANIM: u8 = 0x21;
 pub const CMD_RUN_HOST_CMD: u8 = 0x30; // board -> host, unsolicited: [index]
 pub const CMD_EEPROM_COMMIT: u8 = 0x40;
 pub const CMD_OLED_SET_LAYER: u8 = 0x50;
@@ -55,6 +58,9 @@ pub const CMD_OLED_SET_SCREENS: u8 = 0x51;
 pub const CMD_OLED_SET_TEXT: u8 = 0x52;
 pub const CMD_OLED_SET_COUNTDOWN: u8 = 0x53;
 pub const CMD_OLED_SYNC_TIME: u8 = 0x54;
+pub const CMD_OLED_IMG_BEGIN: u8 = 0x55;
+pub const CMD_OLED_IMG_DATA: u8 = 0x56;
+pub const CMD_OLED_IMG_END: u8 = 0x57;
 
 // SET_LEDS control-frame selectors (first payload byte).
 pub const LED_BRIGHTNESS: u8 = 0xF0;
@@ -68,17 +74,67 @@ pub const STATUS_ERROR: u8 = 0x01;
 pub const QK_KB_0: u16 = 0x7E00;
 pub const HOST_CMD_COUNT: u8 = 16;
 
+/// MACRO(n) — QMK dynamic macros, recorded and stored on the board itself
+/// (`dynamic_keymap_macro_*`). QMK's keycode space runs to QK_MACRO_31, but the
+/// board compiles in `DYNAMIC_KEYMAP_MACRO_COUNT` (16) of them, so only 0..15
+/// will actually fire.
+pub const QK_MACRO_0: u16 = 0x7700;
+pub const MACRO_COUNT: u8 = 16;
+
 // OLED limits (kf_hid.h).
 pub const OLED_MAX_CUSTOM_SCREENS: usize = 6;
 pub const OLED_LAYER_NAME_MAX: usize = 16;
 pub const OLED_CUSTOM_TITLE_MAX: usize = 14;
 pub const OLED_BODY_MAX: usize = 48;
+/// Most text bytes ONE frame can carry: 32 - (magic+cmd+slot+field+offset+len).
+/// A source limit, unrelated to `OLED_BODY_MAX` which bounds the destination —
+/// a 48-byte body is legal, it just takes two frames.
+pub const OLED_TEXT_CHUNK_MAX: usize = REPORT_LEN - 6;
 
 /// `enum kf_screen_type` in kf_hid.h.
 pub const SCREEN_TIMER: u8 = 1;
 pub const SCREEN_COUNTDOWN: u8 = 2;
 pub const SCREEN_DATETIME: u8 = 3;
 pub const SCREEN_CUSTOM_TEXT: u8 = 4;
+pub const SCREEN_POMODORO: u8 = 5;
+pub const SCREEN_IMAGE: u8 = 6;
+
+/// The board's single image buffer (`KF_OLED_IMG_MAX_BYTES`), and the caps the
+/// encoder must respect to stay inside it.
+pub const OLED_IMG_MAX_BYTES: usize = 72 * 1024;
+pub const OLED_IMG_MAX_FRAMES: usize = 8;
+pub const OLED_IMG_MAX_DIM: u32 = 128;
+/// Image bytes one frame can carry: 32 - (magic, cmd, offset×3, len).
+pub const OLED_IMG_CHUNK_MAX: usize = REPORT_LEN - 6;
+
+/// `enum kf_anim` in kf_hid.h. Stable wire ids — the firmware maps these to
+/// whichever QMK effect is compiled in, because QMK's own effect numbers shift
+/// whenever the enabled effect set changes. Never send a QMK enum value here.
+///
+/// `ANIM_SOLID` is special: it means "the per-key colours the app pushed",
+/// which the firmware renders through the overlay rather than as an effect.
+pub const ANIM_SOLID: u8 = 0;
+pub const ANIM_RAINBOW: u8 = 1;
+pub const ANIM_SNAKE: u8 = 2;
+pub const ANIM_BREATHE: u8 = 3;
+pub const ANIM_WAVE: u8 = 4;
+pub const ANIM_REACTIVE: u8 = 5;
+pub const ANIM_SPARKLE: u8 = 6;
+pub const ANIM_COUNT: u8 = 7;
+
+/// Map the app's animation name to its wire id. Unknown names fall back to
+/// solid, matching the firmware's own default arm.
+pub fn anim_id(name: &str) -> u8 {
+    match name {
+        "rainbow" => ANIM_RAINBOW,
+        "snake" => ANIM_SNAKE,
+        "breathe" => ANIM_BREATHE,
+        "wave" => ANIM_WAVE,
+        "reactive" => ANIM_REACTIVE,
+        "sparkle" => ANIM_SPARKLE,
+        _ => ANIM_SOLID,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Frame construction
@@ -147,6 +203,45 @@ pub fn set_led_color_frames(colors: &[[u8; 3]]) -> Vec<[u8; REPORT_LEN]> {
 
 pub fn brightness_frame(brightness: u8) -> [u8; REPORT_LEN] {
     frame(CMD_SET_LEDS, &[LED_BRIGHTNESS, brightness])
+}
+
+/// SET_ANIM: `[anim, speed, hue, sat, val]`. Animation is global — QMK's RGB
+/// matrix has one mode for the whole board, so per-key state is colour only.
+pub fn identity_frame() -> [u8; REPORT_LEN] {
+    frame(CMD_GET_IDENTITY, &[])
+}
+
+/// Longest product name GET_IDENTITY can carry (mirrors `KF_PRODUCT_NAME_MAX`).
+pub const PRODUCT_NAME_MAX: usize = REPORT_LEN - 10;
+
+pub fn set_anim_frame(anim: u8, speed: u8, hue: u8, sat: u8, val: u8) -> [u8; REPORT_LEN] {
+    frame(CMD_SET_ANIM, &[anim, speed, hue, sat, val])
+}
+
+pub fn oled_img_begin_frame(total_len: u32) -> [u8; REPORT_LEN] {
+    let b = total_len.to_le_bytes();
+    frame(CMD_OLED_IMG_BEGIN, &[b[0], b[1], b[2]])
+}
+
+/// Chunk the QGF into offset-addressed data frames. Offset-addressed rather than
+/// sequential so a dropped chunk can just be re-sent.
+pub fn oled_img_data_frames(image: &[u8]) -> Vec<[u8; REPORT_LEN]> {
+    image
+        .chunks(OLED_IMG_CHUNK_MAX)
+        .enumerate()
+        .map(|(ci, chunk)| {
+            let off = (ci * OLED_IMG_CHUNK_MAX) as u32;
+            let ob = off.to_le_bytes();
+            let mut p = Vec::with_capacity(4 + chunk.len());
+            p.extend_from_slice(&[ob[0], ob[1], ob[2], chunk.len() as u8]);
+            p.extend_from_slice(chunk);
+            frame(CMD_OLED_IMG_DATA, &p)
+        })
+        .collect()
+}
+
+pub fn oled_img_end_frame() -> [u8; REPORT_LEN] {
+    frame(CMD_OLED_IMG_END, &[])
 }
 
 pub fn overlay_frame(on: bool) -> [u8; REPORT_LEN] {
@@ -239,6 +334,9 @@ pub fn oled_sync_time_frame(
 fn parse_parametric(name: &str) -> Option<u16> {
     const BASES: &[(&str, u16)] = &[
         ("HOST", QK_KB_0),
+        // Before "MO" only for readability — "MACRO(0)" cannot match the "MO"
+        // prefix anyway, since it starts "MA".
+        ("MACRO", QK_MACRO_0),
         ("MO", 0x5220),
         ("TO", 0x5200),
         ("TG", 0x5260),
@@ -262,6 +360,7 @@ fn parse_parametric(name: &str) -> Option<u16> {
 fn format_parametric(kc: u16) -> Option<String> {
     Some(match kc {
         0x7E00..=0x7E0F => format!("HOST({})", kc - QK_KB_0),
+        0x7700..=0x771F => format!("MACRO({})", kc - QK_MACRO_0),
         0x5220..=0x523F => format!("MO({})", kc - 0x5220),
         0x5200..=0x521F => format!("TO({})", kc - 0x5200),
         0x5260..=0x527F => format!("TG({})", kc - 0x5260),
@@ -397,6 +496,10 @@ pub struct BoardModel {
     pub rgb: [[u8; 3]; LED_COUNT],
     pub brightness: u8,
     pub overlay_on: bool,
+    /// Global animation state (`kf_led_state_t.anim*` in kf_hid.c).
+    pub anim: u8,
+    pub anim_speed: u8,
+    pub anim_hsv: (u8, u8, u8),
     /// Last-committed snapshot (EEPROM). Purely to model persistence.
     pub committed: Option<([[u8; 3]; LED_COUNT], u8, bool)>,
     // OLED state (push-only; recorded so tests can assert it was received).
@@ -404,6 +507,10 @@ pub struct BoardModel {
     pub oled_show_title: [bool; LAYER_COUNT],
     pub oled_screen_types: Vec<u8>,
     pub oled_countdown: (u8, u8, u8),
+    /// Image upload state, mirroring the board's single image buffer.
+    pub oled_img_expected: usize,
+    pub oled_img_received: usize,
+    pub oled_img_ready: bool,
 }
 
 impl Default for BoardModel {
@@ -413,11 +520,17 @@ impl Default for BoardModel {
             rgb: [[0u8; 3]; LED_COUNT],
             brightness: 255,
             overlay_on: false,
+            anim: ANIM_SOLID,
+            anim_speed: 128,
+            anim_hsv: (24, 171, 150), // RGB_MATRIX_DEFAULT_* in config.h
             committed: None,
             oled_layer_names: Default::default(),
             oled_show_title: [true; LAYER_COUNT],
             oled_screen_types: Vec::new(),
             oled_countdown: (0, 0, 0),
+            oled_img_expected: 0,
+            oled_img_received: 0,
+            oled_img_ready: false,
         }
     }
 }
@@ -476,8 +589,37 @@ impl BoardModel {
                     r[0] = STATUS_OK;
                 }
             }
+            CMD_GET_IDENTITY => {
+                // Mirrors kf_hid.c: the mock reports the same product 0x01 /
+                // hw 1.0.0 the bench board does, so capability lookups behave
+                // identically with and without hardware attached.
+                let name = b"Macro Pad Pro";
+                r[0] = 0x01; // product id
+                r[1] = 1; // hardware 1.0.0
+                r[2] = 0;
+                r[3] = 0;
+                r[4] = 0; // firmware 0.2.0
+                r[5] = 2;
+                r[6] = 0;
+                r[7] = name.len() as u8;
+                r[8..8 + name.len()].copy_from_slice(name);
+            }
             CMD_SET_LEDS => {
                 r[0] = self.apply_set_leds(p);
+            }
+            CMD_SET_ANIM => {
+                if p[0] >= ANIM_COUNT {
+                    r[0] = STATUS_ERROR;
+                } else {
+                    self.anim = p[0];
+                    self.anim_speed = p[1];
+                    self.anim_hsv = (p[2], p[3], p[4]);
+                    // Mirrors kf_apply_anim(): solid means "show the host's
+                    // per-key colours", i.e. the overlay; anything else hands
+                    // the LEDs to the board's own effect.
+                    self.overlay_on = self.anim == ANIM_SOLID;
+                    r[0] = STATUS_OK;
+                }
             }
             CMD_EEPROM_COMMIT => {
                 self.committed = Some((self.rgb, self.brightness, self.overlay_on));
@@ -506,11 +648,51 @@ impl BoardModel {
             CMD_OLED_SET_TEXT => {
                 let (slot, field, offset, len) = (p[0], p[1], p[2] as usize, p[3] as usize);
                 let max = if field == 0 { OLED_CUSTOM_TITLE_MAX } else { OLED_BODY_MAX };
-                if slot as usize >= OLED_MAX_CUSTOM_SCREENS || field > 1 || offset + len > max {
+                // `len` is bounded against the destination AND the report. Without
+                // the second check a frame claiming len=48 would read past the end
+                // of a 32-byte report on the board — mirrors kf_hid.c.
+                if slot as usize >= OLED_MAX_CUSTOM_SCREENS
+                    || field > 1
+                    || len > OLED_TEXT_CHUNK_MAX
+                    || offset + len > max
+                {
                     r[0] = STATUS_ERROR;
                 } else {
                     r[0] = STATUS_OK; // content recording omitted in the mock
                 }
+            }
+            // Image upload — models the board's buffer state machine so the mock
+            // rejects exactly what the firmware rejects.
+            CMD_OLED_IMG_BEGIN => {
+                let total = p[0] as usize | ((p[1] as usize) << 8) | ((p[2] as usize) << 16);
+                if total == 0 || total > OLED_IMG_MAX_BYTES {
+                    r[0] = STATUS_ERROR;
+                } else {
+                    self.oled_img_expected = total;
+                    self.oled_img_received = 0;
+                    self.oled_img_ready = false;
+                    r[0] = STATUS_OK;
+                }
+            }
+            CMD_OLED_IMG_DATA => {
+                let offset = p[0] as usize | ((p[1] as usize) << 8) | ((p[2] as usize) << 16);
+                let len = p[3] as usize;
+                if self.oled_img_expected == 0
+                    || len > OLED_IMG_CHUNK_MAX
+                    || offset + len > self.oled_img_expected
+                {
+                    r[0] = STATUS_ERROR;
+                } else {
+                    self.oled_img_received += len;
+                    r[0] = STATUS_OK;
+                }
+            }
+            CMD_OLED_IMG_END => {
+                let complete = self.oled_img_expected > 0
+                    && self.oled_img_received == self.oled_img_expected;
+                self.oled_img_expected = 0;
+                self.oled_img_ready = complete;
+                r[0] = if complete { STATUS_OK } else { STATUS_ERROR };
             }
             CMD_OLED_SET_COUNTDOWN => {
                 self.oled_countdown = (p[0], p[1], p[2]);
@@ -548,7 +730,11 @@ impl BoardModel {
                 for i in 0..count {
                     self.rgb[offset + i] = [p[2 + i * 3], p[3 + i * 3], p[4 + i * 3]];
                 }
-                self.overlay_on = true;
+                // Colour data fills the overlay buffer, but whether it is SHOWN
+                // belongs to the animation mode — see the same comment in
+                // kf_hid.c. Asserting it unconditionally (v1) meant live colour
+                // sync silently killed a running animation.
+                self.overlay_on = self.anim == ANIM_SOLID;
                 STATUS_OK
             }
         }
@@ -691,6 +877,82 @@ mod tests {
             }
         }
         assert_eq!(got, kcs);
+    }
+
+    #[test]
+    fn set_anim_frame_shape_and_ids() {
+        let f = set_anim_frame(ANIM_BREATHE, 200, 24, 171, 150);
+        assert_eq!(&f[0..7], &[0xC0, CMD_SET_ANIM, ANIM_BREATHE, 200, 24, 171, 150]);
+        // Wire ids are ours, not QMK's — pin them so a reorder is a test failure.
+        assert_eq!(
+            (
+                anim_id("solid"),
+                anim_id("rainbow"),
+                anim_id("snake"),
+                anim_id("breathe"),
+                anim_id("wave"),
+                anim_id("reactive"),
+                anim_id("sparkle"),
+            ),
+            (0, 1, 2, 3, 4, 5, 6)
+        );
+        assert_eq!(anim_id("nonsense"), ANIM_SOLID); // unknown degrades to solid
+    }
+
+    /// The interaction that broke v1: colour data must NOT steal the LEDs back
+    /// from a running animation, but must still assert the overlay in solid mode.
+    #[test]
+    fn colour_push_respects_the_active_animation() {
+        let mut b = BoardModel::default();
+        b.handle(&set_anim_frame(ANIM_RAINBOW, 128, 0, 255, 255)).unwrap();
+        assert!(!b.overlay_on, "a real animation releases the overlay");
+
+        for f in set_led_color_frames(&[[1u8, 2, 3]; LED_COUNT]) {
+            b.handle(&f).unwrap();
+        }
+        assert!(!b.overlay_on, "colour push must not kill the animation");
+        assert_eq!(b.rgb[0], [1, 2, 3], "but the buffer is still updated");
+
+        b.handle(&set_anim_frame(ANIM_SOLID, 128, 0, 0, 0)).unwrap();
+        assert!(b.overlay_on, "solid means show the host's colours");
+    }
+
+    /// Regression: OLED_SET_TEXT validated `len` only against the destination
+    /// buffer, so `field=1, len=48` passed and the firmware memcpy'd 48 bytes
+    /// out of the 26 a report actually carries — an out-of-bounds read on the
+    /// board. Both sides must reject it.
+    #[test]
+    fn oled_text_len_bounded_by_the_report_not_just_the_buffer() {
+        let mut b = BoardModel::default();
+        let over = frame(CMD_OLED_SET_TEXT, &[0, 1, 0, (OLED_TEXT_CHUNK_MAX + 1) as u8]);
+        assert_eq!(b.handle(&over).unwrap()[2], STATUS_ERROR);
+
+        // A 48-byte body is still legal — it just has to arrive in two frames.
+        let ok = frame(CMD_OLED_SET_TEXT, &[0, 1, 0, OLED_TEXT_CHUNK_MAX as u8]);
+        assert_eq!(b.handle(&ok).unwrap()[2], STATUS_OK);
+
+        // And the real chunker never emits an over-long frame.
+        for f in oled_set_text_frames(0, 1, &"x".repeat(OLED_BODY_MAX)) {
+            assert!(f[5] as usize <= OLED_TEXT_CHUNK_MAX, "chunker exceeded report room");
+            assert_eq!(b.handle(&f).unwrap()[2], STATUS_OK);
+        }
+    }
+
+    #[test]
+    fn board_model_rejects_unknown_anim() {
+        let mut b = BoardModel::default();
+        let resp = b.handle(&set_anim_frame(ANIM_COUNT, 0, 0, 0, 0)).unwrap();
+        assert_eq!(resp[2], STATUS_ERROR);
+    }
+
+    #[test]
+    fn macro_keycodes_roundtrip() {
+        assert_eq!(keycode_to_u16("MACRO(0)"), Some(QK_MACRO_0));
+        assert_eq!(keycode_to_u16("MACRO(15)"), Some(QK_MACRO_0 + 15));
+        assert_eq!(keycode_from_u16(QK_MACRO_0), "MACRO(0)");
+        assert_eq!(keycode_from_u16(QK_MACRO_0 + 15), "MACRO(15)");
+        // "MACRO" must not be swallowed by the "MO" layer-keycode prefix.
+        assert_ne!(keycode_to_u16("MACRO(1)"), keycode_to_u16("MO(1)"));
     }
 
     #[test]

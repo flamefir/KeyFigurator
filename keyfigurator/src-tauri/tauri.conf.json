@@ -14,7 +14,7 @@
       {
         "title": "KeyFigurator Pro",
         "width": 1000, "height": 1100,
-        "minWidth": 420, "minHeight": 1060,
+        "minWidth": 940, "minHeight": 700,
         "decorations": false,
         "shadow": true
       }

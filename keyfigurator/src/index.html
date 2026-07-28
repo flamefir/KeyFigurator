@@ -17,8 +17,114 @@
       </div>
     </div>
 
-    <!-- Fixed top-left: app title -->
-    <span class="app-title">KeyFigurator Pro</span>
+    <!-- Home page: the device list. Shown first; the editor is entered by
+         picking a device, so the editor always has a known product + hardware
+         behind it rather than assuming one. -->
+    <div class="home" id="home">
+      <div class="home-head">
+        <h1 class="home-title">Devices</h1>
+        <button class="home-add" id="home-add">+ New Device</button>
+      </div>
+      <div class="scan-notice" id="scan-notice"></div>
+      <div class="home-list" id="home-list"></div>
+      <div class="home-empty" id="home-empty">
+        <div class="home-empty-icon">⌨</div>
+        <div class="home-empty-title">No devices yet</div>
+        <div class="home-empty-sub">Plug a board in and hit <b>New Device</b> to scan for it.</div>
+      </div>
+
+      <!-- Macro libraries. Browsed like folders: tiles at the top level, macros
+           inside. Each library is a self-contained, versioned document, which is
+           the unit that gets exported and shared. -->
+      <div class="home-head lib-head">
+        <h1 class="home-title" id="lib-title">Macro Libraries</h1>
+        <div class="lib-actions" id="lib-actions"></div>
+      </div>
+      <div class="lib-crumb" id="lib-crumb"></div>
+      <div class="lib-grid" id="lib-grid"></div>
+      <div class="home-list" id="lib-list"></div>
+      <div class="home-empty" id="lib-empty"></div>
+      <input type="file" id="lib-import" accept=".json,application/json" style="display:none" />
+    </div>
+
+    <!-- Test playback overlay -->
+    <div class="macro-editor" id="macro-test">
+      <div class="macro-editor-modal">
+        <div class="macro-editor-head">
+          <span class="macro-test-title" id="macro-test-title">Test</span>
+          <button class="macro-close" id="macro-test-close" title="Close">✕</button>
+        </div>
+        <div class="macro-test-queue" id="macro-test-queue"></div>
+        <div class="macro-test-steps" id="macro-test-steps"></div>
+        <div class="macro-test-out" id="macro-test-out"></div>
+        <div class="macro-editor-actions">
+          <button class="oled-picker-cancel" id="macro-test-stop">Stop</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Macro editor overlay -->
+    <div class="macro-editor" id="macro-editor">
+      <div class="macro-editor-modal">
+        <div class="macro-editor-head">
+          <input type="text" id="macro-name" class="macro-name-inp" placeholder="Macro name…" maxlength="40" />
+          <button class="macro-close" id="macro-close" title="Close">✕</button>
+        </div>
+        <input type="text" id="macro-desc" class="macro-desc-inp" placeholder="Description (optional)…" maxlength="120" />
+
+        <div class="macro-kind">
+          <button class="macro-kind-btn active" id="macro-kind-keys" data-kind="keys">⌨ Keystrokes</button>
+          <button class="macro-kind-btn" id="macro-kind-shell" data-kind="shell">$ Shell script</button>
+        </div>
+
+        <div id="macro-pane-keys">
+          <div class="macro-hint">
+            One action per line:
+            <code>TAP KC_A</code> · <code>DOWN KC_LCTL</code> · <code>UP KC_LCTL</code> ·
+            <code>DELAY 100</code> · <code>TEXT hello world</code>
+          </div>
+          <textarea id="macro-actions" class="macro-actions-inp" spellcheck="false"
+            placeholder="DOWN KC_LCTL&#10;TAP KC_C&#10;UP KC_LCTL"></textarea>
+        </div>
+
+        <div id="macro-pane-shell" style="display:none">
+          <div class="term">
+            <div class="term-bar">
+              <span class="term-dot red"></span><span class="term-dot amber"></span><span class="term-dot green"></span>
+              <span class="term-title" id="term-shell-name">shell</span>
+            </div>
+            <div class="term-body">
+              <div class="term-gutter" id="term-gutter"></div>
+              <textarea id="macro-script" class="term-input" spellcheck="false"
+                autocomplete="off" autocorrect="off" autocapitalize="off"
+                placeholder="git add -A&#10;git commit -m &quot;wip&quot;&#10;git push"></textarea>
+            </div>
+          </div>
+          <div class="macro-hint">
+            Runs on this computer when the bound key is pressed. Multi-line, pipes and
+            redirects all work — it goes through a shell.
+          </div>
+          <label class="macro-cwd">
+            <span class="pill-label">CWD</span>
+            <input type="text" id="macro-cwd" placeholder="Working directory (optional) — e.g. C:\Repos\KeyFigurator" />
+          </label>
+        </div>
+        <div class="macro-editor-err" id="macro-err"></div>
+        <div class="macro-editor-actions">
+          <button class="oled-picker-cancel" id="macro-cancel">Cancel</button>
+          <button class="oled-picker-add" id="macro-save">Save</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Fixed top-left: back to the device list, with the active device's
+         identity underneath so you always know which board you are editing. -->
+    <div class="app-nav" id="app-nav">
+      <button class="app-home" id="app-home" title="Back to devices">
+        <span class="app-home-arrow">←</span> Home
+      </button>
+      <div class="app-device" id="app-device"></div>
+    </div>
 
     <!-- Fixed top-right: Saved Layers (hover-activated) -->
     <div class="sl-wrap" id="sl-wrap">
@@ -39,6 +145,23 @@
 
     <header>
       <div id="conn" class="pill">checking…</div>
+      <!-- Global board LED controls. Both are protocol-level: brightness is the
+           0xF0 byte the firmware scales every channel by, and LED SOURCE is the
+           0xF1/0xF2 overlay switch that decides whether the board renders our
+           colours or runs its own RGB matrix animations. -->
+      <label class="bright-ctl" title="Global LED brightness on the board — scales every colour channel">
+        <span class="pill-label">BRIGHTNESS</span>
+        <input type="range" id="led-brightness" min="0" max="255" value="255" />
+        <span class="bright-val" id="led-brightness-val">100%</span>
+      </label>
+      <!-- Derived from the animation, not an independent control: "solid" means
+           the board shows our per-key colours, any other animation means the
+           board drives its own effect. Two controls over one firmware flag
+           would just fight. -->
+      <div id="overlay-ind" class="overlay-ind" title="Who is driving the LEDs right now">
+        <span class="pill-label">LED SOURCE</span>
+        <span class="overlay-state" id="overlay-state">App</span>
+      </div>
       <button id="btn-save-board" class="save-board-btn">Save to Board</button>
     </header>
 
@@ -144,6 +267,15 @@
                 <img class="kc-icon-thumb" id="kc-icon-thumb" src="" alt="" />
               </div>
             </div>
+            <!-- Bind one macro from the Home page libraries to this key. Sets
+                 the key's keycode to MACRO(n) and reserves a board slot. -->
+            <div class="kc-macro-row" id="kc-macro-row">
+              <span class="pill-label">MACRO</span>
+              <select id="kc-macro-select" class="kc-macro-select"></select>
+              <span class="kc-macro-slot" id="kc-macro-slot"></span>
+            </div>
+            <div class="kc-macro-note" id="kc-macro-note"></div>
+
             <div class="kc-palette-wrap">
               <input id="kc-search" class="kc-search" placeholder="Search keycodes…" />
               <div id="kc-palette-list" class="kc-palette-list"></div>
@@ -156,14 +288,16 @@
                 <button class="oled-action-btn" id="kc-back-assign">Set</button>
                 <button class="oled-action-btn oled-del-screen" id="kc-back-clear" style="display:none">Clear</button>
               </div>
+              <!-- Special Enter: the confirm action. Defaults to the encoder
+                   push, but hardware without a push switch has none, so any key
+                   can stand in. -->
+              <div class="kc-back-row" id="kc-enter-row">
+                <span class="kc-back-label">Special Enter</span>
+                <span class="kc-back-val" id="kc-enter-val">Encoder push</span>
+                <button class="oled-action-btn" id="kc-enter-assign">Set</button>
+                <button class="oled-action-btn oled-del-screen" id="kc-enter-clear" style="display:none">Clear</button>
+              </div>
             </div>
-            <div class="hb-header">
-              <span class="pill-label">HOST BINDINGS</span>
-              <span class="hb-hint">Triggered by HOST(n) keycodes — each binding runs a shell command on the host.</span>
-            </div>
-            <div id="hb-list"></div>
-            <button class="hb-add-btn" id="hb-add">+ Add Binding</button>
-            <div class="hb-output" id="hb-output" style="display:none"></div>
           </div>
         </div>
       </div>

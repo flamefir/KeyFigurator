@@ -10,10 +10,12 @@
 mod hid;
 mod kf_protocol;
 mod model;
+mod products;
+mod qgf;
 mod runner;
 
 use hid::{BoardLink, HidTransport, PingInfo, RealHid};
-use model::{HostBinding, KeyMap, LedState, OledConfig};
+use model::{AnimState, HostBinding, KeyMap, LedState, OledConfig};
 use serde::Serialize;
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
@@ -53,6 +55,59 @@ fn board_status(state: State<AppState>) -> BoardStatus {
         connected,
         transport: if connected { "board" } else { "mock" },
     }
+}
+
+/// One entry on the home page. Everything the card needs to render: what the
+/// device is, how it is attached, and what it can do.
+#[derive(Serialize)]
+struct DeviceInfo {
+    product_id: u8,
+    product_name: String,
+    hardware: String,
+    firmware: String,
+    /// `"usb"` today. Bluetooth is not implemented — the field exists so the UI
+    /// can render a transport icon without pretending BLE already works.
+    transport: &'static str,
+    connected: bool,
+    /// False when the board is real but this build has no entry for its
+    /// product + hardware, so the UI can say "unknown device" honestly.
+    known_product: bool,
+    capabilities: Option<products::Capabilities>,
+    /// Key index standing in for a missing encoder push, if any.
+    default_special_enter: Option<usize>,
+}
+
+/// Scan for attached devices and report what they are.
+///
+/// Backs the home page's "New Device" button. Returns a list even though only
+/// one board can be attached today, so the UI does not need reshaping when that
+/// changes.
+#[tauri::command]
+fn scan_devices(state: State<AppState>) -> Result<Vec<DeviceInfo>, String> {
+    let mut transport = state.transport.lock().unwrap();
+
+    // Must check for a real board FIRST. `BoardLink` deliberately falls through
+    // to `MockHid` when nothing is attached, so calling identity() blind would
+    // happily report the mock's identity and invent a device that is not there.
+    if !transport.has_board() {
+        return Ok(Vec::new());
+    }
+    let connected = true;
+
+    let ident = transport.identity().map_err(|e| e.to_string())?;
+    let spec = products::lookup_or_nearest(ident.product_id, ident.hardware);
+
+    Ok(vec![DeviceInfo {
+        product_id: ident.product_id,
+        product_name: ident.product_name,
+        hardware: ident.hardware.to_string(),
+        firmware: ident.firmware.to_string(),
+        transport: "usb",
+        connected,
+        known_product: spec.is_some(),
+        capabilities: spec.map(|s| s.capabilities),
+        default_special_enter: spec.and_then(|s| s.default_special_enter),
+    }])
 }
 
 #[tauri::command]
@@ -95,6 +150,31 @@ fn set_leds(state: State<AppState>, leds: LedState) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// Set the global LED animation. Animation is board-wide by design — QMK's RGB
+/// matrix has one mode — so per-key state is colour only.
+#[tauri::command]
+fn set_anim(state: State<AppState>, anim: AnimState) -> Result<(), String> {
+    state
+        .transport
+        .lock()
+        .unwrap()
+        .set_anim(&anim)
+        .map_err(|e| e.to_string())
+}
+
+/// Release the board to its own RGB animations (`on = false`) or re-assert the
+/// host colour overlay (`on = true`). Pushing colours turns the overlay on by
+/// itself, so this is what makes that reversible.
+#[tauri::command]
+fn set_overlay(state: State<AppState>, on: bool) -> Result<(), String> {
+    state
+        .transport
+        .lock()
+        .unwrap()
+        .set_overlay(on)
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn oled_push(state: State<AppState>, config: OledConfig) -> Result<(), String> {
     state
@@ -123,6 +203,42 @@ fn sync_time(
         .unwrap()
         .sync_time(year2000, month, day, hour, min, sec, weekday)
         .map_err(|e| e.to_string())
+}
+
+/// Encode an image (PNG/JPEG/GIF data URL) as QGF and upload it to the board's
+/// image screen. Returns what the board actually got, since the encoder may have
+/// scaled the image down or dropped frames to fit the buffer.
+#[derive(Serialize)]
+struct ImageUploadResult {
+    width: u16,
+    height: u16,
+    frames: u16,
+    bytes: usize,
+}
+
+#[tauri::command]
+fn oled_push_image(state: State<AppState>, data_url: String) -> Result<ImageUploadResult, String> {
+    let img = qgf::encode_data_url(
+        &data_url,
+        kf_protocol::OLED_IMG_MAX_DIM,
+        kf_protocol::OLED_IMG_MAX_FRAMES,
+        kf_protocol::OLED_IMG_MAX_BYTES,
+    )
+    .map_err(|e| e.to_string())?;
+
+    state
+        .transport
+        .lock()
+        .unwrap()
+        .push_oled_image(&img.bytes)
+        .map_err(|e| e.to_string())?;
+
+    Ok(ImageUploadResult {
+        width: img.width,
+        height: img.height,
+        frames: img.frames,
+        bytes: img.bytes.len(),
+    })
 }
 
 #[tauri::command]
@@ -174,12 +290,11 @@ fn main() {
     // simulate_board_host_cmd command) sends a binding index here; the listener
     // thread below runs it and emits a `host-cmd` event to the UI.
     let (host_cmd_tx, host_cmd_rx) = channel::<u8>();
-    let bindings = Arc::new(Mutex::new(vec![HostBinding {
-        index: 0,
-        label: "git commit (wip)".into(),
-        command: vec!["git".into(), "commit".into(), "-am".into(), "wip".into()],
-        cwd: None,
-    }]));
+    // Empty: bindings are authored as shell macros in the library and pushed
+    // from the frontend when one is bound to a key. A hardcoded sample would
+    // reappear on every launch and mean a HOST(0) press ran something the user
+    // never wrote.
+    let bindings = Arc::new(Mutex::new(Vec::<HostBinding>::new()));
 
     // Board attach/detach notifications from the HID supervisor. Drained by a
     // listener in `setup` (where an AppHandle exists) and re-emitted to the UI.
@@ -253,10 +368,14 @@ fn main() {
             is_connected,
             board_status,
             board_ping,
+            scan_devices,
             get_keymap,
             set_keymap,
             set_leds,
+            set_anim,
+            set_overlay,
             oled_push,
+            oled_push_image,
             sync_time,
             eeprom_commit,
             get_bindings,

@@ -17,7 +17,8 @@
 //!   moment it is plugged in.
 
 use crate::kf_protocol::{self as kf, BoardModel, REPORT_LEN};
-use crate::model::{KeyMap, Layer, LedState, OledConfig};
+use crate::model::{AnimState, KeyMap, Layer, LedState, OledConfig};
+use crate::products::Version;
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender, TryRecvError};
@@ -30,6 +31,15 @@ pub enum HidError {
     NotConnected,
     #[error("device i/o error: {0}")]
     Io(String),
+}
+
+/// What a board says it is: product line, PCB revision, firmware build.
+#[derive(Debug, Clone, Serialize)]
+pub struct DeviceIdentity {
+    pub product_id: u8,
+    pub product_name: String,
+    pub hardware: Version,
+    pub firmware: Version,
 }
 
 /// Firmware version reported by PING.
@@ -71,6 +81,24 @@ pub trait HidTransport: Send + Sync {
             )));
         }
         Ok(info)
+    }
+
+    /// GET_IDENTITY → product, hardware revision, firmware build.
+    ///
+    /// Separate from `ping`, which only negotiates the protocol version. Kept
+    /// separate on purpose: a protocol-mismatched board still answers PING
+    /// readably, which is how the app can say "your firmware is too old"
+    /// instead of failing with a raw status byte.
+    fn identity(&mut self) -> Result<DeviceIdentity, HidError> {
+        let resp = self.transceive(&kf::identity_frame())?;
+        let name_len = (resp[9] as usize).min(kf::PRODUCT_NAME_MAX);
+        let name = String::from_utf8_lossy(&resp[10..10 + name_len]).into_owned();
+        Ok(DeviceIdentity {
+            product_id: resp[2],
+            product_name: name,
+            hardware: Version::new(resp[3], resp[4], resp[5]),
+            firmware: Version::new(resp[6], resp[7], resp[8]),
+        })
     }
 
     fn get_keymap(&mut self) -> Result<KeyMap, HidError> {
@@ -127,6 +155,51 @@ pub trait HidTransport: Send + Sync {
             expect_ok(&resp)?;
         }
         let resp = self.transceive(&kf::brightness_frame(leds.brightness))?;
+        expect_ok(&resp)
+    }
+
+    /// Upload a QGF image to the board's image screen.
+    ///
+    /// One-time, not per frame: once loaded, `qp_animate` plays it on-device
+    /// with no further host traffic, so the animation survives the app closing.
+    /// A failure part-way leaves the board with no image rather than a corrupt
+    /// one, because `OLED_IMG_END` verifies the byte count before loading.
+    fn push_oled_image(&mut self, image: &[u8]) -> Result<(), HidError> {
+        let resp = self.transceive(&kf::oled_img_begin_frame(image.len() as u32))?;
+        expect_ok(&resp)?;
+        for f in kf::oled_img_data_frames(image) {
+            let resp = self.transceive(&f)?;
+            expect_ok(&resp)?;
+        }
+        let resp = self.transceive(&kf::oled_img_end_frame())?;
+        expect_ok(&resp)
+    }
+
+    /// Select the global animation. QMK's RGB matrix has one mode for the whole
+    /// board, so this is deliberately not per-key — per-key state is colour only.
+    ///
+    /// `AnimState::name` is mapped to a stable wire id here rather than sent
+    /// raw, because QMK's own effect numbers shift with the compiled-in set.
+    fn set_anim(&mut self, anim: &AnimState) -> Result<(), HidError> {
+        let (h, s, v) = anim.hsv();
+        let resp = self.transceive(&kf::set_anim_frame(
+            kf::anim_id(&anim.name),
+            anim.speed,
+            h,
+            s,
+            v,
+        ))?;
+        expect_ok(&resp)
+    }
+
+    /// Hand the LEDs back to the board's own RGB matrix animations (`on = false`)
+    /// or re-assert the host's colour overlay (`on = true`).
+    ///
+    /// This is the only way back: `set_leds` colour data implicitly sets
+    /// `overlay_on = 1` in the firmware, so once the app has pushed colours the
+    /// board renders nothing but that static frame until it is told otherwise.
+    fn set_overlay(&mut self, on: bool) -> Result<(), HidError> {
+        let resp = self.transceive(&kf::overlay_frame(on))?;
         expect_ok(&resp)
     }
 
@@ -190,6 +263,9 @@ fn screen_kind_to_type(kind: &str) -> u8 {
         "timer" => kf::SCREEN_TIMER,
         "countdown" => kf::SCREEN_COUNTDOWN,
         "datetime" => kf::SCREEN_DATETIME,
+        "pomodoro" => kf::SCREEN_POMODORO,
+        // The app calls it a "gif" screen; the firmware calls it an image screen.
+        "image" => kf::SCREEN_IMAGE,
         _ => kf::SCREEN_CUSTOM_TEXT,
     }
 }
@@ -528,6 +604,163 @@ mod tests {
         leds.underglow[0] = [0, 255, 0];
         leds.brightness = 123;
         assert!(hid.set_leds(&leds).is_ok());
+        // The brightness byte is fed by the UI's global control, so pin that it
+        // actually lands on the board rather than just being accepted.
+        assert_eq!(hid.board.brightness, 123);
+        assert_eq!(hid.board.rgb[4], [255, 0, 0]);
+    }
+
+    /// The upload is a three-phase handshake, so a partial transfer must fail
+    /// rather than leave the board loading a truncated QGF.
+    #[test]
+    fn oled_image_upload_round_trips_and_rejects_short_uploads() {
+        let mut hid = MockHid::new();
+        // Not a real QGF — the mock models the buffer handshake, not the parse.
+        let image: Vec<u8> = (0..500u32).map(|i| (i % 251) as u8).collect();
+        assert!(hid.push_oled_image(&image).is_ok());
+        assert!(hid.board.oled_img_ready);
+        assert_eq!(hid.board.oled_img_received, image.len(), "every byte arrived");
+        assert_eq!(hid.board.oled_img_expected, 0, "no upload left in flight");
+
+        // A second upload must start clean rather than accumulate on the first.
+        assert!(hid.push_oled_image(&image).is_ok());
+        assert_eq!(hid.board.oled_img_received, image.len());
+
+        // BEGIN then END with no data must not mark an image ready.
+        hid.transceive(&kf::oled_img_begin_frame(500)).unwrap();
+        let resp = hid.transceive(&kf::oled_img_end_frame()).unwrap();
+        assert_eq!(resp[2], kf::STATUS_ERROR, "short upload must be rejected");
+        assert!(!hid.board.oled_img_ready);
+    }
+
+    /// Probe a physically attached board and print what PING returns.
+    ///
+    /// `#[ignore]` because it needs real hardware. Run with:
+    ///   cargo test real_board_ping -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn real_board_ping() {
+        let (host_cmd_tx, _rx) = channel::<u8>();
+        let (conn_tx, _crx) = channel::<bool>();
+        let mut hid = RealHid::start(host_cmd_tx, conn_tx);
+
+        // The supervisor rescans every second while dark; give it a few tries.
+        let mut waited = 0;
+        while !hid.is_connected() && waited < 6000 {
+            std::thread::sleep(Duration::from_millis(250));
+            waited += 250;
+        }
+        if !hid.is_connected() {
+            println!("NO BOARD ATTACHED (nothing on {:#06x}/{:#06x})", kf::VENDOR_ID, kf::PRODUCT_ID);
+            return;
+        }
+
+        // Raw frame first, so a version mismatch still shows the bytes instead
+        // of being swallowed by ping()'s error path.
+        let raw = hid.transceive(&kf::ping_frame()).expect("ping transceive");
+        println!("PING raw response: {:02X?}", &raw[..8]);
+        println!(
+            "  magic=0x{:02X} cmd=0x{:02X} protocol=v{} firmware=v{}.{}",
+            raw[0], raw[1], raw[2], raw[3], raw[4]
+        );
+        println!("  app expects protocol v{}", kf::PROTOCOL_VERSION);
+        if raw[2] != kf::PROTOCOL_VERSION {
+            println!(
+                "  => MISMATCH: board is v{}, app is v{} — ping() rejects this",
+                raw[2],
+                kf::PROTOCOL_VERSION
+            );
+        } else {
+            println!("  => match");
+        }
+
+        match hid.ping() {
+            Ok(info) => println!("ping() -> Ok({info:?})"),
+            Err(e) => println!("ping() -> Err({e})"),
+        }
+    }
+
+    /// Identity must decode to the three separate layers, and must resolve
+    /// against the capability table — that lookup is what tells the app this
+    /// board has no encoder push.
+    #[test]
+    fn identity_decodes_and_resolves_capabilities() {
+        use crate::products;
+        let mut hid = MockHid::new();
+        let id = hid.identity().unwrap();
+
+        assert_eq!(id.product_id, 0x01);
+        assert_eq!(id.product_name, "Macro Pad Pro");
+        assert_eq!(id.hardware.to_string(), "1.0.0");
+        assert_eq!(id.firmware.to_string(), "0.2.0");
+
+        let spec = products::lookup(id.product_id, id.hardware).expect("known product");
+        assert!(!spec.capabilities.encoder_push, "rev 1.0.0 has no encoder push");
+        assert_eq!(spec.default_special_enter, Some(5));
+    }
+
+    /// Every screen kind the frontend can emit must map to a distinct firmware
+    /// type. A missing arm silently falls through to CUSTOM_TEXT, which is how
+    /// the image screen first shipped rendering as an empty text screen.
+    #[test]
+    fn every_screen_kind_maps_to_its_own_firmware_type() {
+        assert_eq!(screen_kind_to_type("timer"), kf::SCREEN_TIMER);
+        assert_eq!(screen_kind_to_type("countdown"), kf::SCREEN_COUNTDOWN);
+        assert_eq!(screen_kind_to_type("datetime"), kf::SCREEN_DATETIME);
+        assert_eq!(screen_kind_to_type("pomodoro"), kf::SCREEN_POMODORO);
+        assert_eq!(screen_kind_to_type("image"), kf::SCREEN_IMAGE);
+        assert_eq!(screen_kind_to_type("custom"), kf::SCREEN_CUSTOM_TEXT);
+        assert_eq!(screen_kind_to_type("something else"), kf::SCREEN_CUSTOM_TEXT);
+    }
+
+    /// End to end: a real encoded QGF through the real chunker into the board
+    /// model. Catches an off-by-one between the encoder's size, the chunking,
+    /// and the board's byte accounting — which a hand-made byte vector would not.
+    #[test]
+    fn real_qgf_survives_encode_chunk_and_upload() {
+        use crate::qgf;
+        let img = image::RgbaImage::from_fn(48, 32, |x, y| {
+            image::Rgba([(x * 5) as u8, (y * 7) as u8, 128, 255])
+        });
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+
+        let encoded = qgf::encode_bytes(&png, 128, 8, kf::OLED_IMG_MAX_BYTES).unwrap();
+        assert_eq!((encoded.width, encoded.height), (48, 32));
+
+        let mut hid = MockHid::new();
+        hid.push_oled_image(&encoded.bytes).unwrap();
+        assert!(hid.board.oled_img_ready);
+        assert_eq!(
+            hid.board.oled_img_received,
+            encoded.bytes.len(),
+            "every encoded byte must reach the board exactly once"
+        );
+
+        // And the chunking must never exceed what one report can carry.
+        for f in kf::oled_img_data_frames(&encoded.bytes) {
+            assert!(f[5] as usize <= kf::OLED_IMG_CHUNK_MAX);
+        }
+    }
+
+    /// Pins the bug `set_overlay` exists to fix: colour data implicitly turns
+    /// the overlay ON in firmware, so without an explicit off the board is
+    /// locked to that static frame and can never return to its own animations.
+    #[test]
+    fn set_overlay_hands_the_leds_back_after_a_colour_push() {
+        let mut hid = MockHid::new();
+        let mut leds = LedState::all_off(kf::KEY_COUNT);
+        leds.keys[0] = [255, 0, 0];
+        hid.set_leds(&leds).unwrap();
+        assert!(hid.board.overlay_on, "colour data must imply overlay on");
+
+        hid.set_overlay(false).unwrap();
+        assert!(!hid.board.overlay_on, "overlay off returns the board to its own effects");
+
+        hid.set_overlay(true).unwrap();
+        assert!(hid.board.overlay_on, "overlay on re-asserts the host's colours");
     }
 
     #[test]

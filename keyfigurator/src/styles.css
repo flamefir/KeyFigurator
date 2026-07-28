@@ -7,6 +7,9 @@
   --sel:   #ffb454;
   --amber: #ff7a1e;
   --titlebar-h: 32px;
+  /* Vertical room reserved for the fixed top-corner UI. The editor's nav is
+     taller than the home page's because it carries the device identity block. */
+  --nav-clear: 60px;
   --ug-color: 255, 110, 20; /* underglow RGB — changed via JS/localStorage */
   --ug-c0: 255, 110, 20;   /* per-corner colors for solid preview — set by applyCornerColors() */
   --ug-c1: 255, 110, 20;
@@ -29,7 +32,10 @@ body {
   align-items: center;
   justify-content: flex-start;
   gap: 10px;
-  padding: calc(var(--titlebar-h) + 60px) 20px 40px;
+  /* Top padding must clear the FIXED corner elements (Home + device info on the
+     left, Saved Layers on the right), which are out of flow and would otherwise
+     be overlapped by the first row of content. */
+  padding: calc(var(--titlebar-h) + var(--nav-clear)) 20px 40px;
   overflow-y: auto;
   background: var(--bg);
   color: var(--txt);
@@ -79,23 +85,404 @@ body {
 #btn-close:hover            { background: rgba(200, 36, 36, 0.75); color: #fff; }
 
 /* ── Fixed app title — top-left ──────────────────────────────────────────── */
-.app-title {
+.app-nav {
   position: fixed;
   top: calc(var(--titlebar-h) + 10px);
   left: 16px;
+  z-index: 100;
+}
+/* Only meaningful inside the editor — the home page has nowhere to go back to. */
+body:not(.editor) .app-nav { display: none; }
+/* Home link + name + meta + a possible capability warning stack up well past
+   the 60px the home page needs. */
+body.editor { --nav-clear: 118px; }
+
+.app-home {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  background: none;
+  border: none;
+  padding: 0;
   font-size: 15px;
   font-weight: 600;
   color: var(--txt);
   letter-spacing: 0.03em;
-  pointer-events: none;
-  z-index: 100;
+  cursor: pointer;
+  transition: color 0.15s;
 }
+.app-home:hover { color: var(--sel); }
+.app-home-arrow { font-size: 17px; line-height: 1; transition: transform 0.15s; }
+.app-home:hover .app-home-arrow { transform: translateX(-3px); }
+
+/* Device identity — the same facts the home page card shows. Width-capped so a
+   long product name cannot run under the centre content. */
+.app-device { margin-top: 12px; max-width: 260px; }
+.app-device-name {
+  display: flex; align-items: center; gap: 7px;
+  font-size: 13px; color: var(--txt);
+}
+.app-device-meta {
+  font-size: 11px; color: var(--muted); margin-top: 3px;
+  display: flex; gap: 9px; flex-wrap: wrap; align-items: center;
+}
+.app-device-meta b { color: var(--txt); font-weight: 500; }
+.app-device-meta .sep { opacity: 0.4; }
+.app-device-warn { font-size: 11px; color: var(--sel); margin-top: 3px; }
+
+/* ── Home page — device list ──────────────────────────────────────────────── */
+.home {
+  position: fixed;
+  inset: calc(var(--titlebar-h)) 0 0 0;
+  background: var(--bg);
+  overflow-y: auto;
+  padding: 56px 32px 32px;
+  z-index: 90;
+}
+body.editor .home { display: none; }
+
+/* The editor chrome only exists once a device is chosen — hiding it by default
+   means the home page cannot flash the board behind it on first paint. */
+body:not(.editor) .sl-wrap,
+body:not(.editor) header,
+body:not(.editor) .board-wrap,
+body:not(.editor) #key-tooltip { display: none; }
+
+.home-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  max-width: 900px;
+  margin: 0 auto 22px;
+}
+.home-title { font-size: 22px; font-weight: 600; color: var(--txt); margin: 0; letter-spacing: 0.02em; }
+.home-add {
+  background: none;
+  border: 1px solid var(--sel);
+  color: var(--sel);
+  border-radius: 20px;
+  font-size: 14px;
+  padding: 8px 18px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+.home-add:hover { background: var(--sel); color: #1c1d24; }
+.home-add:disabled { opacity: 0.5; cursor: default; background: none; color: var(--sel); }
+
+.home-list { max-width: 900px; margin: 0 auto; display: flex; flex-direction: column; gap: 12px; }
+
+/* Scan result notice. Persists until the next scan rather than auto-hiding —
+   "nothing found" is the result you most need to keep reading. */
+.scan-notice {
+  max-width: 900px;
+  margin: 0 auto 14px;
+  display: none;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 14px 18px;
+  font-size: 13px;
+  color: var(--muted);
+  background: var(--panel);
+}
+.scan-notice.show { display: block; }
+.scan-notice.warn { border-color: #6b5836; }
+.scan-notice.ok   { border-color: #2f5a3d; }
+.scan-notice-title { color: var(--txt); font-size: 14px; font-weight: 500; margin-bottom: 6px; }
+.scan-notice ul { margin: 8px 0 0; padding-left: 18px; line-height: 1.8; }
+.scan-notice code {
+  background: var(--bg); border: 1px solid var(--line); border-radius: 4px;
+  padding: 1px 5px; font-size: 12px; color: var(--sel);
+}
+.scan-notice-actions { margin-top: 12px; display: flex; gap: 8px; }
+.scan-notice-close {
+  background: none; border: none; color: var(--muted);
+  cursor: pointer; font-size: 12px; text-decoration: underline;
+}
+.scan-notice-close:hover { color: var(--sel); }
+
+.device-card {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 16px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 16px 20px;
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+.device-card:hover { border-color: var(--sel); }
+.device-card.unknown { border-style: dashed; }
+
+.device-dot { width: 10px; height: 10px; border-radius: 50%; background: #d15a5a; flex: none; }
+.device-dot.ok { background: #5ad17a; }
+
+.device-name { font-size: 16px; color: var(--txt); font-weight: 500; }
+.device-meta { font-size: 12px; color: var(--muted); margin-top: 4px; display: flex; gap: 14px; flex-wrap: wrap; }
+.device-meta b { color: var(--txt); font-weight: 500; }
+.device-warn { font-size: 12px; color: var(--sel); margin-top: 5px; }
+
+.device-transport {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 11px; color: var(--muted);
+  border: 1px solid var(--line); border-radius: 14px; padding: 4px 10px;
+}
+
+.device-actions { display: flex; align-items: center; gap: 10px; }
+.device-del {
+  background: none; border: 1px solid var(--line); color: var(--muted);
+  border-radius: 50%; width: 26px; height: 26px; line-height: 1;
+  cursor: pointer; font-size: 12px;
+  transition: border-color 0.15s, color 0.15s;
+}
+.device-del:hover { border-color: #d15a5a; color: #d15a5a; }
+
+/* ── Macro library ────────────────────────────────────────────────────────── */
+.lib-head { margin-top: 40px; }
+.lib-actions { display: flex; align-items: center; gap: 8px; }
+.lib-selcount { font-size: 12px; color: var(--muted); margin-right: 4px; }
+.home-add.ghost { border-color: var(--line); color: var(--muted); font-size: 13px; padding: 7px 14px; }
+.home-add.ghost:hover:not(:disabled) { border-color: var(--sel); color: var(--sel); background: none; }
+.home-add.ghost.danger:hover:not(:disabled) { border-color: #d15a5a; color: #d15a5a; }
+label.home-add.ghost { cursor: pointer; display: inline-block; }
+
+/* Library tiles — the folder level */
+.lib-grid {
+  max-width: 900px; margin: 0 auto;
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 14px;
+}
+.lib-tile {
+  position: relative;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+  padding: 20px 16px; cursor: pointer; text-align: center;
+  transition: border-color 0.15s, transform 0.12s;
+}
+.lib-tile:hover { border-color: var(--sel); transform: translateY(-2px); }
+.lib-tile-icon { font-size: 30px; opacity: 0.85; }
+.lib-tile-name { font-size: 15px; color: var(--txt); font-weight: 500; margin-top: 8px; word-break: break-word; }
+.lib-tile-sub  { font-size: 12px; color: var(--muted); margin-top: 3px; }
+.lib-tile-desc { font-size: 11px; color: var(--muted); margin-top: 6px; opacity: 0.8; }
+.lib-tile-del {
+  position: absolute; top: 8px; right: 8px;
+  background: none; border: 1px solid transparent; color: var(--muted);
+  border-radius: 50%; width: 22px; height: 22px; font-size: 11px; cursor: pointer;
+  opacity: 0; transition: opacity 0.15s, color 0.15s, border-color 0.15s;
+}
+.lib-tile:hover .lib-tile-del { opacity: 1; }
+.lib-tile-del:hover { border-color: #d15a5a; color: #d15a5a; }
+
+.lib-crumb { max-width: 900px; margin: 0 auto 14px; }
+.lib-back {
+  background: none; border: none; color: var(--muted);
+  font-size: 13px; cursor: pointer; padding: 4px 0;
+}
+.lib-back:hover { color: var(--sel); }
+
+/* Test playback */
+.macro-test-title { flex: 1; font-size: 15px; color: var(--txt); font-weight: 500; }
+.macro-test-queue {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  font-size: 12px; color: var(--muted);
+}
+.mt-q { border: 1px solid var(--line); border-radius: 12px; padding: 3px 10px; }
+.mt-q.active { border-color: var(--sel); color: var(--sel); }
+.mt-q.done { opacity: 0.45; }
+.mt-arrow { opacity: 0.4; }
+.macro-test-steps {
+  background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+  padding: 10px 12px; max-height: 210px; overflow-y: auto;
+  font-family: 'Courier New', monospace; font-size: 12px;
+}
+.mt-step { color: var(--muted); padding: 2px 0; white-space: pre; transition: color 0.1s; }
+.mt-step.done { opacity: 0.45; }
+.mt-step.active { color: var(--sel); font-weight: bold; }
+.macro-test-out {
+  background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+  padding: 10px 12px; min-height: 54px;
+  font-family: 'Courier New', monospace; font-size: 13px; color: var(--txt);
+  white-space: pre-wrap; word-break: break-all;
+}
+
+/* Per-key macro binding */
+.kc-macro-row { display: flex; align-items: center; gap: 10px; padding: 6px 0 2px; }
+.kc-macro-select {
+  flex: 1; min-width: 0;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+  color: var(--txt); font-size: 13px; padding: 7px 10px; cursor: pointer;
+}
+.kc-macro-select:hover { border-color: var(--sel); }
+.kc-macro-slot { font-size: 11px; color: var(--muted); white-space: nowrap; }
+.kc-macro-note { font-size: 11px; color: var(--muted); padding: 0 0 8px; line-height: 1.6; }
+.kc-macro-note.warn { color: var(--sel); }
+
+.macro-card {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 14px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 14px 18px;
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+.macro-card:hover { border-color: var(--sel); }
+.macro-card.selected { border-color: var(--sel); }
+.macro-card input[type="checkbox"] { accent-color: var(--sel); width: 16px; height: 16px; cursor: pointer; }
+.macro-card-name { font-size: 15px; color: var(--txt); font-weight: 500; }
+.macro-card-desc { font-size: 12px; color: var(--muted); margin-top: 3px; }
+.macro-card-steps { font-size: 11px; color: var(--muted); border: 1px solid var(--line); border-radius: 12px; padding: 3px 10px; }
+/* Library rename. Macros have no equivalent because clicking a macro card
+   opens its editor, where the name field already lives — clicking a library
+   tile browses into it instead, so this is the only way to rename one. */
+.lib-tile-rename {
+  position: absolute; top: 8px; left: 8px;
+  background: none; border: 1px solid transparent; color: var(--muted);
+  border-radius: 50%; width: 22px; height: 22px; font-size: 11px;
+  cursor: pointer; opacity: 0; transition: opacity 0.15s, color 0.15s, border-color 0.15s;
+}
+.lib-tile:hover .lib-tile-rename { opacity: 1; }
+.lib-tile-rename:hover { border-color: var(--sel); color: var(--sel); }
+
+/* Inline rename field — sized to sit in place of the label it replaces. */
+.inline-rename {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--sel);
+  border-radius: 6px;
+  color: var(--txt);
+  font-size: inherit;
+  font-family: inherit;
+  padding: 3px 7px;
+}
+.lib-tile-name .inline-rename { text-align: center; }
+
+/* Editor overlay */
+.macro-editor {
+  position: fixed; inset: 0; z-index: 300;
+  background: rgba(10, 11, 14, 0.72);
+  display: none; align-items: center; justify-content: center;
+}
+.macro-editor.open { display: flex; }
+.macro-editor-modal {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+  padding: 22px; width: min(560px, 92vw); display: flex; flex-direction: column; gap: 12px;
+}
+.macro-editor-head { display: flex; align-items: center; gap: 10px; }
+.macro-name-inp {
+  flex: 1; background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+  color: var(--txt); font-size: 16px; padding: 9px 12px;
+}
+.macro-desc-inp {
+  background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+  color: var(--muted); font-size: 13px; padding: 8px 12px;
+}
+.macro-close {
+  background: none; border: 1px solid var(--line); color: var(--muted);
+  border-radius: 50%; width: 28px; height: 28px; cursor: pointer;
+}
+.macro-close:hover { border-color: var(--sel); color: var(--sel); }
+.macro-hint { font-size: 11px; color: var(--muted); line-height: 1.7; }
+.macro-hint code {
+  background: var(--bg); border: 1px solid var(--line); border-radius: 4px;
+  padding: 1px 5px; font-size: 11px; color: var(--sel);
+}
+.macro-actions-inp {
+  background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+  color: var(--txt); font-family: 'Courier New', monospace; font-size: 13px;
+  padding: 10px 12px; min-height: 170px; resize: vertical; line-height: 1.6;
+}
+/* Keystrokes vs shell script */
+.macro-kind { display: flex; gap: 8px; }
+.macro-kind-btn {
+  flex: 1;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+  color: var(--muted); font-size: 13px; padding: 8px 10px; cursor: pointer;
+  transition: border-color 0.15s, color 0.15s;
+}
+.macro-kind-btn:hover { border-color: var(--sel); }
+.macro-kind-btn.active { border-color: var(--sel); color: var(--sel); }
+
+/* Terminal-style script editor. The chrome is deliberate: a shell script runs
+   on this machine, and it should not look like just another text box. */
+.term {
+  border: 1px solid #0d0f13;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #0b0d11;
+  box-shadow: 0 4px 18px rgba(0,0,0,0.45);
+}
+.term-bar {
+  display: flex; align-items: center; gap: 6px;
+  background: #191c22; border-bottom: 1px solid #0d0f13;
+  padding: 7px 10px;
+}
+.term-dot { width: 10px; height: 10px; border-radius: 50%; }
+.term-dot.red   { background: #ec6a5e; }
+.term-dot.amber { background: #f4bf4f; }
+.term-dot.green { background: #61c554; }
+.term-title {
+  margin-left: 6px; font-size: 11px; color: var(--muted);
+  font-family: 'Courier New', monospace;
+}
+.term-body { display: flex; align-items: stretch; max-height: 260px; }
+.term-gutter {
+  padding: 10px 0 10px 10px;
+  color: #4a5160;
+  font-family: 'Courier New', monospace;
+  font-size: 13px; line-height: 1.6;
+  text-align: right;
+  user-select: none;
+  min-width: 30px;
+  white-space: pre;
+  overflow: hidden;
+}
+.term-input {
+  flex: 1;
+  background: transparent;
+  border: none;
+  outline: none;
+  resize: vertical;
+  color: #d7f5c8;
+  font-family: 'Courier New', monospace;
+  font-size: 13px; line-height: 1.6;
+  padding: 10px 12px;
+  min-height: 190px;
+  caret-color: #61c554;
+  white-space: pre;
+  overflow-wrap: normal;
+  overflow-x: auto;
+}
+.term-input::placeholder { color: #46505f; }
+
+.macro-cwd { display: flex; align-items: center; gap: 10px; }
+.macro-cwd input {
+  flex: 1; background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+  color: var(--txt); font-size: 12px; padding: 7px 10px;
+  font-family: 'Courier New', monospace;
+}
+
+.macro-editor-err { font-size: 12px; color: #d15a5a; min-height: 16px; }
+.macro-editor-actions { display: flex; justify-content: flex-end; gap: 10px; }
+
+.home-empty { max-width: 900px; margin: 60px auto; text-align: center; color: var(--muted); }
+.home-empty-icon { font-size: 40px; opacity: 0.35; }
+.home-empty-title { font-size: 16px; color: var(--txt); margin-top: 12px; }
+.home-empty-sub { font-size: 13px; margin-top: 6px; }
+.home-empty b { color: var(--sel); font-weight: 500; }
 
 /* ── Header (connection pill + save button) ──────────────────────────────── */
 header {
   display: flex;
   align-items: center;
+  justify-content: center;
   gap: 10px;
+  /* Wrap rather than overflow — min-width keeps the corners clear, but the
+     header still has to survive being squeezed toward it. */
+  flex-wrap: wrap;
+  max-width: 100%;
 }
 
 .save-board-btn {
@@ -118,6 +505,34 @@ header {
   color: var(--muted);
 }
 .pill.ok { color: #5ad17a; border-color: #2f5a3d; }
+
+/* Global board LED controls (brightness 0xF0 + overlay 0xF1/0xF2) */
+.bright-ctl {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 12px;
+  border: 1px solid var(--line);
+  border-radius: 20px;
+}
+.bright-ctl input[type="range"] { width: 90px; accent-color: var(--sel); cursor: pointer; }
+.bright-val {
+  font-size: 12px;
+  color: var(--muted);
+  min-width: 34px;
+  text-align: right;
+}
+.overlay-ind {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  padding: 5px 12px;
+}
+.overlay-state { font-size: 13px; color: var(--sel); }
+/* Board-driven: the app's colours are not what's on the keyboard right now. */
+.overlay-ind.board-driven .overlay-state { color: var(--muted); }
 
 /* ── Saved Layers — fixed top-right, pure-hover ──────────────────────────── */
 .sl-wrap {
@@ -1099,8 +1514,11 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 50%; }
   color: var(--sel);
   border-color: var(--sel);
 }
-.enc-cw  { bottom: -5px; right:  -6px; }
-.enc-ccw { bottom: -5px; left:   -6px; }
+/* Overhang must stay INSIDE the board's 6px grid gap. At -5px these buttons
+   reached the key below the encoder and, at z-index 5, swallowed clicks meant
+   for it — which reads as "that key cannot be configured". */
+.enc-cw  { bottom: -2px; right:  -4px; }
+.enc-ccw { bottom: -2px; left:   -4px; }
 
 /* ── OLED pill ───────────────────────────────────────────────────────────── */
 .oled-pill-nav {
@@ -1376,6 +1794,12 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 50%; }
   text-shadow: 0 0 6px rgba(255,180,84,.9), 0 0 16px rgba(255,180,84,.5);
   letter-spacing: 0.04em;
 }
+/* Break phases render green on the board (COL_GREEN in display.c), so the
+   preview matches. */
+.oled-time-val.oled-pomo-break {
+  color: #5ad17a;
+  text-shadow: 0 0 6px rgba(90,209,122,.9), 0 0 16px rgba(90,209,122,.5);
+}
 .oled-screen-hint {
   color: rgba(255,180,84,0.30);
   font-family: 'Courier New', monospace; font-size: 8px; letter-spacing: 0.05em;
@@ -1586,6 +2010,24 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 50%; }
   z-index: 1;
   pointer-events: none;
   transform: translateY(-4px);
+  /* Clamp to 3 lines and ellipsise: a keycap is 56px, so anything longer has to
+     be cut somewhere — better a visible "…" than text spilling over the cap. */
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  overflow: hidden;
+  max-width: calc(100% - 6px);
+  text-align: center;
+  line-height: 1.15;
+  overflow-wrap: anywhere;
+}
+/* Macro names are arbitrary text rather than a short keycode, so they need the
+   extra room that a smaller size buys. */
+.key-label.macro {
+  font-size: 9px;
+  line-height: 1.1;
+  letter-spacing: -0.01em;
 }
 
 /* ── Key icon image (shown on keycap when image is uploaded) ─────────────── */
