@@ -187,6 +187,32 @@ pub struct OledScreen {
     pub body: String,
 }
 
+/// Pomodoro phase durations in minutes, plus how many work phases earn a long
+/// break instead of a short one.
+///
+/// These live on the board (the pomodoro runs on-device so it keeps counting
+/// with the app closed), so this is push-only configuration, not live state.
+/// `Default` matches the firmware's compile-time defaults, which is also what
+/// a board that has never been configured is already running.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct PomodoroConfig {
+    pub work_min: u8,
+    pub short_break_min: u8,
+    pub long_break_min: u8,
+    pub long_every: u8,
+}
+
+impl Default for PomodoroConfig {
+    fn default() -> Self {
+        Self {
+            work_min: 25,
+            short_break_min: 5,
+            long_break_min: 15,
+            long_every: 4,
+        }
+    }
+}
+
 /// The full OLED configuration the app pushes to the board. RAM-only on the
 /// firmware side, so the app re-pushes this on every reconnect.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -197,6 +223,21 @@ pub struct OledConfig {
     pub screens: Vec<OledScreen>,
     /// Single global countdown duration: hours, minutes, seconds.
     pub countdown: (u8, u8, u8),
+    /// Absent from an older frontend's payload, so it defaults rather than
+    /// failing to deserialize.
+    #[serde(default)]
+    pub pomodoro: PomodoroConfig,
+    /// Which screens may blank themselves after `sleep_timeout_s` idle, as a
+    /// bitmap over the board's nav-index space: bits 0..3 are the four layer
+    /// screens, bits 4..9 the custom screens in order. Empty by default.
+    #[serde(default)]
+    pub sleep_mask: u16,
+    #[serde(default = "default_sleep_timeout")]
+    pub sleep_timeout_s: u8,
+}
+
+fn default_sleep_timeout() -> u8 {
+    60
 }
 
 /// A host-side command bound to a HOST(n) key. When the board sends a

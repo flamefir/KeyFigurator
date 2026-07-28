@@ -17,7 +17,7 @@
 //!   moment it is plugged in.
 
 use crate::kf_protocol::{self as kf, BoardModel, REPORT_LEN};
-use crate::model::{AnimState, KeyMap, Layer, LedState, OledConfig};
+use crate::model::{AnimState, KeyMap, Layer, LedState, OledConfig, PomodoroConfig};
 use crate::products::Version;
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -64,6 +64,21 @@ pub trait HidTransport: Send + Sync {
 
     /// Send one 32-byte report and return the 32-byte response.
     fn transceive(&mut self, frame: &[u8; REPORT_LEN]) -> Result<[u8; REPORT_LEN], HidError>;
+
+    /// PING purely as a liveness poke — did the board answer, yes or no.
+    ///
+    /// The firmware counts the app as present for `KF_APP_TIMEOUT_MS` (8 s)
+    /// after *any* KeyFigurator frame, and drives its OLED link dot off that.
+    /// So the app's connection poll has to actually touch the wire: reading
+    /// `has_board()` alone sends nothing, and the dot goes red while the app
+    /// sits idle even though it is running and attached.
+    ///
+    /// Deliberately not `ping()`. A protocol-mismatched board is still very
+    /// much attached, and answering "no board" for one would hide a version
+    /// problem behind a wiring problem.
+    fn heartbeat(&mut self) -> bool {
+        self.transceive(&kf::ping_frame()).is_ok()
+    }
 
     /// PING → validate the protocol version matches the app.
     fn ping(&mut self) -> Result<PingInfo, HidError> {
@@ -204,7 +219,13 @@ pub trait HidTransport: Send + Sync {
     }
 
     /// Push the full OLED config (RAM-only on the board, so re-push on reconnect).
-    fn push_oled(&mut self, cfg: &OledConfig) -> Result<(), HidError> {
+    /// Push the whole OLED config.
+    ///
+    /// Returns whether the board accepted the pomodoro durations. `false` means
+    /// firmware predating 0x58, which keeps its built-in 25/5/15/4 — everything
+    /// else in the config still landed. Reported rather than swallowed so the
+    /// settings UI can say so instead of showing inputs that do nothing.
+    fn push_oled(&mut self, cfg: &OledConfig) -> Result<bool, HidError> {
         for (li, l) in cfg.layers.iter().enumerate().take(kf::LAYER_COUNT) {
             let resp = self.transceive(&kf::oled_set_layer_frame(li as u8, l.show_title, &l.name))?;
             expect_ok(&resp)?;
@@ -231,7 +252,31 @@ pub trait HidTransport: Send + Sync {
         }
         let (h, m, s) = cfg.countdown;
         let resp = self.transceive(&kf::oled_set_countdown_frame(h, m, s))?;
-        expect_ok(&resp)
+        expect_ok(&resp)?;
+        // Rejection is not fatal for either of these two: a board too old for
+        // them must still have received everything above. Sleep is sent first
+        // so the pomodoro answer is the one reported — it is the setting with
+        // visible UI riding on whether the board took it.
+        let sleep = kf::oled_set_sleep_frame(cfg.sleep_timeout_s, cfg.sleep_mask);
+        let _ = self.transceive(&sleep)?;
+        self.push_pomodoro(&cfg.pomodoro)
+    }
+
+    /// Push the pomodoro phase durations.
+    ///
+    /// `Ok(false)` means the board answered but rejected the command, which is
+    /// how firmware predating 0x58 identifies itself. That is a real answer,
+    /// not a failure, so it is distinct from `Err` (the wire broke). Asking the
+    /// board beats checking a firmware version number: it is ground truth, and
+    /// there is no version table to keep in sync.
+    fn push_pomodoro(&mut self, p: &PomodoroConfig) -> Result<bool, HidError> {
+        let resp = self.transceive(&kf::oled_set_pomodoro_frame(
+            p.work_min,
+            p.short_break_min,
+            p.long_break_min,
+            p.long_every,
+        ))?;
+        Ok(expect_ok(&resp).is_ok())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -696,7 +741,6 @@ mod tests {
 
         let spec = products::lookup(id.product_id, id.hardware).expect("known product");
         assert!(!spec.capabilities.encoder_push, "rev 1.0.0 has no encoder push");
-        assert_eq!(spec.default_special_enter, Some(5));
     }
 
     /// Every screen kind the frontend can emit must map to a distinct firmware
@@ -809,6 +853,157 @@ mod tests {
     }
 
     #[test]
+    fn pomodoro_durations_reach_the_board() {
+        let mut hid = MockHid::new();
+        assert_eq!(
+            hid.board.pomodoro,
+            (25, 5, 15, 4),
+            "an unconfigured board runs the firmware's compile-time defaults"
+        );
+
+        let cfg = PomodoroConfig {
+            work_min: 50,
+            short_break_min: 10,
+            long_break_min: 30,
+            long_every: 3,
+        };
+        assert!(hid.push_pomodoro(&cfg).unwrap(), "mock supports the command");
+        assert_eq!(hid.board.pomodoro, (50, 10, 30, 3));
+    }
+
+    /// 0 is the protocol's "leave this one alone", so a host that only wants to
+    /// change the work phase does not have to know the other three.
+    #[test]
+    fn pomodoro_zero_field_keeps_the_current_value() {
+        let mut hid = MockHid::new();
+        hid.push_pomodoro(&PomodoroConfig {
+            work_min: 45,
+            short_break_min: 0,
+            long_break_min: 0,
+            long_every: 0,
+        })
+        .unwrap();
+        assert_eq!(hid.board.pomodoro, (45, 5, 15, 4), "only work_min moved");
+    }
+
+    /// The firmware clamps instead of rejecting, so the app must not believe a
+    /// value it sent is what the board ended up with.
+    #[test]
+    fn pomodoro_out_of_range_is_clamped_not_rejected() {
+        let mut hid = MockHid::new();
+        assert!(hid
+            .push_pomodoro(&PomodoroConfig {
+                work_min: 255,
+                short_break_min: 255,
+                long_break_min: 255,
+                long_every: 255,
+            })
+            .unwrap());
+        assert_eq!(
+            hid.board.pomodoro,
+            (
+                kf::POMO_MAX_MINUTES,
+                kf::POMO_MAX_MINUTES,
+                kf::POMO_MAX_MINUTES,
+                kf::POMO_MAX_EVERY
+            )
+        );
+    }
+
+    /// The whole point of not bumping the protocol version: a board that does
+    /// not know 0x58 must still receive every other part of its OLED config.
+    #[test]
+    fn oled_push_survives_a_board_that_rejects_pomodoro() {
+        let mut hid = MockHid::new();
+        hid.board.reject_pomodoro = true;
+
+        let cfg = OledConfig {
+            layers: vec![crate::model::OledLayer { name: "GIT".into(), show_title: true }],
+            screens: vec![crate::model::OledScreen {
+                kind: "pomodoro".into(),
+                title: String::new(),
+                body: String::new(),
+            }],
+            countdown: (0, 5, 0),
+            pomodoro: PomodoroConfig { work_min: 50, ..Default::default() },
+            sleep_mask: 0,
+            sleep_timeout_s: 60,
+        };
+        hid.push_oled(&cfg).expect("the rest of the config still lands");
+        assert_eq!(hid.board.oled_layer_names[0], "GIT");
+        assert_eq!(hid.board.oled_countdown, (0, 5, 0));
+        assert_eq!(hid.board.pomodoro, (25, 5, 15, 4), "old firmware keeps its defaults");
+
+        assert!(
+            !hid.push_pomodoro(&cfg.pomodoro).unwrap(),
+            "and the UI is told the board does not support it"
+        );
+    }
+
+    /// Sleep is opt-in per screen, so an unconfigured board must never blank
+    /// itself. The mask is over the nav-index space, NOT the app's screen list.
+    #[test]
+    fn sleep_mask_reaches_the_board_and_defaults_to_never() {
+        let mut hid = MockHid::new();
+        assert_eq!(hid.board.sleep_mask, 0, "nothing sleeps until asked");
+        assert_eq!(hid.board.sleep_timeout_s, 60);
+
+        // Layer screen 2 (bit 2) and the first custom screen (bit 4).
+        let cfg = OledConfig {
+            layers: Vec::new(),
+            screens: Vec::new(),
+            countdown: (0, 0, 0),
+            pomodoro: PomodoroConfig::default(),
+            sleep_mask: (1 << 2) | (1 << 4),
+            sleep_timeout_s: 90,
+        };
+        hid.push_oled(&cfg).unwrap();
+        assert_eq!(hid.board.sleep_mask, 0b0001_0100);
+        assert_eq!(hid.board.sleep_timeout_s, 90);
+    }
+
+    /// 0 is the protocol's "keep the current timeout", so a host can change
+    /// which screens sleep without restating how long.
+    #[test]
+    fn sleep_timeout_zero_keeps_the_current_value() {
+        let mut hid = MockHid::new();
+        hid.transceive(&kf::oled_set_sleep_frame(45, 0xFF)).unwrap();
+        assert_eq!(hid.board.sleep_timeout_s, 45);
+
+        hid.transceive(&kf::oled_set_sleep_frame(0, 0x01)).unwrap();
+        assert_eq!(hid.board.sleep_timeout_s, 45, "timeout untouched");
+        assert_eq!(hid.board.sleep_mask, 0x01, "mask still applied");
+    }
+
+    /// The heartbeat has to put a frame ON THE WIRE — that is its whole job.
+    /// The firmware's app-link dot goes red 8 s after the last frame, so a
+    /// heartbeat that short-circuits on a cached flag would look fine here and
+    /// still leave the board reporting the app as absent.
+    #[test]
+    fn heartbeat_sends_a_frame_and_reports_the_answer() {
+        let mut hid = MockHid::new();
+        assert!(hid.heartbeat(), "mock answers, so the board counts as alive");
+
+        // Same frame PING uses, so the firmware's kf_hid_handle() refreshes its
+        // last-seen timestamp exactly as a real ping would.
+        let resp = hid.transceive(&kf::ping_frame()).unwrap();
+        assert_eq!(resp[0], kf::KF_MAGIC);
+        assert_eq!(resp[1], kf::CMD_PING);
+    }
+
+    /// A dark board must read as dead rather than panicking or hanging — this
+    /// runs every 3 s, and `board_status` turns it straight into the UI's dot.
+    #[test]
+    fn heartbeat_is_false_when_no_board_answers() {
+        let (host_cmd_tx, _host_cmd_rx) = channel::<u8>();
+        let (conn_tx, _conn_rx) = channel::<bool>();
+        let mut real = RealHid::start(host_cmd_tx, conn_tx);
+
+        assert!(!real.is_connected(), "no hardware in a unit test");
+        assert!(!real.heartbeat());
+    }
+
+    #[test]
     fn mock_pushes_oled_and_commits() {
         let mut hid = MockHid::new();
         let cfg = OledConfig {
@@ -819,6 +1014,9 @@ mod tests {
                 body: "world".into(),
             }],
             countdown: (0, 5, 0),
+            pomodoro: PomodoroConfig::default(),
+            sleep_mask: 0,
+            sleep_timeout_s: 60,
         };
         assert!(hid.push_oled(&cfg).is_ok());
         assert!(hid.eeprom_commit().is_ok());

@@ -57,6 +57,25 @@ pub const CMD_OLED_SET_LAYER: u8 = 0x50;
 pub const CMD_OLED_SET_SCREENS: u8 = 0x51;
 pub const CMD_OLED_SET_TEXT: u8 = 0x52;
 pub const CMD_OLED_SET_COUNTDOWN: u8 = 0x53;
+/// Deliberately NOT gated behind a protocol-version bump: firmware older than
+/// this command answers STATUS_ERROR and keeps its compile-time defaults, which
+/// is what lets the app keep talking to a board that has not been reflashed.
+pub const CMD_OLED_SET_POMODORO: u8 = 0x58;
+/// Per-screen OLED sleep. Same "not behind a version bump" rule as 0x58:
+/// firmware that predates it answers STATUS_ERROR and simply never sleeps.
+pub const CMD_OLED_SET_SLEEP: u8 = 0x59;
+
+/// Pomodoro limits + defaults, mirroring `KF_POMO_*` in `kf_hid.h`. The board
+/// clamps to these, so the app applies the same bounds rather than letting the
+/// user set a value that silently becomes something else.
+pub const POMO_MIN_MINUTES: u8 = 1;
+pub const POMO_MAX_MINUTES: u8 = 240;
+pub const POMO_MIN_EVERY: u8 = 1;
+pub const POMO_MAX_EVERY: u8 = 16;
+pub const POMO_DEFAULT_WORK_MIN: u8 = 25;
+pub const POMO_DEFAULT_SHORT_BREAK_MIN: u8 = 5;
+pub const POMO_DEFAULT_LONG_BREAK_MIN: u8 = 15;
+pub const POMO_DEFAULT_LONG_EVERY: u8 = 4;
 pub const CMD_OLED_SYNC_TIME: u8 = 0x54;
 pub const CMD_OLED_IMG_BEGIN: u8 = 0x55;
 pub const CMD_OLED_IMG_DATA: u8 = 0x56;
@@ -308,6 +327,30 @@ pub fn oled_set_countdown_frame(h: u8, m: u8, s: u8) -> [u8; REPORT_LEN] {
     frame(CMD_OLED_SET_COUNTDOWN, &[h, m, s])
 }
 
+/// Which screens may blank themselves, as a bitmap over the nav-index space
+/// (bits 0..3 = layer screens, 4..9 = custom screens), and after how long.
+/// A `timeout_s` of 0 leaves the board's current timeout alone.
+pub fn oled_set_sleep_frame(timeout_s: u8, mask: u16) -> [u8; REPORT_LEN] {
+    frame(
+        CMD_OLED_SET_SLEEP,
+        &[timeout_s, (mask & 0xFF) as u8, (mask >> 8) as u8],
+    )
+}
+
+/// Pomodoro phase durations in minutes, plus how many work phases earn a long
+/// break. A zero field means "leave that one alone" on the firmware side.
+pub fn oled_set_pomodoro_frame(
+    work_min: u8,
+    short_break_min: u8,
+    long_break_min: u8,
+    long_every: u8,
+) -> [u8; REPORT_LEN] {
+    frame(
+        CMD_OLED_SET_POMODORO,
+        &[work_min, short_break_min, long_break_min, long_every],
+    )
+}
+
 pub fn oled_sync_time_frame(
     year_2000: u8,
     month: u8,
@@ -507,6 +550,17 @@ pub struct BoardModel {
     pub oled_show_title: [bool; LAYER_COUNT],
     pub oled_screen_types: Vec<u8>,
     pub oled_countdown: (u8, u8, u8),
+    /// Pomodoro durations: (work, short break, long break, long every).
+    /// Starts at the firmware's compile-time defaults, same as a real board.
+    pub pomodoro: (u8, u8, u8, u8),
+    /// Simulate firmware older than SET_POMODORO, which answers STATUS_ERROR
+    /// for an unknown command. The un-reflashed board is a real configuration
+    /// the app has to keep working against, so it is worth modelling.
+    pub reject_pomodoro: bool,
+    /// Per-screen sleep: bitmap over the nav-index space, plus the idle
+    /// timeout. Starts empty — a board nobody configured never goes dark.
+    pub sleep_mask: u16,
+    pub sleep_timeout_s: u8,
     /// Image upload state, mirroring the board's single image buffer.
     pub oled_img_expected: usize,
     pub oled_img_received: usize,
@@ -528,6 +582,15 @@ impl Default for BoardModel {
             oled_show_title: [true; LAYER_COUNT],
             oled_screen_types: Vec::new(),
             oled_countdown: (0, 0, 0),
+            pomodoro: (
+                POMO_DEFAULT_WORK_MIN,
+                POMO_DEFAULT_SHORT_BREAK_MIN,
+                POMO_DEFAULT_LONG_BREAK_MIN,
+                POMO_DEFAULT_LONG_EVERY,
+            ),
+            reject_pomodoro: false,
+            sleep_mask: 0,
+            sleep_timeout_s: 60,
             oled_img_expected: 0,
             oled_img_received: 0,
             oled_img_ready: false,
@@ -696,6 +759,36 @@ impl BoardModel {
             }
             CMD_OLED_SET_COUNTDOWN => {
                 self.oled_countdown = (p[0], p[1], p[2]);
+                r[0] = STATUS_OK;
+            }
+            CMD_OLED_SET_SLEEP => {
+                // Mirrors oled_set_sleep(): timeout 0 keeps the current value.
+                if p[0] > 0 {
+                    self.sleep_timeout_s = p[0];
+                }
+                self.sleep_mask = (p[1] as u16) | ((p[2] as u16) << 8);
+                r[0] = STATUS_OK;
+            }
+            CMD_OLED_SET_POMODORO if self.reject_pomodoro => {
+                // What firmware predating 0x58 does with an unknown command.
+                r[0] = STATUS_ERROR;
+            }
+            CMD_OLED_SET_POMODORO => {
+                // Mirrors kf_hid.c: 0 keeps the current value, everything else
+                // is clamped rather than rejected.
+                let keep_or = |want: u8, current: u8, max: u8| {
+                    if want == 0 {
+                        current
+                    } else {
+                        want.min(max)
+                    }
+                };
+                self.pomodoro = (
+                    keep_or(p[0], self.pomodoro.0, POMO_MAX_MINUTES),
+                    keep_or(p[1], self.pomodoro.1, POMO_MAX_MINUTES),
+                    keep_or(p[2], self.pomodoro.2, POMO_MAX_MINUTES),
+                    keep_or(p[3], self.pomodoro.3, POMO_MAX_EVERY),
+                );
                 r[0] = STATUS_OK;
             }
             CMD_OLED_SYNC_TIME => {

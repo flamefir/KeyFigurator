@@ -66,12 +66,6 @@ pub struct ProductSpec {
     pub name: &'static str,
     pub hardware: Version,
     pub capabilities: Capabilities,
-    /// Key index that acts as "Special Enter" when `encoder_push` is false.
-    ///
-    /// On rev 1.0.0 this is index 5 — the key directly below the encoder,
-    /// shown as "KEY 06" on the board's Present Keys screen (1-based there).
-    /// `None` means the encoder push is available and is the default.
-    pub default_special_enter: Option<usize>,
 }
 
 /// The database. Static and compiled in: it describes hardware that already
@@ -89,8 +83,6 @@ pub const PRODUCTS: &[ProductSpec] = &[ProductSpec {
         has_oled: true,
         has_underglow: true,
     },
-    // No encoder push, so the key under the encoder stands in for it.
-    default_special_enter: Some(5),
 }];
 
 /// Look up an exact product + hardware match.
@@ -131,11 +123,9 @@ mod tests {
     #[test]
     fn rev_1_0_0_has_no_encoder_push_and_names_a_stand_in() {
         let spec = lookup(0x01, Version::new(1, 0, 0)).unwrap();
-        assert!(!spec.capabilities.encoder_push);
-        assert_eq!(
-            spec.default_special_enter,
-            Some(5),
-            "key index 5 (KEY 06, under the encoder) stands in for the missing push"
+        assert!(
+            !spec.capabilities.encoder_push,
+            "rev 1.0.0 has no push switch soldered; screens expose their actions              as assignable OLED events instead"
         );
     }
 

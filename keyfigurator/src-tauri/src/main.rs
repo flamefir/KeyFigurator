@@ -4,6 +4,17 @@
 // app state (which holds the HID transport + host bindings) and delegate. The
 // transport is a `BoardLink`: it drives a real board whenever one is attached
 // and the mock otherwise, hot-swapping between them at any point in the session.
+//
+// EVERY command that touches the wire is `#[tauri::command(async)]`. Tauri runs
+// a plain sync command ON THE MAIN THREAD, and these block: a transceive waits
+// up to TRANSCEIVE_TIMEOUT (3 s), and an image upload is tens of KB in 26-byte
+// chunks, so it blocks for seconds. On the main thread the window stops pumping
+// messages and Windows paints it "Not Responding" — which is exactly what Save
+// to Board did, since it pushes the keymap, LEDs, animation, OLED config AND a
+// forced full image re-upload before committing. `(async)` moves them to the
+// async runtime's pool; the functions stay synchronous, they just don't run
+// where the UI lives. Cheap commands (get/set_bindings, simulate_*) are left
+// sync deliberately — they only touch a Mutex<Vec> or a channel.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -41,16 +52,23 @@ struct BoardStatus {
     transport: &'static str,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn is_connected(state: State<AppState>) -> bool {
     state.transport.lock().unwrap().is_connected()
 }
 
 /// Richer form of `is_connected` — lets the UI distinguish "real board" from
 /// "mock standing in", which a bare bool cannot express.
-#[tauri::command]
+///
+/// This is the frontend's ~3 s connection poll, and it deliberately touches the
+/// wire rather than reading the cached flag. That does two jobs at once: it
+/// refreshes the firmware's app-link timer, which is the only thing that keeps
+/// the board's OLED status dot green while the app sits idle, and it catches a
+/// board that has gone away before the supervisor thread has noticed.
+#[tauri::command(async)]
 fn board_status(state: State<AppState>) -> BoardStatus {
-    let connected = state.transport.lock().unwrap().has_board();
+    let mut transport = state.transport.lock().unwrap();
+    let connected = transport.has_board() && transport.heartbeat();
     BoardStatus {
         connected,
         transport: if connected { "board" } else { "mock" },
@@ -73,8 +91,6 @@ struct DeviceInfo {
     /// product + hardware, so the UI can say "unknown device" honestly.
     known_product: bool,
     capabilities: Option<products::Capabilities>,
-    /// Key index standing in for a missing encoder push, if any.
-    default_special_enter: Option<usize>,
 }
 
 /// Scan for attached devices and report what they are.
@@ -82,7 +98,7 @@ struct DeviceInfo {
 /// Backs the home page's "New Device" button. Returns a list even though only
 /// one board can be attached today, so the UI does not need reshaping when that
 /// changes.
-#[tauri::command]
+#[tauri::command(async)]
 fn scan_devices(state: State<AppState>) -> Result<Vec<DeviceInfo>, String> {
     let mut transport = state.transport.lock().unwrap();
 
@@ -106,11 +122,10 @@ fn scan_devices(state: State<AppState>) -> Result<Vec<DeviceInfo>, String> {
         connected,
         known_product: spec.is_some(),
         capabilities: spec.map(|s| s.capabilities),
-        default_special_enter: spec.and_then(|s| s.default_special_enter),
     }])
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn board_ping(state: State<AppState>) -> Result<PingInfo, String> {
     state
         .transport
@@ -120,7 +135,7 @@ fn board_ping(state: State<AppState>) -> Result<PingInfo, String> {
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_keymap(state: State<AppState>) -> Result<KeyMap, String> {
     state
         .transport
@@ -130,7 +145,7 @@ fn get_keymap(state: State<AppState>) -> Result<KeyMap, String> {
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_keymap(state: State<AppState>, map: KeyMap) -> Result<(), String> {
     state
         .transport
@@ -140,7 +155,7 @@ fn set_keymap(state: State<AppState>, map: KeyMap) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_leds(state: State<AppState>, leds: LedState) -> Result<(), String> {
     state
         .transport
@@ -152,7 +167,7 @@ fn set_leds(state: State<AppState>, leds: LedState) -> Result<(), String> {
 
 /// Set the global LED animation. Animation is board-wide by design — QMK's RGB
 /// matrix has one mode — so per-key state is colour only.
-#[tauri::command]
+#[tauri::command(async)]
 fn set_anim(state: State<AppState>, anim: AnimState) -> Result<(), String> {
     state
         .transport
@@ -165,7 +180,7 @@ fn set_anim(state: State<AppState>, anim: AnimState) -> Result<(), String> {
 /// Release the board to its own RGB animations (`on = false`) or re-assert the
 /// host colour overlay (`on = true`). Pushing colours turns the overlay on by
 /// itself, so this is what makes that reversible.
-#[tauri::command]
+#[tauri::command(async)]
 fn set_overlay(state: State<AppState>, on: bool) -> Result<(), String> {
     state
         .transport
@@ -175,8 +190,9 @@ fn set_overlay(state: State<AppState>, on: bool) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-fn oled_push(state: State<AppState>, config: OledConfig) -> Result<(), String> {
+/// Returns whether the board accepted the pomodoro durations; see `push_oled`.
+#[tauri::command(async)]
+fn oled_push(state: State<AppState>, config: OledConfig) -> Result<bool, String> {
     state
         .transport
         .lock()
@@ -185,7 +201,7 @@ fn oled_push(state: State<AppState>, config: OledConfig) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 #[allow(clippy::too_many_arguments)]
 fn sync_time(
     state: State<AppState>,
@@ -216,7 +232,7 @@ struct ImageUploadResult {
     bytes: usize,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn oled_push_image(state: State<AppState>, data_url: String) -> Result<ImageUploadResult, String> {
     let img = qgf::encode_data_url(
         &data_url,
@@ -241,7 +257,7 @@ fn oled_push_image(state: State<AppState>, data_url: String) -> Result<ImageUplo
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn eeprom_commit(state: State<AppState>) -> Result<(), String> {
     state
         .transport
@@ -263,10 +279,23 @@ fn set_bindings(state: State<AppState>, bindings: Vec<HostBinding>) {
 
 /// Manually trigger a host binding (UI testing without the board). Runs
 /// synchronously and returns the output for display.
-#[tauri::command]
+#[tauri::command(async)]
 fn run_binding(state: State<AppState>, index: u8) -> Result<String, String> {
     let bindings = state.bindings.lock().unwrap();
     let out = runner::run_binding(&bindings, index).map_err(|e| e.to_string())?;
+    Ok(format!(
+        "exit={:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        out.status, out.stdout, out.stderr
+    ))
+}
+
+/// Run a script the user is editing, without needing it bound to a key.
+///
+/// Backs "Test" in the macro library. See `runner::run_script` for why taking a
+/// script here does not weaken the board-side index indirection.
+#[tauri::command(async)]
+fn run_script(script: String, cwd: Option<String>) -> Result<String, String> {
+    let out = runner::run_script(&script, cwd.as_deref()).map_err(|e| e.to_string())?;
     Ok(format!(
         "exit={:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
         out.status, out.stdout, out.stderr
@@ -381,6 +410,7 @@ fn main() {
             get_bindings,
             set_bindings,
             run_binding,
+            run_script,
             simulate_board_host_cmd,
         ])
         .run(tauri::generate_context!())

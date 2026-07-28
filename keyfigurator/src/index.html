@@ -63,6 +63,21 @@
       </div>
     </div>
 
+    <!-- One confirm dialog, reused for anything that needs a deliberate yes.
+         Title, body and button label are filled in by confirmModal(). -->
+    <div class="macro-editor" id="confirm-dialog">
+      <div class="macro-editor-modal">
+        <div class="macro-editor-head">
+          <span class="macro-test-title" id="confirm-title"></span>
+        </div>
+        <div class="macro-hint" id="confirm-body"></div>
+        <div class="macro-editor-actions">
+          <button class="oled-picker-cancel" id="confirm-cancel">Cancel</button>
+          <button class="oled-picker-add" id="confirm-ok"></button>
+        </div>
+      </div>
+    </div>
+
     <!-- Macro editor overlay -->
     <div class="macro-editor" id="macro-editor">
       <div class="macro-editor-modal">
@@ -169,10 +184,10 @@
       <div class="board-ring" id="board-ring" title="Click anywhere on the ring to open Underglow settings">
         <div class="board" id="board" title=""></div>
         <!-- Corner underglow LED pickers (one per corner) -->
-        <div class="ug-corner ug-tl" id="ug-c0" title="Top-left LED"><span class="ug-dot"></span><input type="color" class="ug-corner-inp" value="#ff6e14" /></div>
-        <div class="ug-corner ug-tr" id="ug-c1" title="Top-right LED"><span class="ug-dot"></span><input type="color" class="ug-corner-inp" value="#ff6e14" /></div>
-        <div class="ug-corner ug-bl" id="ug-c2" title="Bottom-left LED"><span class="ug-dot"></span><input type="color" class="ug-corner-inp" value="#ff6e14" /></div>
-        <div class="ug-corner ug-br" id="ug-c3" title="Bottom-right LED"><span class="ug-dot"></span><input type="color" class="ug-corner-inp" value="#ff6e14" /></div>
+        <div class="ug-corner ug-tl" id="ug-c0" title="Top-left LED"><span class="ug-dot"></span><input type="color" class="ug-corner-inp" value="#ffffff" /></div>
+        <div class="ug-corner ug-tr" id="ug-c1" title="Top-right LED"><span class="ug-dot"></span><input type="color" class="ug-corner-inp" value="#ffffff" /></div>
+        <div class="ug-corner ug-bl" id="ug-c2" title="Bottom-left LED"><span class="ug-dot"></span><input type="color" class="ug-corner-inp" value="#ffffff" /></div>
+        <div class="ug-corner ug-br" id="ug-c3" title="Bottom-right LED"><span class="ug-dot"></span><input type="color" class="ug-corner-inp" value="#ffffff" /></div>
       </div>
       <div class="underglow-pill" id="underglow-pill">
         <div class="ug-main-row">
@@ -276,10 +291,9 @@
             </div>
             <div class="kc-macro-note" id="kc-macro-note"></div>
 
-            <div class="kc-palette-wrap">
-              <input id="kc-search" class="kc-search" placeholder="Search keycodes…" />
-              <div id="kc-palette-list" class="kc-palette-list"></div>
-            </div>
+            <!-- Above the keycode palette on purpose: the palette is a long
+                 scrolling list, so anything below it needs scrolling past to
+                 reach. These two settings are short and get looked for. -->
             <div class="kc-layer-events" id="kc-layer-events">
               <span class="pill-label">LAYER EVENTS</span>
               <div class="kc-back-row" id="kc-back-row">
@@ -288,15 +302,15 @@
                 <button class="oled-action-btn" id="kc-back-assign">Set</button>
                 <button class="oled-action-btn oled-del-screen" id="kc-back-clear" style="display:none">Clear</button>
               </div>
-              <!-- Special Enter: the confirm action. Defaults to the encoder
-                   push, but hardware without a push switch has none, so any key
-                   can stand in. -->
-              <div class="kc-back-row" id="kc-enter-row">
-                <span class="kc-back-label">Special Enter</span>
-                <span class="kc-back-val" id="kc-enter-val">Encoder push</span>
-                <button class="oled-action-btn" id="kc-enter-assign">Set</button>
-                <button class="oled-action-btn oled-del-screen" id="kc-enter-clear" style="display:none">Clear</button>
-              </div>
+              <!-- No "Special Enter" row. It was one global confirm key
+                   standing in for the encoder push, which duplicated what the
+                   per-screen OLED Events already do better: every screen that
+                   needs a confirm has its own assignable event, so a single
+                   global one had no job left. -->
+            </div>
+            <div class="kc-palette-wrap">
+              <input id="kc-search" class="kc-search" placeholder="Search keycodes…" />
+              <div id="kc-palette-list" class="kc-palette-list"></div>
             </div>
           </div>
         </div>

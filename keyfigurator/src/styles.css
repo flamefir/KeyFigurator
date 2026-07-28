@@ -1690,6 +1690,16 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 50%; }
 .oled-cd-num::-webkit-outer-spin-button { -webkit-appearance: none; }
 .oled-cd-sep { font-size: 20px; color: var(--muted); margin-top: 12px; }
 
+/* Pomodoro durations. Wider gap than the countdown's H:M:S because these are
+   four independent settings, not one value split into fields. */
+.oled-pomo-setrow { justify-content: center; gap: 18px; padding-bottom: 4px; }
+.oled-pomo-setrow .oled-cd-field-lbl { min-width: 74px; }
+.oled-pomo-unsupported {
+  border-left: 2px solid #d1a05a;
+  padding-left: 8px;
+  color: #d1a05a;
+}
+
 /* Image upload area */
 .oled-img-row { flex-wrap: wrap; gap: 8px; align-items: center; }
 .oled-img-thumb {
@@ -1936,6 +1946,45 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 50%; }
 .encoder-knob.oled-event-key {
   border-color: var(--oled-ev-color, rgba(255,110,20,0.65)) !important;
   color: var(--oled-ev-color, rgba(255,110,20,0.85)) !important;
+}
+
+/* Device card: reset. Sits next to the remove ✕ but reads as the heavier of
+   the two, since remove is recoverable by rescanning and this is not. */
+.device-reset {
+  background: none; border: 1px solid var(--line); border-radius: 8px;
+  color: var(--muted); font-size: 11px; padding: 4px 12px;
+  cursor: pointer; transition: border-color 0.12s, color 0.12s;
+}
+.device-reset:hover { border-color: #d15a5a; color: #d15a5a; }
+
+/* Per-screen sleep toggle */
+.oled-sleep-row { display: flex; align-items: center; justify-content: space-between; }
+.oled-sleep-btn {
+  background: none; border: 1px solid var(--line); border-radius: 8px;
+  color: var(--muted); font-size: 12px; padding: 4px 16px;
+  cursor: pointer; transition: border-color 0.12s, color 0.12s;
+}
+.oled-sleep-btn:hover { border-color: var(--txt); color: var(--txt); }
+.oled-sleep-btn.on { border-color: var(--sel); color: var(--sel); }
+
+/* 3 Hz hint on keys that do something on the screen currently showing. Matches
+   kf_led_special_blink() in the firmware: same rate, same amber, so the preview
+   and the board agree. Faster than the 2 Hz Present Keys blink on purpose. */
+@keyframes key-special-blink {
+  0%, 49%   { border-color: rgba(255,140,0,0.95); color: rgba(255,140,0,0.95); }
+  50%, 100% { border-color: var(--line); color: inherit; }
+}
+.key.key-special-blink,
+.encoder-knob.key-special-blink {
+  animation: key-special-blink 0.333s steps(1, end) infinite;
+}
+/* Respect a reduced-motion preference: keep the amber, drop the flashing. */
+@media (prefers-reduced-motion: reduce) {
+  .key.key-special-blink,
+  .encoder-knob.key-special-blink {
+    animation: none;
+    border-color: rgba(255,140,0,0.95);
+  }
 }
 
 /* All keys flash to indicate "press any key to assign" */

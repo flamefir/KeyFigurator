@@ -15,6 +15,9 @@ function browserMock(cmd, args) {
   switch (cmd) {
     case "is_connected": return false;
     case "board_status": return { connected: false, transport: "mock" };
+    // Empty, not undefined: callers iterate the result, and the browser mock
+    // stands for "no hardware here" rather than "command not implemented".
+    case "scan_devices": return [];
     case "get_keymap":   return structuredClone(browserState.keymap);
     case "set_keymap":   browserState.keymap = structuredClone(args.map); return;
     case "set_leds":     return;
@@ -25,6 +28,7 @@ function browserMock(cmd, args) {
     case "get_bindings": return [];
     case "set_bindings": return;
     case "run_binding":  return "exit=Some(0)\n--- stdout ---\n(browser mock)\n--- stderr ---\n";
+    case "run_script":   return `exit=Some(0)\n--- stdout ---\n(browser mock ran: ${(args?.script || "").split("\n")[0]})\n--- stderr ---\n`;
     case "simulate_board_host_cmd": return;
   }
 }
@@ -74,14 +78,13 @@ const BRIGHTNESS_KEY  = "kf-led-brightness";
 let ledBrightness = 255;
 
 // ── Special Enter ───────────────────────────────────────────────────────────
-// The confirm/enter action the board uses to accept things. By default that is
-// the encoder push — but hardware revisions without a push switch (product 0x01
-// hw 1.0.0) have no such button, so any key can stand in for it. `null` means
-// "use the encoder push", which is only valid where the hardware has one.
-const SPECIAL_ENTER_KEY = "kf-special-enter";
-let specialEnterIdx = null;
+// Special Enter is gone: one global confirm key standing in for the encoder
+// push duplicated the per-screen OLED Events, which do the same job better.
+// A layer screen only ever needs Present Keys; every screen that needs a
+// confirm now carries its own assignable event. Old "kf-special-enter"
+// localStorage entries are simply left to rot.
 
-let cornerColors    = ["#ff6e14", "#ff6e14", "#ff6e14", "#ff6e14"];
+let cornerColors    = ["#ffffff", "#ffffff", "#ffffff", "#ffffff"];
 let selectedCorners = new Set([0, 1, 2, 3]);
 const UG_SELECTED_KEY = "kf-ug-selected";
 let ugAnimation   = "breathe";
@@ -131,7 +134,8 @@ let encoderMode   = "layer"; // "layer" | "scroll"
 
 // ── OLED state ────────────────────────────────────────────────────────────
 const OLED_CUSTOM_KEY     = "kf-oled-custom";
-const OLED_CD_KEY         = "kf-oled-cd";
+// No OLED_CD_KEY: the countdown is not persisted at all any more, it always
+// opens at 00:00:00. Old "kf-oled-cd" entries are simply left to rot.
 const OLED_BACK_KEY       = "kf-oled-back";
 // Standard 128×128 OLED font presets — char limits derived from real glyph cell widths
 const OLED_FONTS = [
@@ -165,10 +169,22 @@ let oledCdDone       = false;
 // Pomodoro preview state. Mirrors the firmware's state machine in display.c
 // (KF_POMO_* in kf_hid.h) so the app simulates what the board will do — the
 // board runs its own copy, this is not synced live.
-const POMO_WORK_MIN        = 25;
-const POMO_SHORT_BREAK_MIN = 5;
-const POMO_LONG_BREAK_MIN  = 15;
-const POMO_LONG_EVERY      = 4;
+//
+// The durations are configuration, pushed to the board via OLED_SET_POMODORO.
+// These are the FIRMWARE's power-on defaults, so an unconfigured board and a
+// fresh editor agree before anything is sent.
+const POMO_DEFAULTS = { workMin: 25, shortBreakMin: 5, longBreakMin: 15, longEvery: 4 };
+// Same bounds the firmware clamps to (KF_POMO_MIN/MAX_* in kf_hid.h). Applied
+// here too, so a value cannot be shown that the board would silently change.
+const POMO_MIN_MINUTES = 1;
+const POMO_MAX_MINUTES = 240;
+const POMO_MIN_EVERY   = 1;
+const POMO_MAX_EVERY   = 16;
+
+let oledPomo = { ...POMO_DEFAULTS };
+// null = not asked yet. False means the board answered but rejected
+// OLED_SET_POMODORO, i.e. firmware predating the command.
+let oledPomoSupported = null;
 
 let oledPomoPhase     = "work";     // "work" | "shortBreak" | "longBreak"
 let oledPomoRunning   = false;
@@ -177,9 +193,9 @@ let oledPomoAcc       = 0;          // seconds accumulated before current start
 let oledPomoCompleted = 0;
 
 function pomoPhaseSeconds() {
-  if (oledPomoPhase === "shortBreak") return POMO_SHORT_BREAK_MIN * 60;
-  if (oledPomoPhase === "longBreak")  return POMO_LONG_BREAK_MIN * 60;
-  return POMO_WORK_MIN * 60;
+  if (oledPomoPhase === "shortBreak") return oledPomo.shortBreakMin * 60;
+  if (oledPomoPhase === "longBreak")  return oledPomo.longBreakMin * 60;
+  return oledPomo.workMin * 60;
 }
 
 function getPomoElapsed() {
@@ -191,15 +207,15 @@ function getPomoRemaining() {
 }
 
 // Roll finished phases forward. Same rule as pomo_advance(): only WORK phases
-// count toward the completed tally, and every POMO_LONG_EVERY of them earns a
+// count toward the completed tally, and every longEvery of them earns a
 // long break instead of a short one.
 function pomoTick() {
   if (!oledPomoRunning) return;
   let guard = 0;
-  while (getPomoElapsed() >= pomoPhaseSeconds() && guard++ < POMO_LONG_EVERY * 2) {
+  while (getPomoElapsed() >= pomoPhaseSeconds() && guard++ < oledPomo.longEvery * 2) {
     if (oledPomoPhase === "work") {
       oledPomoCompleted++;
-      oledPomoPhase = (oledPomoCompleted % POMO_LONG_EVERY === 0) ? "longBreak" : "shortBreak";
+      oledPomoPhase = (oledPomoCompleted % oledPomo.longEvery === 0) ? "longBreak" : "shortBreak";
     } else {
       oledPomoPhase = "work";
     }
@@ -232,12 +248,12 @@ const KC_CATEGORIES = [
   { label: "Media",   keys: ["KC_MPLY","KC_MNXT","KC_MPRV","KC_MSTP","KC_VOLU","KC_VOLD","KC_MUTE","KC_BRIU","KC_BRID"] },
   { label: "Layers",  keys: ["MO(1)","MO(2)","MO(3)","TG(1)","TG(2)","DF(0)","DF(1)","TO(0)","TO(1)","OSL(1)"] },
   { label: "Misc",    keys: ["KC_NO","KC_TRNS","KC_PSCR","KC_SLCK","KC_PAUS","KC_CAPS","KC_NLCK","KC_APP","RESET","QK_BOOT"] },
-  // QMK dynamic macros. Recorded and stored ON THE BOARD (dynamic_keymap_macro_*),
-  // so assigning MACRO(n) here binds the key; the macro's contents are edited in
-  // Vial. DYNAMIC_KEYMAP_MACRO_COUNT is 16, so only 0..15 will fire.
-  { label: "Macros",  keys: Array.from({ length: 16 }, (_, i) => `MACRO(${i})`) },
-  // HOST(n) runs a command on this computer — the KeyFigurator differentiator.
-  { label: "Host",    keys: Array.from({ length: 16 }, (_, i) => `HOST(${i})`) },
+  // No Macros or Host categories on purpose. Both emit a bare index — MACRO(n)
+  // and HOST(n) — that means nothing until something owns slot n, and the macro
+  // library is what owns them: assigning a macro to a key IS what allocates the
+  // slot and writes the keycode. Picking a raw MACRO(3) here bound a key to
+  // whatever happened to be in slot 3, or to nothing at all. The wire and
+  // keycodes.rs still carry both; they are just not hand-pickable.
 ];
 const KC_ALL_FLAT = KC_CATEGORIES.flatMap(c => c.keys);
 
@@ -392,7 +408,7 @@ function renderOledScreenContent(screenEl) {
         screenEl.innerHTML = `<div class="oled-countdown-screen">
           <div class="oled-screen-lbl">COUNTDOWN</div>
           <div class="oled-time-val">${timeDisplay}</div>
-          <div class="oled-screen-hint">${oledCdRunning ? "↓ stop" : "↓ cycle field · rotate to set"}</div>
+          <div class="oled-screen-hint">${oledCdRunning ? "↓ stop" : "←→ field · ↑↓ set · ↓ start"}</div>
         </div>`;
       }
       break;
@@ -450,6 +466,7 @@ function renderOledScreenContent(screenEl) {
 function updateOledDisplay() {
   const screenEl = document.querySelector(".oled-screen");
   if (screenEl) renderOledScreenContent(screenEl);
+  refreshSpecialKeyHints();
   const pill = document.getElementById("oled-pill");
   if (pill.classList.contains("visible")) {
     renderOledPillNav();
@@ -470,28 +487,22 @@ function oledScreenNav(dir) {
   updateOledDisplay();
 }
 
+// Rotation is screen navigation, always. It used to be hijacked by the
+// countdown screen for field editing, which made that screen a dead end: the
+// only control that moves between screens stopped moving between screens the
+// moment you arrived on it. Field editing lives on the arrow keys now.
 function onEncoderCW() {
-  const screens = getOledScreens();
-  const screen  = screens[oledScreenIdx];
   if (oledSubMode === "keycycle") {
     oledKeyCycleIdx = (oledKeyCycleIdx + 1) % 21;
     updateOledDisplay(); renderBoard(); return;
-  }
-  if (screen?.type === "countdown" && !oledCdRunning && !oledCdDone) {
-    adjustCdField(1); return;
   }
   oledScreenNav(1);
 }
 
 function onEncoderCCW() {
-  const screens = getOledScreens();
-  const screen  = screens[oledScreenIdx];
   if (oledSubMode === "keycycle") {
     oledKeyCycleIdx = (oledKeyCycleIdx + 20) % 21;
     updateOledDisplay(); renderBoard(); return;
-  }
-  if (screen?.type === "countdown" && !oledCdRunning && !oledCdDone) {
-    adjustCdField(-1); return;
   }
   oledScreenNav(-1);
 }
@@ -529,6 +540,32 @@ function triggerOledEvent(eventName) {
     case "timerReset":
       oledTimerRunning = false; oledTimerAcc = 0; updateOledDisplay();
       break;
+    // Field editing as bindable events, alongside the keycode route the board
+    // uses (kf_cd_arrow). Same guard as there: only while the fields are
+    // actually editable, so a bound key does nothing mid-countdown rather than
+    // silently moving a marker no one can see.
+    case "cdLeft":
+      if (!oledCdRunning && !oledCdDone) moveCdField(-1);
+      break;
+    case "cdRight":
+      if (!oledCdRunning && !oledCdDone) moveCdField(1);
+      break;
+    case "cdUp":
+      if (!oledCdRunning && !oledCdDone) adjustCdField(1);
+      break;
+    case "cdDown":
+      if (!oledCdRunning && !oledCdDone) adjustCdField(-1);
+      break;
+    case "pomoStartStop":
+      if (oledPomoRunning) {
+        oledPomoAcc     = getPomoElapsed();
+        oledPomoRunning = false;
+      } else {
+        oledPomoStart   = performance.now();
+        oledPomoRunning = true;
+      }
+      updateOledDisplay();
+      break;
     case "cdEvent":
       if (oledCdDone) {
         oledCdDone = false; oledCdRunning = false; oledCdAcc = 0; oledFlashKeys = false;
@@ -537,8 +574,7 @@ function triggerOledEvent(eventName) {
         oledCdAcc += (performance.now() - oledCdStart) / 1000;
         oledCdRunning = false; updateOledDisplay();
       } else {
-        oledCdField = "hours"; oledCdStart = performance.now(); oledCdAcc = 0; oledCdRunning = true;
-        localStorage.setItem(OLED_CD_KEY, JSON.stringify({ h: oledCdH, m: oledCdM, s: oledCdS }));
+        oledCdStart = performance.now(); oledCdAcc = 0; oledCdRunning = true;
         updateOledDisplay();
       }
       break;
@@ -589,22 +625,15 @@ function onEncoderPress() {
     if (oledCdRunning) {
       oledCdAcc    += (performance.now() - oledCdStart) / 1000;
       oledCdRunning = false;
-    } else {
-      const fields  = ["hours", "minutes", "seconds"];
-      const fi      = fields.indexOf(oledCdField);
-      if (fi < fields.length - 1) {
-        oledCdField = fields[fi + 1];
-      } else if (oledCdH + oledCdM + oledCdS > 0) {
-        oledCdField   = "hours";
-        oledCdStart   = performance.now();
-        oledCdAcc     = 0;
-        oledCdRunning = true;
-        localStorage.setItem(OLED_CD_KEY, JSON.stringify({ h: oledCdH, m: oledCdM, s: oledCdS }));
-      } else {
-        // 00:00:00 would finish on the same tick — wrap instead of flashing done.
-        oledCdField = "hours";
-      }
+    } else if (oledCdH + oledCdM + oledCdS > 0) {
+      // Push is start/stop only. Walking the fields on push was how you used to
+      // select one; the arrow keys do that now, so push means what the screen
+      // says it means.
+      oledCdStart   = performance.now();
+      oledCdAcc     = 0;
+      oledCdRunning = true;
     }
+    // 00:00:00 would finish on the same tick, so it simply does not start.
     updateOledDisplay(); return;
   }
 }
@@ -618,17 +647,174 @@ function adjustCdField(delta) {
   updateOledDisplay();
 }
 
+// Does this key DO something on the screen currently showing?
+//
+// Those keys blink at 3 Hz so the board says which keys work here, rather than
+// the user having to remember or go looking in the app. Four sources, all of
+// which are "press this and something happens on the OLED":
+//   - an event bound to this screen (Present Keys, Start/Stop, …)
+//   - the back key, which leaves a sub-mode
+//   - the arrows, while the countdown's fields are editable
+//
+// The firmware only knows the last of these; the first three live solely in
+// this app. See the note in kf_led_special_blink().
+function isSpecialKeyForScreen(kc, isEventKey, isBackKey) {
+  if (isEventKey || isBackKey) return true;
+
+  const screen = getOledScreens()[oledScreenIdx];
+  if (screen?.type === "countdown" && !oledCdRunning && !oledCdDone) {
+    return kc === "KC_LEFT" || kc === "KC_RIGHT" || kc === "KC_RGHT"
+        || kc === "KC_UP"   || kc === "KC_DOWN";
+  }
+  return false;
+}
+
+// Which keys are special changes with the screen and with the countdown's run
+// state, so the hint has to be refreshed on every OLED update. A full
+// renderBoard() would rebuild the DOM on each tick of a running timer and fight
+// the animation loop; toggling the one class is enough and costs 21 lookups.
+function refreshSpecialKeyHints() {
+  const sk    = currentOledScreenKey();
+  const evMap = sk ? (oledEventKeys[sk] || {}) : {};
+  for (const pos of BOARD_POSITIONS) {
+    const el = document.getElementById("key-" + pos.idx);
+    if (!el || el.classList.contains("oled-assigning")) continue;
+    const isEventKey = Object.values(evMap).some(v => evIdx(v) === pos.idx);
+    const isBackKey  = pos.idx === oledBackKeyIdx;
+    el.classList.toggle(
+      "key-special-blink",
+      isSpecialKeyForScreen(keycodeAt(pos.idx), isEventKey, isBackKey));
+  }
+}
+
+// Back to 00:00:00 with hours selected — the state the countdown screen always
+// opens in. Also clears any run in progress, so a stale one cannot survive.
+function resetCountdown() {
+  oledCdH = 0; oledCdM = 0; oledCdS = 0;
+  oledCdField   = "hours";
+  oledCdRunning = false;
+  oledCdDone    = false;
+  oledCdAcc     = 0;
+}
+
+// The editor only ever writes layer 0, so that is where a key's keycode lives.
+function keycodeAt(idx) {
+  return keymap?.layers?.[0]?.keys?.[idx] ?? "KC_NO";
+}
+
+const CD_FIELDS = ["hours", "minutes", "seconds"];
+
+function moveCdField(delta) {
+  const i = CD_FIELDS.indexOf(oledCdField);
+  // Wraps, so you can reach seconds from hours with one press either way.
+  oledCdField = CD_FIELDS[(i + delta + CD_FIELDS.length) % CD_FIELDS.length];
+  updateOledDisplay();
+}
+
+// Arrow keys drive the countdown while its screen is up: left/right pick a
+// field, up/down change it.
+//
+// Matched on the KEYCODE rather than the key index, so remapping an arrow moves
+// the control with it instead of stranding it on whatever now sits at index 11.
+// Returns true when the press was consumed, which is what stops it also being
+// typed — the same trade Present Keys already makes.
+function handleCountdownArrow(idx) {
+  const screens = getOledScreens();
+  if (screens[oledScreenIdx]?.type !== "countdown") return false;
+  // While it runs, the fields are not editable and the display shows remaining
+  // time, so arrows should behave normally.
+  if (oledCdRunning || oledCdDone) return false;
+
+  switch (keycodeAt(idx)) {
+    case "KC_LEFT":  moveCdField(-1); return true;
+    case "KC_RIGHT": moveCdField(1);  return true;
+    case "KC_RGHT":  moveCdField(1);  return true;
+    case "KC_UP":    adjustCdField(1);  return true;
+    case "KC_DOWN":  adjustCdField(-1); return true;
+    default: return false;
+  }
+}
+
 const OLED_EVENT_LABELS = {
   presentKeys:    "Present Keys",
   timerStartStop: "Start / Stop",
   timerReset:     "Reset Timer",
   cdEvent:        "Start / Stop",
+  cdLeft:         "Field ←",
+  cdRight:        "Field →",
+  cdUp:           "Value +",
+  cdDown:         "Value −",
+  pomoStartStop:  "Start / Pause",
 };
 
 function currentOledScreenKey() {
   const screens = getOledScreens();
   const s = screens[oledScreenIdx];
   return s ? (s.layerId || s.id) : null;
+}
+
+// ── Per-screen sleep ────────────────────────────────────────────────────────
+// Whether the OLED is allowed to blank itself after a period of no input, per
+// screen. Off by default, because a screen going dark unasked reads as a fault:
+// you opt a screen in. Worth having per screen rather than globally — a clock
+// you glance at wants to stay lit, a countdown you started and walked away from
+// does not, and burn-in is cumulative on the pixels that never change.
+const OLED_SLEEP_KEY = "kf-oled-sleep";
+let oledSleepScreens = {};   // { screenKey: true }
+
+// Seconds of no input before an opted-in screen blanks. One global value: the
+// board carries a single timeout, and per-screen durations would be a setting
+// nobody asked for on top of one they did.
+const OLED_SLEEP_TIMEOUT_S = 60;
+
+function screenSleepEnabled(sk) {
+  return sk ? oledSleepScreens[sk] === true : false;
+}
+
+function buildSleepMask() {
+  let mask = 0;
+  getSavedLayers().slice(0, 4).forEach((l, i) => {
+    if (screenSleepEnabled(l.id)) mask |= 1 << i;
+  });
+  oledCustomScreens.slice(0, 6).forEach((s, i) => {
+    if (screenSleepEnabled(s.id)) mask |= 1 << (4 + i);
+  });
+  return mask;
+}
+
+function setScreenSleep(sk, on) {
+  if (!sk) return;
+  if (on) oledSleepScreens[sk] = true;
+  else delete oledSleepScreens[sk];
+  localStorage.setItem(OLED_SLEEP_KEY, JSON.stringify(oledSleepScreens));
+  scheduleAutoSave();
+  scheduleLiveSync("oled");
+}
+
+// Rendered on every screen's pill, so the setting sits in the same place
+// wherever you are rather than only on the screens someone remembered to add
+// it to.
+function sleepRowHTML() {
+  const sk = currentOledScreenKey();
+  const on = screenSleepEnabled(sk);
+  return `
+    <div class="oled-pill-section oled-sleep-row">
+      <span class="pill-label">SCREEN SLEEP</span>
+      <button class="oled-sleep-btn${on ? " on" : ""}" id="oled-sleep-toggle"
+        title="${on
+          ? "This screen blanks after a period with no input. Any key or the encoder wakes it."
+          : "This screen stays lit. Turn on to blank it after a period with no input."}">
+        ${on ? "On" : "Off"}
+      </button>
+    </div>`;
+}
+
+function wireSleepRow(container) {
+  container.querySelector("#oled-sleep-toggle")?.addEventListener("click", () => {
+    const sk = currentOledScreenKey();
+    setScreenSleep(sk, !screenSleepEnabled(sk));
+    renderOledPillContent();
+  });
 }
 
 function eventRowHTML(eventName, label) {
@@ -767,7 +953,8 @@ function renderOledPillContent() {
         <div class="oled-pill-section" style="padding-bottom:6px">
           <span class="pill-label">OLED Events</span>
         </div>
-        ${eventRowHTML("presentKeys", "Present Keys")}`;
+        ${eventRowHTML("presentKeys", "Present Keys")}
+        ${sleepRowHTML()}`;
       document.getElementById("oled-title-inp")?.addEventListener("input", (e) => {
         if (layer) { renameSavedLayer(layer.id, e.target.value); updateOledDisplay(); }
       });
@@ -775,6 +962,7 @@ function renderOledPillContent() {
         if (layer) { setLayerShowTitle(layer.id, e.target.checked); updateOledDisplay(); }
       });
       wireEventRows(container);
+      wireSleepRow(container);
       break;
     }
     case "timer": {
@@ -787,8 +975,10 @@ function renderOledPillContent() {
         </div>
         ${eventRowHTML("timerStartStop", "Start / Stop")}
         ${eventRowHTML("timerReset", "Reset")}
-        ${eventRowHTML("presentKeys", "Present Keys")}`;
+        ${eventRowHTML("presentKeys", "Present Keys")}
+        ${sleepRowHTML()}`;
       wireEventRows(container);
+      wireSleepRow(container);
       break;
     }
     case "countdown": {
@@ -807,17 +997,87 @@ function renderOledPillContent() {
           </label>
         </div>
         <div class="oled-pill-hint">
-          Rotate encoder to adjust the selected field.
+          On the board, arrow keys pick a field and change it. Rotating the
+          encoder moves between screens. Bind any key below to do the same.
         </div>
         <div class="oled-pill-section" style="padding-bottom:6px">
           <span class="pill-label">OLED Events</span>
         </div>
         ${eventRowHTML("cdEvent", "Start / Stop")}
-        ${eventRowHTML("presentKeys", "Present Keys")}`;
+        ${eventRowHTML("cdLeft", "Field ←")}
+        ${eventRowHTML("cdRight", "Field →")}
+        ${eventRowHTML("cdUp", "Value +")}
+        ${eventRowHTML("cdDown", "Value −")}
+        ${eventRowHTML("presentKeys", "Present Keys")}
+        ${sleepRowHTML()}`;
       document.getElementById("oled-cd-h")?.addEventListener("input", (e) => { oledCdH = Math.max(0, Math.min(99, parseInt(e.target.value, 10) || 0)); e.target.value = oledCdH; updateOledDisplay(); });
       document.getElementById("oled-cd-m")?.addEventListener("input", (e) => { oledCdM = Math.max(0, Math.min(59, parseInt(e.target.value, 10) || 0)); e.target.value = oledCdM; updateOledDisplay(); });
       document.getElementById("oled-cd-s")?.addEventListener("input", (e) => { oledCdS = Math.max(0, Math.min(59, parseInt(e.target.value, 10) || 0)); e.target.value = oledCdS; updateOledDisplay(); });
       wireEventRows(container);
+      wireSleepRow(container);
+      break;
+    }
+    case "pomodoro": {
+      // Durations live on the BOARD (the pomodoro keeps counting with the app
+      // closed), so these are push-only settings, not a live readout.
+      const unsupported = oledPomoSupported === false
+        ? `<div class="oled-pill-hint oled-pomo-unsupported">
+             This board's firmware predates adjustable durations, so it is still
+             running the built-in ${POMO_DEFAULTS.workMin}/${POMO_DEFAULTS.shortBreakMin}/${POMO_DEFAULTS.longBreakMin}.
+             Values set here apply to the preview above; flash the current firmware to use them on the board.
+           </div>`
+        : "";
+      container.innerHTML = `
+        <div class="oled-pill-section oled-pomo-setrow">
+          <label class="oled-cd-field-lbl">WORK
+            <input class="oled-cd-num" id="oled-pomo-work" type="number"
+              min="${POMO_MIN_MINUTES}" max="${POMO_MAX_MINUTES}" step="1" value="${oledPomo.workMin}" />
+          </label>
+          <label class="oled-cd-field-lbl">PAUSE
+            <input class="oled-cd-num" id="oled-pomo-short" type="number"
+              min="${POMO_MIN_MINUTES}" max="${POMO_MAX_MINUTES}" step="1" value="${oledPomo.shortBreakMin}" />
+          </label>
+        </div>
+        <div class="oled-pill-section oled-pomo-setrow">
+          <label class="oled-cd-field-lbl">LONG PAUSE
+            <input class="oled-cd-num" id="oled-pomo-long" type="number"
+              min="${POMO_MIN_MINUTES}" max="${POMO_MAX_MINUTES}" step="1" value="${oledPomo.longBreakMin}" />
+          </label>
+          <label class="oled-cd-field-lbl">EVERY
+            <input class="oled-cd-num" id="oled-pomo-every" type="number"
+              min="${POMO_MIN_EVERY}" max="${POMO_MAX_EVERY}" step="1" value="${oledPomo.longEvery}" />
+          </label>
+        </div>
+        <div class="oled-pill-hint">
+          Minutes. After every ${oledPomo.longEvery} work ${oledPomo.longEvery === 1 ? "phase" : "phases"} the long pause
+          replaces the short one. Changing a duration does not restart a running phase.
+        </div>
+        ${unsupported}
+        <div class="oled-pill-section" style="padding-bottom:6px">
+          <span class="pill-label">OLED Events</span>
+        </div>
+        ${eventRowHTML("pomoStartStop", "Start / Pause")}
+        ${eventRowHTML("presentKeys", "Present Keys")}
+        ${sleepRowHTML()}`;
+
+      const wirePomo = (id, key, min, max) => {
+        document.getElementById(id)?.addEventListener("input", (e) => {
+          const v = Math.max(min, Math.min(max, parseInt(e.target.value, 10) || min));
+          e.target.value = v;
+          oledPomo[key] = v;
+          savePomodoro();
+          // The hint quotes longEvery, so it has to be re-rendered with it.
+          if (key === "longEvery") renderOledPillContent();
+          updateOledDisplay();
+          scheduleLiveSync("oled");
+        });
+      };
+      wirePomo("oled-pomo-work",  "workMin",       POMO_MIN_MINUTES, POMO_MAX_MINUTES);
+      wirePomo("oled-pomo-short", "shortBreakMin", POMO_MIN_MINUTES, POMO_MAX_MINUTES);
+      wirePomo("oled-pomo-long",  "longBreakMin",  POMO_MIN_MINUTES, POMO_MAX_MINUTES);
+      wirePomo("oled-pomo-every", "longEvery",     POMO_MIN_EVERY,   POMO_MAX_EVERY);
+      wireEventRows(container);
+      wireSleepRow(container);
       break;
     }
     case "datetime": {
@@ -828,8 +1088,10 @@ function renderOledPillContent() {
         <div class="oled-pill-section" style="padding-bottom:6px">
           <span class="pill-label">OLED Events</span>
         </div>
-        ${eventRowHTML("presentKeys", "Present Keys")}`;
+        ${eventRowHTML("presentKeys", "Present Keys")}
+        ${sleepRowHTML()}`;
       wireEventRows(container);
+      wireSleepRow(container);
       break;
     }
     case "gif": {
@@ -854,7 +1116,8 @@ function renderOledPillContent() {
         <div class="oled-pill-section" style="padding-bottom:6px">
           <span class="pill-label">OLED Events</span>
         </div>
-        ${eventRowHTML("presentKeys", "Present Keys")}`;
+        ${eventRowHTML("presentKeys", "Present Keys")}
+        ${sleepRowHTML()}`;
       document.getElementById("oled-img-upload")?.addEventListener("change", async (e) => {
         const file = e.target.files[0];
         if (!file) return;
@@ -870,6 +1133,7 @@ function renderOledPillContent() {
         scheduleLiveSync("oled");
       });
       wireEventRows(container);
+      wireSleepRow(container);
       break;
     }
     case "custom": {
@@ -886,7 +1150,8 @@ function renderOledPillContent() {
         <div class="oled-pill-section" style="padding-bottom:6px">
           <span class="pill-label">OLED Events</span>
         </div>
-        ${eventRowHTML("presentKeys", "Present Keys")}`;
+        ${eventRowHTML("presentKeys", "Present Keys")}
+        ${sleepRowHTML()}`;
       document.getElementById("oled-custom-title")?.addEventListener("input", (e) => {
         screen.title = e.target.value; saveOledCustomScreens(); updateOledDisplay();
       });
@@ -894,6 +1159,7 @@ function renderOledPillContent() {
         screen.body = e.target.value; saveOledCustomScreens(); updateOledDisplay();
       });
       wireEventRows(container);
+      wireSleepRow(container);
       break;
     }
     default:
@@ -1111,7 +1377,11 @@ function saveAdvancedState() {
   }));
 }
 
-const DEFAULT_CORNER_COLORS = ["#ff6e14", "#ff6e14", "#ff6e14", "#ff6e14"];
+// White, matching the per-key default. This replaces the 2026-06-29 choice of
+// orange (#ff6e14, the board's out-of-box underglow): a new layer should start
+// from one neutral default everywhere rather than two different ones, so
+// "untouched" looks the same on the keys and the corners.
+const DEFAULT_CORNER_COLORS = ["#ffffff", "#ffffff", "#ffffff", "#ffffff"];
 
 function currentUnderglowSnapshot() {
   return {
@@ -1682,6 +1952,10 @@ async function init() {
 
   document.getElementById("btn-save-board").addEventListener("click", async () => {
     const btn = document.getElementById("btn-save-board");
+    // Checked before the button changes state, so backing out leaves no trace.
+    // This is the only commit that can strand the board in a state it cannot
+    // get itself out of, so it is the only one that asks.
+    if (committedFrameIsDark() && !(await confirmDarkSave())) return;
     btn.textContent = "Saving…";
     btn.disabled = true;
     try {
@@ -1700,11 +1974,6 @@ async function init() {
   });
 
   // ── Home page ─────────────────────────────────────────────────────────────
-  const savedSpecialEnter = localStorage.getItem(SPECIAL_ENTER_KEY);
-  if (savedSpecialEnter !== null && savedSpecialEnter !== "null") {
-    const v = parseInt(savedSpecialEnter, 10);
-    if (Number.isFinite(v)) specialEnterIdx = v;
-  }
   document.getElementById("home-add")?.addEventListener("click", scanForDevices);
   document.getElementById("app-home")?.addEventListener("click", () => {
     if (document.body.classList.contains("editor")) leaveEditor();
@@ -1770,6 +2039,10 @@ async function init() {
   const status  = await invoke("board_status");
   _wasConnected = !!status?.connected;
   renderConnPill(_wasConnected);
+  // renderDeviceList() above drew last session's saved dots. Nothing guarantees
+  // they survived the app being closed, so settle them against reality before
+  // the user can read them as current.
+  await syncDeviceListConnection(_wasConnected);
 
   // Backend events: inbound HOST(n) results, and board attach/detach. The
   // attach/detach event is what makes plugging a board in mid-session work —
@@ -1867,12 +2140,13 @@ async function init() {
   activeProfileId = bootLayer.id;
   await invoke("set_keymap", { map: keymap });
 
-  // Restore OLED custom screens + countdown settings + back key
+  // Restore OLED custom screens + back key. The countdown deliberately does NOT
+  // restore: it always opens at 00:00:00. A duration is set for one use, and
+  // reopening to a stale 00:45:00 from days ago reads as the timer already
+  // being armed.
   try { oledCustomScreens = JSON.parse(localStorage.getItem(OLED_CUSTOM_KEY) || "[]"); } catch {}
-  try {
-    const c = JSON.parse(localStorage.getItem(OLED_CD_KEY) || "{}");
-    oledCdH = c.h ?? 0; oledCdM = c.m ?? 0; oledCdS = c.s ?? 0;
-  } catch {}
+  try { oledSleepScreens = JSON.parse(localStorage.getItem(OLED_SLEEP_KEY)) || {}; } catch { oledSleepScreens = {}; }
+  resetCountdown();
   const savedBack = localStorage.getItem(OLED_BACK_KEY);
   if (savedBack !== null) oledBackKeyIdx = Number(savedBack);
   try {
@@ -2121,28 +2395,6 @@ async function init() {
     bindMacroToKey(idx, e.target.value || null);
   });
 
-  // ── Special Enter assignment ──────────────────────────────────────────────
-  document.getElementById("kc-enter-assign").addEventListener("click", () => {
-    const [idx] = selectedKeys;
-    if (idx === undefined) return;
-    specialEnterIdx = idx;
-    localStorage.setItem(SPECIAL_ENTER_KEY, String(idx));
-    updateSpecialEnterRow();
-    renderBoard();
-  });
-  document.getElementById("kc-enter-clear").addEventListener("click", () => {
-    // Clearing means "use the encoder push" — only meaningful on hardware that
-    // has one, so refuse where the product table says it does not.
-    if (document.body.classList.contains("no-encoder-push")) {
-      console.warn("this hardware revision has no encoder push; Special Enter must be a key");
-      return;
-    }
-    specialEnterIdx = null;
-    localStorage.removeItem(SPECIAL_ENTER_KEY);
-    updateSpecialEnterRow();
-    renderBoard();
-  });
-
   // ── Animation rate + intensity ────────────────────────────────────────────
   document.getElementById("ug-rate").addEventListener("input", (e) => {
     ugRate = Number(e.target.value); saveAdvancedState();
@@ -2336,12 +2588,14 @@ function renderBoard() {
       const evEntry        = Object.values(bScreenEvMap).find(v => evIdx(v) === pos.idx);
       const isEventKey     = !!evEntry;
       const isAssigning    = pendingEventAssign !== null && !isEventKey && !isBackKey;
+      const isSpecial      = isSpecialKeyForScreen(kc, isEventKey, isBackKey);
       k.className = "key"
         + (isSel ? " sel" : "")
         + (isEmpty ? " empty" : "")
         + (isCycleActive ? " oled-key-active" : "")
         + (isBackKey ? " oled-back-key" : "")
         + (isEventKey ? " oled-event-key" : "")
+        + (isSpecial && !isAssigning ? " key-special-blink" : "")
         + (isAssigning ? " oled-assigning" : "");
       k.style.cssText = `grid-row:${pos.row};grid-column:${pos.col}`;
       if (isEventKey) {
@@ -2444,6 +2698,9 @@ function onKeyDown(idx) {
     renderBoard();
     // renderBoard() rebuilt the DOM, so re-apply the selection highlight.
     document.getElementById("key-" + idx)?.classList.add("sel");
+  } else if (handleCountdownArrow(idx)) {
+    // Consumed by the countdown screen. Nothing else to do — the key stays
+    // selected so it is still configurable while doubling as a control.
   } else if (eventHit) {
     triggerOledEvent(eventHit[0]);
     document.getElementById("key-" + idx)?.classList.add("sel");
@@ -2474,38 +2731,7 @@ function updateBackKeyRow() {
   document.getElementById("kc-back-val").textContent = isBack ? `Key ${idx}` : "—";
   document.getElementById("kc-back-assign").style.display = isBack ? "none" : "";
   document.getElementById("kc-back-clear").style.display  = isBack ? "" : "none";
-  updateSpecialEnterRow();
   renderKeyMacroRow();
-}
-
-// Shown for a single selected key, same as the back-key row. Displays 1-based
-// key numbers to match the board's Present Keys screen.
-function updateSpecialEnterRow() {
-  const val = document.getElementById("kc-enter-val");
-  if (!val) return;
-  const single = selectedKeys.size === 1 && !selectedKeys.has(ENCODER_IDX);
-  if (!single) return;
-  const [idx] = selectedKeys;
-  const isEnter = specialEnterIdx === idx;
-
-  const row = document.getElementById("kc-enter-row");
-  val.textContent = specialEnterIdx === null
-    ? "Encoder push"
-    : `Key ${specialEnterIdx + 1}${isEnter ? "" : " (elsewhere)"}`;
-
-  // Being Special Enter is only a default, and it constrains nothing: the key
-  // keeps its own keycode, macro, icon and LED like any other. "Set" simply
-  // moves the role here.
-  if (row) {
-    row.title = isEnter
-      ? "This key is Special Enter. It is still fully configurable — press Set on another key to move the role."
-      : "Special Enter is the confirm action. Press Set to move it to this key.";
-  }
-  document.getElementById("kc-enter-assign").style.display = isEnter ? "none" : "";
-  // Clearing means "fall back to the encoder push", which is only possible on
-  // hardware that has one.
-  const canClear = isEnter && !document.body.classList.contains("no-encoder-push");
-  document.getElementById("kc-enter-clear").style.display = canClear ? "" : "none";
 }
 
 function syncKeyLedPill() {
@@ -2572,6 +2798,26 @@ function saveCurrentLayerState() {
   cur.animStates = currentAnimState();
   cur.underglow  = currentUnderglowSnapshot();
   localStorage.setItem(layersKeyScoped(), JSON.stringify(layers));
+}
+
+// A blank layer record, built from the defaults rather than from whatever is in
+// memory — resetDevice() writes one for a device whose editor may never have
+// been opened, so there is no current state to snapshot.
+function defaultLayerRecord(name) {
+  return {
+    id: Date.now().toString(),
+    name,
+    keymap:     { layers: Array.from({ length: 4 }, () => ({ keys: Array(21).fill("KC_NO") })) },
+    leds:       Array.from({ length: 21 }, () => "#ffffff"),
+    icons:      Array(21).fill(""),
+    iconImages: Array(21).fill(null),
+    keyMacros:  Array(21).fill(null),
+    animStates: { animation: "solid", rate: 128, intensity: 180, palette: [] },
+    underglow:  {
+      animation: "solid", rate: 128, intensity: 180, palette: [],
+      cornerColors: [...DEFAULT_CORNER_COLORS],
+    },
+  };
 }
 
 function saveCurrentAsLayer(name) {
@@ -2707,10 +2953,15 @@ async function switchToLayer(id, { silent = false } = {}) {
   }
 }
 
+// A new layer starts from the SAME default state in every respect: no
+// keycodes, white keys, white underglow, solid animation, no icons or macros.
+// `keyIconLabels` was missing here, so a new blank layer silently inherited the
+// previous layer's icons — the one array that was not being cleared.
 function switchToBlankLayer() {
   saveCurrentLayerState();
   keymap         = { layers: Array.from({ length: 4 }, () => ({ keys: Array(21).fill("KC_NO") })) };
   keyLedColors   = Array.from({ length: 21 }, () => "#ffffff");
+  keyIconLabels  = Array(21).fill("");
   keyIconImages  = Array(21).fill(null);
   keyMacros      = Array(21).fill(null);
   applyAnimState(mkKeyAnim());
@@ -2859,7 +3110,7 @@ function openScreenPicker() {
       preview: `<div style="color:#ffb454;font-family:monospace;text-align:center">
         <div style="font-size:6px;opacity:.4;letter-spacing:.1em">COUNTDOWN</div>
         <div style="font-size:13px;font-weight:bold">01:00</div>
-        <div style="font-size:6px;opacity:.25">↓ cycle field</div></div>`,
+        <div style="font-size:6px;opacity:.25">←→ field · ↑↓ set</div></div>`,
     },
     {
       type: "datetime", label: "Date & Time", desc: "Live clock + date",
@@ -3089,6 +3340,89 @@ function buildLedState() {
   };
 }
 
+// Would committing right now leave the board rendering nothing at all?
+//
+// "Save to Board" persists overlay_on alongside the colours, and the firmware
+// re-asserts it on every boot (kf_hid_init -> kf_apply_anim). With the overlay
+// on, kf_led_overlay_render() returns false, so QMK's animations never run. A
+// committed all-black frame therefore boots dark AND stays dark, which is
+// indistinguishable from a dead LED chain, and no control on the board can
+// clear it. Only this app can.
+//
+// A solid save with actual colour in it is the intended feature and must not
+// nag, so the test is specifically "renders nothing", not "is solid".
+//
+// The arithmetic mirrors kf_led_overlay_render() byte for byte, integer divide
+// included: what shows up is decided by those bytes, not by whether the hex
+// looked dark in the picker. `1` at brightness `1` floors to `0`.
+function committedFrameIsDark() {
+  // A real animation is its own way out: the board keeps running it on boot.
+  if (!isAppDrivingLeds()) return false;
+  const { keys, underglow, brightness } = buildLedState();
+  return [...keys, ...underglow].every(([r, g, b]) =>
+    Math.floor((r * brightness) / 255) === 0 &&
+    Math.floor((g * brightness) / 255) === 0 &&
+    Math.floor((b * brightness) / 255) === 0);
+}
+
+// Resolves true if the user still wants to commit. Deliberately a real dialog
+// rather than window.confirm: a native modal blocks the webview, and this needs
+// to explain a firmware behaviour rather than just ask a yes/no.
+// One confirm dialog for anything that needs a deliberate yes. Deliberately a
+// real dialog rather than window.confirm: a native modal blocks the webview,
+// and these need room to explain a consequence rather than just ask.
+//
+// Backdrop and Escape both resolve false — the safe answer is the easy one.
+function confirmModal({ title, body, confirmLabel = "Confirm" }) {
+  const el = document.getElementById("confirm-dialog");
+  if (!el) return Promise.resolve(true);
+
+  document.getElementById("confirm-title").textContent = title;
+  document.getElementById("confirm-body").textContent  = body;
+  const ok = document.getElementById("confirm-ok");
+  ok.textContent = confirmLabel;
+
+  return new Promise((resolve) => {
+    const cancel = document.getElementById("confirm-cancel");
+
+    const close = (answer) => {
+      el.classList.remove("open");
+      cancel.removeEventListener("click", onCancel);
+      ok.removeEventListener("click", onOk);
+      el.removeEventListener("click", onBackdrop);
+      document.removeEventListener("keydown", onKey);
+      resolve(answer);
+    };
+    const onCancel   = () => close(false);
+    const onOk       = () => close(true);
+    const onBackdrop = (e) => { if (e.target === el) close(false); };
+    const onKey      = (e) => { if (e.key === "Escape") close(false); };
+
+    cancel.addEventListener("click", onCancel);
+    ok.addEventListener("click", onOk);
+    el.addEventListener("click", onBackdrop);
+    document.addEventListener("keydown", onKey);
+    el.classList.add("open");
+  });
+}
+
+function confirmDarkSave() {
+  const tail = ledBrightness === 0
+    ? "Raise the brightness, or pick an animation, or save anyway."
+    : "Set a colour, or pick an animation, or save anyway.";
+  const lead = ledBrightness === 0
+    ? "Brightness is 0, so every LED comes out black."
+    : "All 25 LEDs come out black at this brightness.";
+  return confirmModal({
+    title: "Save a board that lights up nothing?",
+    body: `${lead} Saving also stores "show the app's colours" as the power-on `
+        + "state, so the board will boot with its lights off and its own "
+        + "animations disabled. That looks the same as a hardware fault, and no "
+        + `button on the board can undo it. Only this app can. ${tail}`,
+    confirmLabel: "Save anyway",
+  });
+}
+
 // OledConfig: per-layer titles + ordered custom screens + one countdown.
 // RAM-only on the board, so we re-push it on every apply/reconnect.
 function buildOledConfig() {
@@ -3105,7 +3439,40 @@ function buildOledConfig() {
       body: s.body || "",
     })),
     countdown: [oledCdH, oledCdM, oledCdS],
+    // Bitmap over the board's nav-index space: bits 0..3 the four hardware
+    // layer screens, 4..9 the custom screens in order. Uses the same
+    // first-4-saved-layers convention as `layers` above — the open question of
+    // how an arbitrary-count profile list maps onto four fixed hardware layers
+    // is unchanged here, this just does not invent a second answer to it.
+    sleep_mask: buildSleepMask(),
+    sleep_timeout_s: OLED_SLEEP_TIMEOUT_S,
+    pomodoro: {
+      work_min:        oledPomo.workMin,
+      short_break_min: oledPomo.shortBreakMin,
+      long_break_min:  oledPomo.longBreakMin,
+      long_every:      oledPomo.longEvery,
+    },
   };
+}
+
+// Per device, not global: two boards can reasonably want different phase
+// lengths, and the durations live on the board they were set for.
+function savePomodoro() {
+  scheduleAutoSave();
+}
+
+// oled_push reports whether the board took the pomodoro durations. Record it so
+// the settings pill can be honest about firmware that predates the command
+// rather than showing four inputs that quietly do nothing.
+function notePomodoroSupport(accepted) {
+  if (typeof accepted !== "boolean" || oledPomoSupported === accepted) return;
+  oledPomoSupported = accepted;
+  // Only on a real change, and never over a focused field — rebuilding the pill
+  // destroys the focused element, the same rule updateOledDisplay() follows.
+  const pill = document.getElementById("oled-pill");
+  if (pill?.classList.contains("visible") && !pill.querySelector("input:focus, textarea:focus")) {
+    renderOledPillContent();
+  }
 }
 
 // The board has ONE image buffer, which is why the picker allows only one GIF
@@ -3162,7 +3529,7 @@ async function pushStateToBoard() {
   // the board shows those colours (solid) or runs its own effect, so sending it
   // last means the mode always wins.
   await invoke("set_anim", { anim: buildAnimState() });
-  try { await invoke("oled_push", { config: buildOledConfig() }); }
+  try { notePomodoroSupport(await invoke("oled_push", { config: buildOledConfig() })); }
   catch (e) { console.warn("oled_push failed", e); }
   // Force: a full push follows a reconnect or a Save, where the board's buffer
   // may have been lost, so the cache cannot be trusted.
@@ -3211,7 +3578,7 @@ async function runLiveSync() {
     // After leds, for the same reason pushStateToBoard sends it last.
     if (parts.has("anim")) await invoke("set_anim", { anim: buildAnimState() });
     if (parts.has("oled")) {
-      await invoke("oled_push", { config: buildOledConfig() });
+      notePomodoroSupport(await invoke("oled_push", { config: buildOledConfig() }));
       // Not forced: skips the multi-second transfer unless the image changed.
       await pushImageToBoard(false);
     }
@@ -3269,8 +3636,7 @@ function renderDeviceList() {
     // Only surface a limitation when we actually know of one. Silence here
     // means "no known limits", not "we did not check".
     const warn = caps && caps.encoder_push === false
-      ? `<div class="device-warn">No encoder push on this revision — key ${
-          (d.default_special_enter ?? 0) + 1} acts as Special Enter</div>`
+      ? `<div class="device-warn">No encoder push on this revision — assign a key to each screen's OLED events</div>`
       : (d.known_product ? "" : `<div class="device-warn">Unknown product/revision — capabilities assumed</div>`);
 
     card.innerHTML = `
@@ -3289,16 +3655,158 @@ function renderDeviceList() {
           <span>${TRANSPORT_ICON[d.transport] ?? "🔌"}</span>
           <span>${(d.transport || "usb").toUpperCase()}</span>
         </div>
+        <button class="device-reset" title="Reset this device to defaults">Reset</button>
         <button class="device-del" title="Remove this device from the list">✕</button>
       </div>`;
     card.addEventListener("click", () => enterEditor(d));
-    // stopPropagation, or removing a device would also open its editor.
+    // stopPropagation, or these buttons would also open the editor.
     card.querySelector(".device-del").addEventListener("click", (e) => {
       e.stopPropagation();
       removeDevice(d);
     });
+    card.querySelector(".device-reset").addEventListener("click", (e) => {
+      e.stopPropagation();
+      resetDevice(d);
+    });
     list.appendChild(card);
   }
+}
+
+// Wipe one device's configuration back to factory defaults.
+//
+// Everything a device owns lives under two keys scoped to its identity, so a
+// reset is exactly "delete those two". Macro libraries are deliberately NOT
+// touched: they are global documents meant to be shared between devices and
+// exported, so losing them to a per-device reset would be a nasty surprise.
+//
+// When the board being reset is the one attached, the defaults are pushed to it
+// and committed as well, so "reset" means the same thing on both sides rather
+// than leaving the hardware carrying the old configuration. The dialog says
+// which of the two is about to happen — those are materially different actions
+// and the wording must not promise the one that is not going to run.
+async function resetDevice(device) {
+  const name = device.product_name || "this device";
+  // Only the attached board can be reset, and only if it IS this device —
+  // pushing defaults into some other board would be worse than doing nothing.
+  const alsoBoard = device.connected === true;
+  const ok = await confirmModal({
+    title: `Reset ${name}?`,
+    body: "This deletes every setting saved for this device: its keymap, per-key "
+        + "colours and icons, LED animation, underglow, OLED screens and their "
+        + "events, and all of its saved layers. It cannot be undone. Macro "
+        + "libraries are shared between devices and are kept. "
+        + (alsoBoard
+            ? "The board is connected, so factory defaults are also written to it "
+              + "and committed — the same as pushing a blank configuration with "
+              + "Save to Board. Its keys will type nothing until you map them."
+            : "The board is not connected, so only this app is cleared. Whatever "
+              + "was last written to the board with Save to Board stays on it."),
+    confirmLabel: "Reset device",
+  });
+  if (!ok) return;
+
+  const scope = deviceKey(device);
+  // Any pending auto-save is holding the state we are about to delete, and
+  // would write it straight back a moment later.
+  clearTimeout(_autoSaveTimer);
+  localStorage.removeItem(`${DEVCFG_PREFIX}::${scope}`);
+
+  // One default layer rather than none. Zero layers is a state nothing else in
+  // the app produces: the OLED has no layer screen to show, and the Saved
+  // Layers list reads "No saved layers yet" as if the device were brand new but
+  // somehow already in use. A single blank layer is what a fresh device looks
+  // like, which is what "reset" should mean.
+  const seed = defaultLayerRecord("Layer 01");
+  localStorage.setItem(`${LAYERS_KEY}::${scope}`, JSON.stringify([seed]));
+
+  // In-memory state is global, so it has to be cleared whether or not this
+  // device is the active one — otherwise it survives the reset and gets shown
+  // (and re-saved) the next time this device is opened.
+  resetInMemoryState();
+  activeProfileId = seed.id;
+
+  if (activeDevice && deviceKey(activeDevice) === scope) {
+    renderSavedLayers();
+    renderOledPill();
+    renderBoard();
+  }
+  renderDeviceList();
+
+  if (alsoBoard) await pushDefaultsToBoard();
+}
+
+// Write factory defaults to the attached board and commit them.
+//
+// Built explicitly rather than routed through pushStateToBoard(), which sends
+// whatever is in memory: Reset can be pressed from Home for a device whose
+// editor was never opened, so in-memory state might belong to a different
+// device entirely. These literals ARE the defaults — keep them in step with
+// switchToBlankLayer() and the DEFAULT_* constants above.
+async function pushDefaultsToBoard() {
+  const white = [255, 255, 255];
+  try {
+    await invoke("set_keymap", {
+      map: { layers: Array.from({ length: 4 }, () => ({ keys: Array(21).fill("KC_NO") })) },
+    });
+    await invoke("set_leds", {
+      leds: { keys: Array(21).fill(white), underglow: Array(4).fill(white), brightness: 255 },
+    });
+    // After the colours, for the same reason pushStateToBoard sends it last:
+    // the animation decides whether those colours are what the board shows.
+    await invoke("set_anim", { anim: { name: "solid", speed: 128, color: [255, 180, 84] } });
+    await invoke("oled_push", {
+      config: {
+        layers: [], screens: [], countdown: [0, 0, 0],
+        sleep_mask: 0, sleep_timeout_s: OLED_SLEEP_TIMEOUT_S,
+        pomodoro: {
+          work_min:        POMO_DEFAULTS.workMin,
+          short_break_min: POMO_DEFAULTS.shortBreakMin,
+          long_break_min:  POMO_DEFAULTS.longBreakMin,
+          long_every:      POMO_DEFAULTS.longEvery,
+        },
+      },
+    });
+    // Commit, or the board reverts to the old configuration on the next power
+    // cycle and the reset would look like it half worked. Safe against the
+    // dark-commit trap by construction: white at full brightness renders.
+    await invoke("eeprom_commit");
+  } catch (e) {
+    console.warn("reset: pushing defaults to the board failed", e);
+  }
+}
+
+// Reconcile the SAVED device list against the live link.
+//
+// The home cards render `d.connected` out of localStorage, which only an
+// explicit scan used to write. So unplugging while sitting on Home left every
+// dot green until the user pressed New Device again, and a restart with nothing
+// attached restored last session's dots as if the board were still there.
+//
+// Called on connect/disconnect transitions and once at startup.
+async function syncDeviceListConnection(connected) {
+  let devices = getSavedDevices();
+  if (!devices.length) return;
+
+  if (connected) {
+    // board_status says *something* is attached but carries no identity, so ask
+    // which device it is rather than guessing it is the one already marked.
+    let found = [];
+    try { found = await invoke("scan_devices"); }
+    catch (e) { console.warn("identify on connect failed", e); return; }
+    // A board that has never been seen belongs in the list, not ignored.
+    for (const f of found) devices = upsertDevice(f);
+    const live = new Set(found.map(deviceKey));
+    for (const d of devices) d.connected = live.has(deviceKey(d));
+  } else {
+    // The transport serves one board at a time, so losing the link means
+    // nothing is attached — not merely that one particular device left.
+    for (const d of devices) d.connected = false;
+  }
+
+  saveDevices(devices);
+  // No point rebuilding a list the editor is covering; leaveEditor() re-renders
+  // from this same saved state on the way back.
+  if (!document.body.classList.contains("editor")) renderDeviceList();
 }
 
 // Merge a scan result into the saved list, keyed on identity so re-scanning
@@ -3354,7 +3862,6 @@ const DEMO_DEVICE = {
   connected: false,
   known_product: true,
   capabilities: { encoder_push: false, key_count: 21, led_count: 25, layer_count: 4, has_oled: true, has_underglow: true },
-  default_special_enter: 5,
 };
 
 async function scanForDevices() {
@@ -3401,11 +3908,45 @@ async function scanForDevices() {
 // The device whose editor is open. Its capabilities gate what the editor offers.
 let activeDevice = null;
 
+// Everything the editor holds, back to factory defaults. One definition, so
+// "a device with no saved config" and "a device that was just reset" cannot
+// drift apart — they are the same state by construction.
+function resetInMemoryState() {
+  keymap        = { layers: Array.from({ length: 4 }, () => ({ keys: Array(21).fill("KC_NO") })) };
+  keyLedColors  = Array.from({ length: 21 }, () => "#ffffff");
+  keyIconLabels = Array(21).fill("");
+  keyIconImages = Array(21).fill(null);
+  keyMacros     = Array(21).fill(null);
+  applyAnimState(mkKeyAnim());
+  applyUnderglowSnapshot(null);
+  ledBrightness = 255;
+  selectedCorners = new Set([0, 1, 2, 3]);
+
+  oledCustomScreens = [];
+  oledEventKeys     = {};
+  oledSleepScreens  = {};
+  oledBackKeyIdx    = null;
+  oledPomo          = { ...POMO_DEFAULTS };
+  oledScreenIdx     = 0;
+  oledSubMode       = "nav";
+  resetCountdown();
+
+  keySelectionOrder = [];
+  selectedKeys.clear();
+}
+
 function enterEditor(device) {
   activeDevice = device;
   // Load BEFORE anything renders, so the editor never shows another device's
   // configuration for a frame.
-  loadDeviceState();
+  //
+  // A device with nothing saved has to be reset to defaults explicitly:
+  // loadDeviceState() returns false without touching anything, and these are
+  // module globals, so without this the editor opened on whatever the LAST
+  // device left behind. That is what made a reset look like it did nothing —
+  // the storage really was cleared, then the stale in-memory copy was shown
+  // over the top of it and auto-saved straight back.
+  if (!loadDeviceState()) resetInMemoryState();
   document.body.classList.add("editor");
   applyDeviceCapabilities(device);
   renderActiveDeviceInfo();
@@ -3445,7 +3986,7 @@ function renderActiveDeviceInfo() {
 
   const caps = d.capabilities;
   const warn = caps && caps.encoder_push === false
-    ? `<div class="app-device-warn">No encoder push — key ${(d.default_special_enter ?? 0) + 1} is Special Enter</div>`
+    ? `<div class="app-device-warn">No encoder push — use each screen's OLED events</div>`
     : (d.known_product ? "" : `<div class="app-device-warn">Unknown revision — capabilities assumed</div>`);
 
   el.innerHTML = `
@@ -3468,12 +4009,9 @@ function renderActiveDeviceInfo() {
 function applyDeviceCapabilities(device) {
   const caps = device?.capabilities;
   const noPush = caps && caps.encoder_push === false;
+  // Kept as a body class so the UI can still say "this revision has no push";
+  // nothing stands in for it any more, the per-screen events cover it.
   document.body.classList.toggle("no-encoder-push", !!noPush);
-  if (noPush && specialEnterIdx === null) {
-    // Default the stand-in to the key the product table names.
-    specialEnterIdx = device.default_special_enter ?? null;
-    localStorage.setItem(SPECIAL_ENTER_KEY, String(specialEnterIdx));
-  }
 }
 
 // ── Per-key macro binding ───────────────────────────────────────────────────
@@ -3673,11 +4211,12 @@ function snapshotDeviceState() {
     selectedCorners: [...selectedCorners],
     encoderMode,
     ledBrightness,
-    specialEnterIdx,
     activeProfileId,
     oled: {
       customScreens: oledCustomScreens,
       countdown:     { h: oledCdH, m: oledCdM, s: oledCdS },
+      pomodoro:      { ...oledPomo },
+      sleepScreens:  { ...oledSleepScreens },
       backKeyIdx:    oledBackKeyIdx,
       eventKeys:     oledEventKeys,
     },
@@ -3722,17 +4261,33 @@ function loadDeviceState() {
   if (Array.isArray(s.selectedCorners)) selectedCorners = new Set(s.selectedCorners);
   if (typeof s.encoderMode === "string") encoderMode = s.encoderMode;
   if (Number.isFinite(s.ledBrightness))  ledBrightness = s.ledBrightness;
-  // null is meaningful here (= use the encoder push), so only `undefined` falls back.
-  if (s.specialEnterIdx !== undefined)   specialEnterIdx = s.specialEnterIdx;
+  // s.specialEnterIdx is ignored: older blobs still carry it, but the role no
+  // longer exists. Nothing to migrate — the per-screen events replaced it.
   if (s.activeProfileId !== undefined)   activeProfileId = s.activeProfileId;
 
   if (s.oled) {
     if (Array.isArray(s.oled.customScreens)) oledCustomScreens = s.oled.customScreens;
-    if (s.oled.countdown) {
-      oledCdH = s.oled.countdown.h ?? 0;
-      oledCdM = s.oled.countdown.m ?? 0;
-      oledCdS = s.oled.countdown.s ?? 0;
+    // s.oled.countdown is deliberately NOT restored — the countdown always
+    // opens at 00:00:00. Older blobs still carry the field; it is ignored
+    // rather than migrated, since there is nothing to preserve.
+    resetCountdown();
+    // Clamped on the way in, not just on input: a hand-edited or older blob
+    // must not hand the board a 0-minute phase.
+    if (s.oled.pomodoro) {
+      const p = s.oled.pomodoro;
+      const min = (v, d, lo, hi) =>
+        Number.isFinite(v) ? Math.max(lo, Math.min(hi, v)) : d;
+      oledPomo = {
+        workMin:       min(p.workMin,       POMO_DEFAULTS.workMin,       POMO_MIN_MINUTES, POMO_MAX_MINUTES),
+        shortBreakMin: min(p.shortBreakMin, POMO_DEFAULTS.shortBreakMin, POMO_MIN_MINUTES, POMO_MAX_MINUTES),
+        longBreakMin:  min(p.longBreakMin,  POMO_DEFAULTS.longBreakMin,  POMO_MIN_MINUTES, POMO_MAX_MINUTES),
+        longEvery:     min(p.longEvery,     POMO_DEFAULTS.longEvery,     POMO_MIN_EVERY,   POMO_MAX_EVERY),
+      };
+    } else {
+      oledPomo = { ...POMO_DEFAULTS };
     }
+    oledSleepScreens = (s.oled.sleepScreens && typeof s.oled.sleepScreens === "object")
+      ? { ...s.oled.sleepScreens } : {};
     if (s.oled.backKeyIdx !== undefined) oledBackKeyIdx = s.oled.backKeyIdx;
     if (s.oled.eventKeys)                oledEventKeys  = s.oled.eventKeys;
   }
@@ -4276,11 +4831,15 @@ async function testSelectedMacros() {
     if (macroKind(m) === "shell") {
       stepsEl.innerHTML = `<div class="mt-step active">$ running…</div>`;
       try {
-        await syncHostBindings();
-        const slot = macroSlotMap().get(m.id)?.slot;
-        const res = slot === undefined
-          ? "Not bound to a key, so it has no host slot to run in. Bind it to a key first."
-          : await invoke("run_binding", { index: slot });
+        // Run the script directly rather than through a host slot. Slots are
+        // derived from key bindings, so requiring one meant an unbound macro
+        // could not be tested — exactly backwards, since testing is what you do
+        // BEFORE deciding it is worth a key. Same shell either way, so a pass
+        // here still means what it says.
+        const res = await invoke("run_script", {
+          script: m.script || "",
+          cwd: m.cwd || null,
+        });
         stepsEl.innerHTML = `<div class="mt-step done">$ ${escapeHtml(m.name)}</div>`;
         outEl.textContent = String(res);
       } catch (e) {
@@ -4427,6 +4986,10 @@ async function onConnectionChange(connected) {
     activeDevice.connected = connected;
     renderActiveDeviceInfo();
   }
+  // Transition only. The home list is persisted state, not live state, so it
+  // has to be reconciled explicitly — and identifying a board costs a real HID
+  // round-trip, which is not something to spend on every poll.
+  if (connected !== _wasConnected) await syncDeviceListConnection(connected);
   if (connected && !_wasConnected) {
     try { await applyActiveProfileToBoard(); }
     catch (e) { console.warn("apply on connect failed", e); }
@@ -4434,11 +4997,20 @@ async function onConnectionChange(connected) {
   _wasConnected = connected;
 }
 
+// board_status now does a wire round-trip, and its timeout (3 s) is the same as
+// this interval — so a board that stops answering would stack overlapping polls,
+// each queueing another frame behind the last. One at a time; a skipped tick
+// costs nothing because the next one is 3 s away.
+let _pollInFlight = false;
+
 async function pollConnection() {
+  if (_pollInFlight) return;
+  _pollInFlight = true;
   try {
     const status = await invoke("board_status");
     await onConnectionChange(!!status?.connected);
   } catch {}
+  finally { _pollInFlight = false; }
 }
 
 // Last line of defence: a debounced save can still be pending when the window
