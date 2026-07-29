@@ -14,3 +14,6 @@ keyfigurator/.taurirun.log
 ## OS
 .DS_Store
 Thumbs.db
+
+## Release artefacts (built, not source)
+release/

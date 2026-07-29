@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "identifier": "com.orbit.config",
   "build": {
-    "frontendDist": "../src",
+    "frontendDist": "../dist",
     "devUrl": "http://localhost:5173",
     "beforeDevCommand": "npm run dev",
     "beforeBuildCommand": "npm run build"
@@ -21,5 +21,18 @@
     ],
     "security": { "csp": null }
   },
-  "bundle": { "active": true, "targets": "all" }
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "publisher": "flamefir",
+    "shortDescription": "Configure the Lunar x MacroPad",
+    "longDescription": "Orbit configures the Lunar x MacroPad over Raw HID: keymap, per-key and underglow LEDs, macros, host commands and the OLED screens.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
 }
