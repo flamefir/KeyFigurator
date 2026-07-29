@@ -1770,24 +1770,41 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 50%; }
   max-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: center;
 }
 
+/* Mirrors the board's own Present Keys layout, top to bottom: number, icon,
+   macro title, keycode. The number leads because it is what ties the screen to
+   a physical key; the sizes step down in the same order the panel's font scales
+   do (3 / 2 / 1 / 1), so the preview and the panel read the same. */
 .oled-keycycle {
   display: flex; flex-direction: column; align-items: center; justify-content: center;
-  gap: 5px; width: 100%; height: 100%;
+  gap: 4px; width: 100%; height: 100%;
 }
 .oled-kc-num {
-  color: rgba(255,180,84,0.45);
-  font-family: 'Courier New', monospace; font-size: 11px;
+  color: #ffb454;
+  font-family: 'Courier New', monospace; font-size: 24px; font-weight: bold;
+  line-height: 1; text-shadow: 0 0 8px rgba(255,180,84,.9);
 }
 .oled-kc-val {
-  color: #ffb454;
-  font-family: 'Courier New', monospace; font-size: 18px; font-weight: bold;
-  text-shadow: 0 0 6px rgba(255,180,84,.9);
-  max-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: center;
+  color: rgba(255,180,84,0.75);
+  font-family: 'Courier New', monospace; font-size: 13px;
+  text-shadow: 0 0 5px rgba(255,180,84,.7);
+  max-width: 112px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: center;
 }
-.oled-kc-icon {
-  font-size: 22px;
-  line-height: 1;
-  filter: drop-shadow(0 0 4px rgba(255,180,84,0.7));
+/* The screen action this key runs. Dim, so it reads as a note about the key
+   rather than as the key's name — and the same amber the board draws it in. */
+.oled-kc-event {
+  color: rgba(255,180,84,0.55);
+  font-family: 'Courier New', monospace; font-size: 10px; letter-spacing: .05em;
+  max-width: 112px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: center;
+}
+
+/* The board draws the icon as a 1-bit mask in its own amber, so the preview
+   tints the artwork to match rather than showing the original colours — the
+   two would otherwise disagree about what the panel looks like. */
+.oled-kc-icon-img {
+  width: 42px; height: 42px; object-fit: contain;
+  filter: brightness(0) saturate(100%) invert(78%) sepia(35%) saturate(1200%)
+          hue-rotate(333deg) brightness(103%) contrast(101%)
+          drop-shadow(0 0 5px rgba(255,180,84,0.75));
 }
 
 .oled-timer-screen, .oled-countdown-screen {
@@ -1948,6 +1965,25 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 50%; }
   color: var(--oled-ev-color, rgba(255,110,20,0.85)) !important;
 }
 
+/* Present Keys: what the board's LEDs are doing while you inspect. The focused
+   key pulses at 2 Hz and the screen's event keys at 4 Hz in red — an octave
+   apart and two colours, so they are told apart at a glance rather than read as
+   one confused blink. Rates match kf_led_focus_blink() exactly. */
+.key.oled-present-focus { animation: presentFocus 500ms steps(1, end) infinite; }
+.key.oled-present-event {
+  border-color: rgba(255,60,60,0.85) !important;
+  color: rgba(255,110,110,0.95) !important;
+  animation: presentEvent 250ms steps(1, end) infinite;
+}
+@keyframes presentFocus {
+  0%   { box-shadow: 0 0 14px rgba(126,232,255,0.65), 0 0 28px rgba(126,232,255,0.30); }
+  50%  { box-shadow: none; }
+}
+@keyframes presentEvent {
+  0%   { box-shadow: 0 0 12px rgba(255,60,60,0.7), 0 0 24px rgba(255,60,60,0.3); }
+  50%  { box-shadow: none; }
+}
+
 .titlebar-title { display: inline-flex; align-items: center; gap: 7px; }
 .titlebar-logo {
   width: 30px; height: 30px; vertical-align: middle;
@@ -1957,6 +1993,33 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 50%; }
 
 .prompt-field { display: flex; flex-direction: column; gap: 6px; }
 .prompt-field .macro-name-inp { width: 100%; }
+
+/* ── Error log ─────────────────────────────────────────────────────────── */
+.log-panel { max-width: 900px; margin: 26px auto 0; }
+body.editor .log-panel { display: none; }
+.log-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.log-toggle {
+  background: none; border: none; color: var(--muted); font-size: 13px;
+  cursor: pointer; display: inline-flex; align-items: center; gap: 7px; padding: 4px 0;
+}
+.log-toggle:hover { color: var(--txt); }
+.log-count { font-family: monospace; font-size: 11px; opacity: 0.7; }
+.log-count.has-errors { color: #d15a5a; opacity: 1; }
+.log-actions { display: flex; gap: 8px; }
+.log-body {
+  display: none; margin-top: 8px; max-height: 260px; overflow-y: auto;
+  border: 1px solid var(--line); border-radius: 10px; background: var(--bg);
+  font-family: 'Courier New', monospace; font-size: 11px;
+}
+.log-panel.open .log-body { display: block; }
+.log-row { display: flex; gap: 10px; padding: 5px 10px; border-bottom: 1px solid rgba(255,255,255,0.04); }
+.log-row:last-child { border-bottom: none; }
+.log-ts   { color: var(--muted); white-space: nowrap; }
+.log-src  { color: var(--sel); white-space: nowrap; }
+.log-msg  { color: var(--txt); word-break: break-word; }
+.log-row.error .log-msg { color: #d15a5a; }
+.log-row.warn  .log-msg { color: #d1a05a; }
+.log-empty { padding: 12px; color: var(--muted); text-align: center; }
 
 /* ── Layer bar ────────────────────────────────────────────────────────────
    Centred over the board, below the header info. The name is deliberately a
@@ -2102,7 +2165,9 @@ body.editor .layer-bar { display: flex; }
   align-items: center;
   gap: 6px;
 }
-.ktt-icon { font-size: 20px; line-height: 1; }
+.ktt-icon-img { width: 20px; height: 20px; object-fit: contain; }
+/* The screen action, in the colour its key blinks on the board. */
+.ktt-event { color: #ff8c3c; }
 .ktt-empty { color: var(--muted); font-weight: normal; font-size: 14px; }
 .ktt-divider { height: 1px; background: rgba(255,255,255,0.07); margin: 2px 0; }
 .ktt-row { display: flex; align-items: center; gap: 8px; }

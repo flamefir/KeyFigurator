@@ -65,6 +65,22 @@
       </div>
     </div>
 
+    <!-- Error log. Lives on Home so it is reachable without a device, and
+         collapsed by default so it is there when wanted and invisible when
+         not. -->
+    <div class="log-panel" id="log-panel">
+      <div class="log-head">
+        <button class="log-toggle" id="log-toggle">
+          <span id="log-caret">&#9656;</span> Log <span class="log-count" id="log-count"></span>
+        </button>
+        <div class="log-actions">
+          <button class="home-add ghost" id="log-copy">Copy</button>
+          <button class="home-add ghost danger" id="log-clear">Clear</button>
+        </div>
+      </div>
+      <div class="log-body" id="log-body"></div>
+    </div>
+
     <!-- One confirm dialog, reused for anything that needs a deliberate yes.
          Title, body and button label are filled in by confirmModal(). -->
     <div class="macro-editor" id="confirm-dialog">
@@ -265,12 +281,11 @@
             <div class="kc-icon-wrap">
               <div class="kc-icon-row">
                 <span class="pill-label">ICON</span>
-                <input type="text" id="kl-icon" class="pill-icon" placeholder="⌘" maxlength="2" />
                 <label class="kc-icon-upload-btn">
-                  Upload GIF / PNG
-                  <input type="file" id="kl-icon-file" accept="image/*" style="display:none" />
+                  Upload PNG / SVG
+                  <input type="file" id="kl-icon-file" accept=".png,.svg,image/png,image/svg+xml" style="display:none" />
                 </label>
-                <span class="kc-icon-notice">max 128×128</span>
+                <span class="kc-icon-notice">max 128×128 · shown on the board in amber</span>
                 <button class="kc-icon-clear" id="kc-icon-clear" style="display:none">✕</button>
               </div>
               <div class="kc-icon-thumb-wrap" id="kc-icon-thumb-wrap" style="display:none">
@@ -304,10 +319,12 @@
         <div class="oled-font-row">
           <span class="pill-label">FONT</span>
           <div class="oled-font-btns" id="oled-font-btns">
+            <!-- The cell sizes are the board's 5x7 glyph at each scale, not
+                 four different fonts — it only has the one. -->
             <button class="oled-font-btn" data-font="small">Small<span>5×7</span></button>
-            <button class="oled-font-btn" data-font="medium">Medium<span>6×8</span></button>
-            <button class="oled-font-btn" data-font="large">Large<span>8×8</span></button>
-            <button class="oled-font-btn" data-font="xl">XL<span>8×16</span></button>
+            <button class="oled-font-btn" data-font="medium">Medium<span>10×14</span></button>
+            <button class="oled-font-btn" data-font="large">Large<span>15×21</span></button>
+            <button class="oled-font-btn" data-font="xl">XL<span>20×28</span></button>
           </div>
         </div>
       </div>

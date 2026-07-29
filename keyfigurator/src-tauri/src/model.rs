@@ -64,7 +64,7 @@ impl Default for KeyMap {
 
 /// Per-key LED colors + underglow. This is the "Vial gap" feature: arbitrary
 /// per-key static colors that the Vial GUI doesn't fully expose.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct LedState {
     /// One color per physical key (21: indices 0..20, encoder at 20), in the
     /// same index order as the keymap / `BOARD_POSITIONS`.
@@ -197,19 +197,15 @@ pub struct OledScreen {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct PomodoroConfig {
     pub work_min: u8,
-    pub short_break_min: u8,
-    pub long_break_min: u8,
-    pub long_every: u8,
+    pub pause_min: u8,
+    /// How many work+pause repetitions make a session; after the last one the
+    /// board stops rather than looping.
+    pub cycles: u8,
 }
 
 impl Default for PomodoroConfig {
     fn default() -> Self {
-        Self {
-            work_min: 25,
-            short_break_min: 5,
-            long_break_min: 15,
-            long_every: 4,
-        }
+        Self { work_min: 25, pause_min: 5, cycles: 4 }
     }
 }
 
@@ -234,6 +230,63 @@ pub struct OledConfig {
     pub sleep_mask: u16,
     #[serde(default = "default_sleep_timeout")]
     pub sleep_timeout_s: u8,
+    /// Which key triggers which screen action: (screen_slot, event, key_idx),
+    /// screen_slot in the board's nav-index space. Without these the board only
+    /// reaches a screen's actions through the encoder push, which hardware
+    /// revision 1.0.0 does not have.
+    #[serde(default)]
+    pub event_keys: Vec<(u8, u8, u8)>,
+    /// What Present Keys shows about each key. The board cannot derive any of
+    /// it — the keycode table is too big for it, and macro titles and icons
+    /// exist only here.
+    #[serde(default)]
+    pub key_info: Vec<KeyInfo>,
+    /// Per-key icon, rasterised host-side from the user's PNG or SVG to the
+    /// board's 32x32 1-bit mask. `None` is a key with no icon, which is sent
+    /// explicitly — otherwise a removed icon would linger on the board.
+    ///
+    /// Rasterised in the app because the board can decode neither format, and
+    /// the app already has a canvas.
+    #[serde(default)]
+    pub key_icons: Vec<Option<Vec<u8>>>,
+    /// How big screen titles are drawn, 1..4. A scale, not a typeface: the
+    /// board has one font. 0 (the serde default) means "leave it alone", which
+    /// is what a payload written before this existed means.
+    #[serde(default)]
+    pub font_scale: u8,
+    /// Each screen's own LED profile. The app has always had these; the board
+    /// had one global set, so an animation configured on one screen ran on all
+    /// of them once you rotated away from it.
+    #[serde(default)]
+    pub screen_leds: Vec<ScreenLeds>,
+}
+
+/// One screen's LEDs: which slot it is, its colours, and the two animations.
+///
+/// Sent per screen rather than only for the active one because the encoder
+/// changes screens with no app involved — the board has to already know what
+/// every screen wants, including with the app closed.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ScreenLeds {
+    /// The app's fixed slot space: 4 layer screens, then custom screens.
+    pub slot: u8,
+    pub leds: LedState,
+    pub anim: AnimState,
+    #[serde(default)]
+    pub underglow: UnderglowAnim,
+}
+
+/// The TEXT Present Keys can show about a key. The board picks the macro title
+/// if there is one, else the keycode — and skips both entirely when the key has
+/// an icon, which outranks them. Empty means "this key has none".
+///
+/// The icon is not here: it is pixels, and travels as `key_icons`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyInfo {
+    #[serde(default)]
+    pub macro_title: String,
+    #[serde(default)]
+    pub keycode: String,
 }
 
 fn default_sleep_timeout() -> u8 {
@@ -263,6 +316,78 @@ pub struct Palette {
     pub colors: Vec<Rgb>,
     /// The app's animation-rate byte; the board maps it to a cycle period.
     pub rate: u8,
+}
+
+#[cfg(test)]
+mod payload_tests {
+    use super::*;
+
+    /// The exact JSON `buildOledConfig()` emits, deserialized the way Tauri
+    /// does it.
+    ///
+    /// This exists because a field rename on the JS side and a stale struct
+    /// here made `oled_push` reject the whole payload — and the frontend's
+    /// `try/catch` swallowed it, so Save to Board reported success while
+    /// nothing OLED ever reached the board. Every Rust-side test passed
+    /// throughout, because they all build the struct directly in Rust and
+    /// never cross the boundary that actually broke.
+    ///
+    /// If you rename a field in `main.js`, this test is what fails.
+    #[test]
+    fn frontend_oled_payload_deserializes() {
+        let json = r#"{
+            "layers":  [{"name":"Launch Apps","show_title":true}],
+            "screens": [{"kind":"pomodoro","title":"","body":""},
+                        {"kind":"datetime","title":"","body":""}],
+            "countdown": [0,0,0],
+            "sleep_mask": 0,
+            "sleep_timeout_s": 60,
+            "pomodoro": {"work_min":25,"pause_min":5,"cycles":4},
+            "event_keys": [[0,0,5],[4,8,11]],
+            "key_info": [{"macro_title":"Claude in Repos","keycode":"ENTER"},
+                         {"macro_title":"","keycode":"F5"}],
+            "key_icons": [[1,2,3], null],
+            "font_scale": 3
+        }"#;
+        let cfg: OledConfig = serde_json::from_str(json).expect("frontend payload must parse");
+        assert_eq!(cfg.layers.len(), 1);
+        assert_eq!(cfg.layers[0].name, "Launch Apps");
+        assert_eq!(cfg.screens.len(), 2);
+        assert_eq!(cfg.pomodoro.work_min, 25);
+        assert_eq!(cfg.pomodoro.pause_min, 5);
+        assert_eq!(cfg.pomodoro.cycles, 4);
+        // (screen_slot, event, key_idx) — Present Keys on layer 0, key 5.
+        assert_eq!(cfg.event_keys, vec![(0, 0, 5), (4, 8, 11)]);
+        // Both text fields survive separately. A rename on either side of this
+        // boundary is exactly the kind of silent breakage that once made Save
+        // to Board do nothing at all.
+        assert_eq!(cfg.key_info.len(), 2);
+        assert_eq!(cfg.key_info[0].macro_title, "Claude in Repos");
+        assert_eq!(cfg.key_info[0].keycode, "ENTER");
+        assert_eq!(cfg.key_info[1].keycode, "F5");
+        // And the icon masks come through as bytes, with null meaning "none".
+        assert_eq!(cfg.key_icons, vec![Some(vec![1u8, 2, 3]), None]);
+        assert_eq!(cfg.font_scale, 3);
+    }
+
+    /// The other two payloads the frontend sends that carry named fields.
+    #[test]
+    fn frontend_anim_and_palette_payloads_deserialize() {
+        let ug: UnderglowAnim =
+            serde_json::from_str(r#"{"name":"breathe","speed":128,"intensity":180}"#).unwrap();
+        assert_eq!(ug.name, "breathe");
+
+        let pal: Palette =
+            serde_json::from_str(r#"{"colors":[[255,0,0],[0,255,0]],"rate":200}"#).unwrap();
+        assert_eq!(pal.colors.len(), 2);
+        assert_eq!(pal.rate, 200);
+
+        let leds: LedState = serde_json::from_str(
+            r#"{"keys":[[1,2,3]],"underglow":[[4,5,6]],"brightness":255}"#,
+        )
+        .unwrap();
+        assert_eq!(leds.brightness, 255);
+    }
 }
 
 /// A host-side command bound to a HOST(n) key. When the board sends a

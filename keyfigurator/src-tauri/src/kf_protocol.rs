@@ -79,18 +79,45 @@ pub const CMD_OLED_SET_SLEEP: u8 = 0x59;
 /// layers; this is only about the OLED's screen list, which the app's own
 /// arbitrary-length layer list drives.
 pub const CMD_OLED_SET_LAYER_COUNT: u8 = 0x5A;
+/// Which physical key triggers which screen action.
+pub const CMD_OLED_SET_EVENT_KEYS: u8 = 0x5B;
+/// What Present Keys shows for a key besides its number.
+pub const CMD_OLED_SET_KEY_LABEL: u8 = 0x5C;
+pub const CMD_OLED_SET_KEY_INFO: u8 = 0x5D;
+pub const CMD_SET_SCREEN_LEDS: u8 = 0x5E;
+pub const CMD_OLED_SET_KEY_ICON: u8 = 0x5F;
+pub const CMD_OLED_SET_FONT: u8 = 0x60;
+/// Title text scale. The board has one font drawn at integer multiples, so
+/// this is the whole of what a "font size" can be there.
+pub const FONT_SCALE_MIN: u8 = 1;
+pub const FONT_SCALE_MAX: u8 = 4;
+/// The board's icon: 32x32 1-bit, 4 bytes per row, MSB = leftmost pixel.
+pub const KEY_ICON_BYTES: usize = 128;
+/// Sentinel in the offset position: this key has no icon.
+pub const KEY_ICON_CLEAR: u8 = 0xFF;
+/// 30 payload bytes per frame, less key_idx/offset/count.
+pub const KEY_ICON_CHUNK_MAX: usize = REPORT_LEN - 5;
+pub const SCREEN_LEDS_HDR: u8 = 0xF0;
+pub const KEY_LABEL_MAX: usize = 16;
+/// Present Keys text fields, in the order they are fallen back through. The
+/// icon is not one of them — it is pixels, and travels via SET_KEY_ICON.
+pub const KEY_INFO_MACRO: u8 = 0;
+pub const KEY_INFO_KEYCODE: u8 = 1;
+pub const KEY_INFO_COUNT: usize = 2;
+/// Bindings one frame can carry: 32 - (magic, cmd, slot, count), two bytes each.
+pub const EVENT_KEYS_CHUNK_MAX: usize = (REPORT_LEN - 4) / 2;
+pub const EVENT_KEY_NONE: u8 = 0xFF;
 
 /// Pomodoro limits + defaults, mirroring `KF_POMO_*` in `kf_hid.h`. The board
 /// clamps to these, so the app applies the same bounds rather than letting the
 /// user set a value that silently becomes something else.
 pub const POMO_MIN_MINUTES: u8 = 1;
 pub const POMO_MAX_MINUTES: u8 = 240;
-pub const POMO_MIN_EVERY: u8 = 1;
-pub const POMO_MAX_EVERY: u8 = 16;
+pub const POMO_MIN_CYCLES: u8 = 1;
+pub const POMO_MAX_CYCLES: u8 = 16;
 pub const POMO_DEFAULT_WORK_MIN: u8 = 25;
-pub const POMO_DEFAULT_SHORT_BREAK_MIN: u8 = 5;
-pub const POMO_DEFAULT_LONG_BREAK_MIN: u8 = 15;
-pub const POMO_DEFAULT_LONG_EVERY: u8 = 4;
+pub const POMO_DEFAULT_PAUSE_MIN: u8 = 5;
+pub const POMO_DEFAULT_CYCLES: u8 = 4;
 pub const CMD_OLED_SYNC_TIME: u8 = 0x54;
 pub const CMD_OLED_IMG_BEGIN: u8 = 0x55;
 pub const CMD_OLED_IMG_DATA: u8 = 0x56;
@@ -287,6 +314,42 @@ pub fn set_ug_anim_frame(anim: u8, speed: u8, intensity: u8) -> [u8; REPORT_LEN]
     frame(CMD_SET_UG_ANIM, &[anim, speed, intensity])
 }
 
+/// One screen's LED profile: a header frame that marks the slot valid and
+/// carries both animations, then the 25 colours in offset-addressed chunks.
+///
+/// Header first on purpose. The board applies a slot the moment it is written
+/// if that slot is the one on screen, so sending the animation before the
+/// colours means the very first apply already has both — the alternative shows
+/// the new colours under the old animation for one frame.
+#[allow(clippy::too_many_arguments)]
+pub fn set_screen_leds_frames(
+    slot: u8,
+    colors: &[[u8; 3]],
+    anim: u8,
+    speed: u8,
+    hsv: (u8, u8, u8),
+    ug_anim: u8,
+    ug_speed: u8,
+    ug_intensity: u8,
+) -> Vec<[u8; REPORT_LEN]> {
+    let (h, s, v) = hsv;
+    let mut out = vec![frame(
+        CMD_SET_SCREEN_LEDS,
+        &[slot, SCREEN_LEDS_HDR, anim, speed, h, s, v, ug_anim, ug_speed, ug_intensity],
+    )];
+    for (ci, chunk) in colors.chunks(LED_CHUNK_MAX).enumerate() {
+        let mut p = Vec::with_capacity(3 + chunk.len() * 3);
+        p.push(slot);
+        p.push((ci * LED_CHUNK_MAX) as u8);
+        p.push(chunk.len() as u8);
+        for c in chunk {
+            p.extend_from_slice(c);
+        }
+        out.push(frame(CMD_SET_SCREEN_LEDS, &p));
+    }
+    out
+}
+
 pub fn oled_img_begin_frame(total_len: u32) -> [u8; REPORT_LEN] {
     let b = total_len.to_le_bytes();
     frame(CMD_OLED_IMG_BEGIN, &[b[0], b[1], b[2]])
@@ -384,6 +447,84 @@ pub fn oled_set_layer_count_frame(count: u8) -> [u8; REPORT_LEN] {
     frame(CMD_OLED_SET_LAYER_COUNT, &[count])
 }
 
+/// Bindings for ONE screen, chunked. `(event, key_idx)` pairs; 0xFF clears.
+pub fn oled_set_event_keys_frames(slot: u8, pairs: &[(u8, u8)]) -> Vec<[u8; REPORT_LEN]> {
+    pairs
+        .chunks(EVENT_KEYS_CHUNK_MAX)
+        .map(|chunk| {
+            let mut p = Vec::with_capacity(2 + chunk.len() * 2);
+            p.push(slot);
+            p.push(chunk.len() as u8);
+            for (e, k) in chunk {
+                p.push(*e);
+                p.push(*k);
+            }
+            frame(CMD_OLED_SET_EVENT_KEYS, &p)
+        })
+        .collect()
+}
+
+/// One key's Present Keys label. ASCII only — the board's 5x7 font covers
+/// 32..126, so anything else would render as '?'.
+pub fn oled_set_key_label_frame(key_idx: u8, label: &str) -> [u8; REPORT_LEN] {
+    let bytes: Vec<u8> = label
+        .bytes()
+        .filter(|b| (32..=126).contains(b))
+        .take(KEY_LABEL_MAX)
+        .collect();
+    let mut p = Vec::with_capacity(2 + bytes.len());
+    p.push(key_idx);
+    p.push(bytes.len() as u8);
+    p.extend_from_slice(&bytes);
+    frame(CMD_OLED_SET_KEY_LABEL, &p)
+}
+
+/// One field of one key's Present Keys text.
+///
+/// Filtered to printable ASCII, which is all the board's 5x7 font covers —
+/// anything else would come out as the font's '?' fallback.
+pub fn oled_set_key_info_frame(key_idx: u8, field: u8, text: &str) -> [u8; REPORT_LEN] {
+    let bytes: Vec<u8> = text
+        .bytes()
+        .filter(|b| (32..=126).contains(b))
+        .take(KEY_LABEL_MAX)
+        .collect();
+    let mut p = Vec::with_capacity(3 + bytes.len());
+    p.push(key_idx);
+    p.push(field);
+    p.push(bytes.len() as u8);
+    p.extend_from_slice(&bytes);
+    frame(CMD_OLED_SET_KEY_INFO, &p)
+}
+
+/// One key's icon mask, in offset-addressed chunks. `None` clears it, which has
+/// to be sent explicitly or a removed icon would linger on the board.
+pub fn oled_set_key_icon_frames(key_idx: u8, mask: Option<&[u8]>) -> Vec<[u8; REPORT_LEN]> {
+    let Some(mask) = mask else {
+        return vec![frame(CMD_OLED_SET_KEY_ICON, &[key_idx, KEY_ICON_CLEAR, 0])];
+    };
+    mask.iter()
+        .copied()
+        .take(KEY_ICON_BYTES)
+        .collect::<Vec<u8>>()
+        .chunks(KEY_ICON_CHUNK_MAX)
+        .enumerate()
+        .map(|(ci, chunk)| {
+            let mut p = Vec::with_capacity(3 + chunk.len());
+            p.push(key_idx);
+            p.push((ci * KEY_ICON_CHUNK_MAX) as u8);
+            p.push(chunk.len() as u8);
+            p.extend_from_slice(chunk);
+            frame(CMD_OLED_SET_KEY_ICON, &p)
+        })
+        .collect()
+}
+
+/// Title scale, clamped to what the panel can draw.
+pub fn oled_set_font_frame(scale: u8) -> [u8; REPORT_LEN] {
+    frame(CMD_OLED_SET_FONT, &[scale.clamp(FONT_SCALE_MIN, FONT_SCALE_MAX)])
+}
+
 pub fn oled_set_sleep_frame(timeout_s: u8, mask: u16) -> [u8; REPORT_LEN] {
     frame(
         CMD_OLED_SET_SLEEP,
@@ -393,16 +534,8 @@ pub fn oled_set_sleep_frame(timeout_s: u8, mask: u16) -> [u8; REPORT_LEN] {
 
 /// Pomodoro phase durations in minutes, plus how many work phases earn a long
 /// break. A zero field means "leave that one alone" on the firmware side.
-pub fn oled_set_pomodoro_frame(
-    work_min: u8,
-    short_break_min: u8,
-    long_break_min: u8,
-    long_every: u8,
-) -> [u8; REPORT_LEN] {
-    frame(
-        CMD_OLED_SET_POMODORO,
-        &[work_min, short_break_min, long_break_min, long_every],
-    )
+pub fn oled_set_pomodoro_frame(work_min: u8, pause_min: u8, cycles: u8) -> [u8; REPORT_LEN] {
+    frame(CMD_OLED_SET_POMODORO, &[work_min, pause_min, cycles])
 }
 
 pub fn oled_sync_time_frame(
@@ -601,6 +734,37 @@ impl Default for PaletteState {
     }
 }
 
+/// How many screens the board can hold bindings for: 4 layer screens plus
+/// MAX_CUSTOM_SCREENS. The app's FIXED slot space, mirroring KF_SCREEN_SLOTS —
+/// not the board's compressed nav_index.
+pub const SCREEN_SLOTS: usize = 10;
+
+/// One screen's LED profile as the board holds it. Mirrors `kf_screen_leds_t`.
+#[derive(Clone, PartialEq, Debug)]
+pub struct ScreenLedState {
+    pub rgb: [Rgb; LED_COUNT],
+    pub anim: u8,
+    pub anim_speed: u8,
+    pub anim_hsv: (u8, u8, u8),
+    pub ug_anim: u8,
+    pub ug_speed: u8,
+    pub ug_intensity: u8,
+}
+
+impl Default for ScreenLedState {
+    fn default() -> Self {
+        Self {
+            rgb: [[0, 0, 0]; LED_COUNT],
+            anim: ANIM_SOLID,
+            anim_speed: 128,
+            anim_hsv: (0, 0, 0),
+            ug_anim: ANIM_SOLID,
+            ug_speed: 128,
+            ug_intensity: 180,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct BoardModel {
     pub keymap: [[u16; KEY_COUNT]; LAYER_COUNT],
@@ -620,11 +784,14 @@ pub struct BoardModel {
     pub oled_countdown: (u8, u8, u8),
     /// Pomodoro durations: (work, short break, long break, long every).
     /// Starts at the firmware's compile-time defaults, same as a real board.
-    pub pomodoro: (u8, u8, u8, u8),
+    pub pomodoro: (u8, u8, u8),
     /// Simulate firmware older than SET_POMODORO, which answers STATUS_ERROR
     /// for an unknown command. The un-reflashed board is a real configuration
     /// the app has to keep working against, so it is worth modelling.
     pub reject_pomodoro: bool,
+    /// Same idea for SET_KEY_INFO: a board on 0.3.x has SET_KEY_LABEL but not
+    /// this, and the app is expected to fall back rather than fail the save.
+    pub reject_key_info: bool,
     /// Per-screen sleep: bitmap over the nav-index space, plus the idle
     /// timeout. Starts empty — a board nobody configured never goes dark.
     /// Underglow animation, independent of the global one (kf_hid.c renders
@@ -637,6 +804,17 @@ pub struct BoardModel {
     /// How many layer screens the board shows (not how many keymap layers it
     /// has, which is always LAYER_COUNT).
     pub layer_screen_count: u8,
+    /// [screen_slot][event] -> key index, 0xFF unbound. Mirrors event_key[][].
+    pub event_keys: [[u8; 9]; 10],
+    /// Present Keys text per key, as the board holds it: [macro, keycode].
+    pub key_info: [[String; KEY_INFO_COUNT]; KEY_COUNT],
+    /// Present Keys icon mask per key. `None` is a key with no icon.
+    pub key_icons: [Option<[u8; KEY_ICON_BYTES]>; KEY_COUNT],
+    /// Title text scale. Starts at the firmware's own default.
+    pub font_scale: u8,
+    /// Per-screen LED profiles, indexed by the app's fixed slot space. `None`
+    /// is a slot the app never pushed, which the board leaves alone.
+    pub screen_leds: [Option<ScreenLedState>; SCREEN_SLOTS],
     pub sleep_mask: u16,
     pub sleep_timeout_s: u8,
     /// Image upload state, mirroring the board's single image buffer.
@@ -660,18 +838,19 @@ impl Default for BoardModel {
             oled_show_title: [true; LAYER_COUNT],
             oled_screen_types: Vec::new(),
             oled_countdown: (0, 0, 0),
-            pomodoro: (
-                POMO_DEFAULT_WORK_MIN,
-                POMO_DEFAULT_SHORT_BREAK_MIN,
-                POMO_DEFAULT_LONG_BREAK_MIN,
-                POMO_DEFAULT_LONG_EVERY,
-            ),
+            pomodoro: (POMO_DEFAULT_WORK_MIN, POMO_DEFAULT_PAUSE_MIN, POMO_DEFAULT_CYCLES),
             reject_pomodoro: false,
+            reject_key_info: false,
             palettes: [PaletteState::default(); 2],
             ug_anim: ANIM_SOLID,
             ug_speed: 128,
             ug_intensity: 180,
             layer_screen_count: LAYER_COUNT as u8,
+            event_keys: [[EVENT_KEY_NONE; 9]; 10],
+            key_info: Default::default(),
+            key_icons: [None; KEY_COUNT],
+            font_scale: 2,
+            screen_leds: Default::default(),
             sleep_mask: 0,
             sleep_timeout_s: 60,
             oled_img_expected: 0,
@@ -879,6 +1058,100 @@ impl BoardModel {
                 self.oled_countdown = (p[0], p[1], p[2]);
                 r[0] = STATUS_OK;
             }
+            // Superseded by SET_KEY_INFO; still handled, and writes the macro
+            // field, so a board's-eye view of an old app stays coherent.
+            CMD_OLED_SET_KEY_LABEL => {
+                let (idx, len) = (p[0] as usize, p[1] as usize);
+                if idx >= self.key_info.len() || len > KEY_LABEL_MAX {
+                    r[0] = STATUS_ERROR;
+                } else {
+                    self.key_info[idx][KEY_INFO_MACRO as usize] =
+                        String::from_utf8_lossy(&p[2..2 + len]).into_owned();
+                    r[0] = STATUS_OK;
+                }
+            }
+            CMD_OLED_SET_FONT => {
+                if (FONT_SCALE_MIN..=FONT_SCALE_MAX).contains(&p[0]) {
+                    self.font_scale = p[0];
+                    r[0] = STATUS_OK;
+                } else {
+                    // The firmware clamps rather than rejects, and so does the
+                    // frame builder — an out-of-range byte means a bug here.
+                    r[0] = STATUS_ERROR;
+                }
+            }
+            CMD_OLED_SET_KEY_ICON => {
+                let idx = p[0] as usize;
+                if idx >= self.key_icons.len() {
+                    r[0] = STATUS_ERROR;
+                } else if p[1] == KEY_ICON_CLEAR {
+                    self.key_icons[idx] = None;
+                    r[0] = STATUS_OK;
+                } else {
+                    let (offset, count) = (p[1] as usize, p[2] as usize);
+                    if count > KEY_ICON_CHUNK_MAX || offset + count > KEY_ICON_BYTES {
+                        r[0] = STATUS_ERROR;
+                    } else {
+                        let m = self.key_icons[idx].get_or_insert([0u8; KEY_ICON_BYTES]);
+                        m[offset..offset + count].copy_from_slice(&p[3..3 + count]);
+                        r[0] = STATUS_OK;
+                    }
+                }
+            }
+            CMD_SET_SCREEN_LEDS => {
+                let slot = p[0] as usize;
+                if slot >= SCREEN_SLOTS {
+                    r[0] = STATUS_ERROR;
+                } else if p[1] == SCREEN_LEDS_HDR {
+                    let s = self.screen_leds[slot].get_or_insert_with(Default::default);
+                    s.anim = p[2];
+                    s.anim_speed = p[3];
+                    s.anim_hsv = (p[4], p[5], p[6]);
+                    s.ug_anim = p[7];
+                    s.ug_speed = p[8];
+                    s.ug_intensity = p[9];
+                    r[0] = STATUS_OK;
+                } else {
+                    let (offset, count) = (p[1] as usize, p[2] as usize);
+                    if count > LED_CHUNK_MAX || offset + count > LED_COUNT {
+                        r[0] = STATUS_ERROR;
+                    } else {
+                        let s = self.screen_leds[slot].get_or_insert_with(Default::default);
+                        for i in 0..count {
+                            let b = 3 + i * 3;
+                            s.rgb[offset + i] = [p[b], p[b + 1], p[b + 2]];
+                        }
+                        r[0] = STATUS_OK;
+                    }
+                }
+            }
+            CMD_OLED_SET_KEY_INFO if self.reject_key_info => {
+                r[0] = STATUS_ERROR;
+            }
+            CMD_OLED_SET_KEY_INFO => {
+                let (idx, field, len) = (p[0] as usize, p[1] as usize, p[2] as usize);
+                if idx >= self.key_info.len() || field >= KEY_INFO_COUNT || len > KEY_LABEL_MAX {
+                    r[0] = STATUS_ERROR;
+                } else {
+                    self.key_info[idx][field] =
+                        String::from_utf8_lossy(&p[3..3 + len]).into_owned();
+                    r[0] = STATUS_OK;
+                }
+            }
+            CMD_OLED_SET_EVENT_KEYS => {
+                let (slot, count) = (p[0] as usize, p[1] as usize);
+                if slot >= self.event_keys.len() || count > EVENT_KEYS_CHUNK_MAX {
+                    r[0] = STATUS_ERROR;
+                } else {
+                    for i in 0..count {
+                        let (e, k) = (p[2 + i * 2] as usize, p[3 + i * 2]);
+                        if e < self.event_keys[slot].len() {
+                            self.event_keys[slot][e] = k;
+                        }
+                    }
+                    r[0] = STATUS_OK;
+                }
+            }
             CMD_OLED_SET_LAYER_COUNT => {
                 if p[0] > 0 {
                     self.layer_screen_count = p[0].min(LAYER_COUNT as u8);
@@ -910,8 +1183,7 @@ impl BoardModel {
                 self.pomodoro = (
                     keep_or(p[0], self.pomodoro.0, POMO_MAX_MINUTES),
                     keep_or(p[1], self.pomodoro.1, POMO_MAX_MINUTES),
-                    keep_or(p[2], self.pomodoro.2, POMO_MAX_MINUTES),
-                    keep_or(p[3], self.pomodoro.3, POMO_MAX_EVERY),
+                    keep_or(p[2], self.pomodoro.2, POMO_MAX_CYCLES),
                 );
                 r[0] = STATUS_OK;
             }

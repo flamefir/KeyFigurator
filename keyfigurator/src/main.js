@@ -1,10 +1,92 @@
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 
 const hasTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+
+// ── Log ─────────────────────────────────────────────────────────────────────
+// Every entry is timestamp + message + SOURCE, because "something failed" with
+// no source is what turned a one-line struct mismatch into a multi-session
+// hunt: oled_push was rejecting the whole payload and the only trace was a
+// console.warn nobody reads.
+//
+// Kept in memory and mirrored to localStorage so a log survives the crash or
+// reload that produced it. Capped, oldest dropped first — an unbounded log in
+// localStorage eventually breaks the thing it is meant to diagnose.
+const LOG_KEY = "kf-log";
+const LOG_MAX = 300;
+let appLog = [];
+
+function loadLog() {
+  try { appLog = JSON.parse(localStorage.getItem(LOG_KEY)) || []; } catch { appLog = []; }
+}
+
+function saveLog() {
+  try { localStorage.setItem(LOG_KEY, JSON.stringify(appLog)); }
+  catch { /* quota: the log is diagnostic, never worth breaking the app for */ }
+}
+
+function logEvent(level, message, source) {
+  const entry = { ts: new Date().toISOString(), level, message: String(message), source };
+  appLog.push(entry);
+  if (appLog.length > LOG_MAX) appLog.splice(0, appLog.length - LOG_MAX);
+  saveLog();
+  // Still goes to the console, so devtools and the log agree.
+  const line = `[${source}] ${entry.message}`;
+  if (level === "error") console.error(line);
+  else if (level === "warn") console.warn(line);
+  else console.log(line);
+  renderLogPanel();
+  return entry;
+}
+
+const logError = (msg, source) => logEvent("error", msg, source);
+const logWarn  = (msg, source) => logEvent("warn",  msg, source);
+const logInfo  = (msg, source) => logEvent("info",  msg, source);
+
+// Rendered from newest first: when something has just gone wrong, the entry
+// you want is the last one.
+function renderLogPanel() {
+  const body = document.getElementById("log-body");
+  const count = document.getElementById("log-count");
+  if (!body || !count) return;
+
+  const errors = appLog.filter(e => e.level === "error").length;
+  count.textContent = appLog.length ? `${appLog.length}${errors ? ` · ${errors} error${errors === 1 ? "" : "s"}` : ""}` : "";
+  count.classList.toggle("has-errors", errors > 0);
+
+  if (!appLog.length) {
+    body.innerHTML = `<div class="log-empty">Nothing logged yet.</div>`;
+    return;
+  }
+  body.innerHTML = [...appLog].reverse().map(e => `
+    <div class="log-row ${e.level}">
+      <span class="log-ts">${escapeHtml(e.ts.slice(11, 23))}</span>
+      <span class="log-src">${escapeHtml(e.source)}</span>
+      <span class="log-msg">${escapeHtml(e.message)}</span>
+    </div>`).join("");
+}
+
+function logAsText() {
+  return appLog.map(e => `${e.ts}  [${e.level}] ${e.source}: ${e.message}`).join("\n");
+}
+
+function clearLog() {
+  appLog = [];
+  saveLog();
+  renderLogPanel();
+}
+
 let browserState = null;
+
+// Every backend call goes through here, so this is the one place that can see
+// a failure with the command name attached. A rejected payload used to surface
+// as an unlabelled console warning at best.
 async function invoke(cmd, args) {
-  if (hasTauri) return tauriInvoke(cmd, args);
-  return browserMock(cmd, args);
+  try {
+    return hasTauri ? await tauriInvoke(cmd, args) : browserMock(cmd, args);
+  } catch (e) {
+    logError(e?.message ?? e, `invoke:${cmd}`);
+    throw e;
+  }
 }
 function browserMock(cmd, args) {
   if (!browserState) {
@@ -53,8 +135,11 @@ const BOARD_POSITIONS = [
 let keymap = null;
 let selectedKeys = new Set();
 let keyLedColors  = Array.from({ length: 21 }, () => "#ffffff");
-let keyIconLabels = Array(21).fill("");   // optional per-key icon/emoji (max 2 chars)
-let keyIconImages = Array(21).fill(null); // optional per-key image data URL
+let keyIconImages = Array(21).fill(null); // optional per-key icon: PNG/SVG data URL
+// The same icon rasterised to the board's 32x32 1-bit mask, base64. Kept beside
+// the image rather than derived at push time because rasterising needs a canvas
+// and an image decode, both async, and buildOledConfig() is not.
+let keyIconBits   = Array(21).fill(null);
 let keySelectionOrder = [];              // order in which keys were selected (for snake anim)
 let isDragging = false;
 let wasDragging = false;
@@ -138,12 +223,22 @@ let encoderMode   = "layer"; // "layer" | "scroll"
 const OLED_CUSTOM_KEY     = "kf-oled-custom";
 // No OLED_CD_KEY: the countdown is not persisted at all any more, it always
 // opens at 00:00:00. Old "kf-oled-cd" entries are simply left to rot.
-// Standard 128×128 OLED font presets — char limits derived from real glyph cell widths
+// OLED text sizes.
+//
+// The board has exactly ONE font — the 5x7 table in display.c — drawn at
+// integer scales, so a size is all this can be. These used to claim four
+// different glyph cells (5×7, 6×8, 8×8, 8×16) and four hand-picked character
+// limits, none of which the board could reproduce: it rendered every title at
+// a hardcoded scale 2 whatever was picked here, and accepted titles it then
+// ran off the right edge of the panel.
+//
+// So the limits are now derived, not chosen: draw_string() advances 6*scale
+// per glyph across 128px, giving floor(128 / (6*scale)) characters.
 const OLED_FONTS = [
-  { id: "small",  label: "Small",  hw: "5×7",  previewPx: "8px",  nameMax: 21, titleMax: 19 },
-  { id: "medium", label: "Medium", hw: "6×8",  previewPx: "10px", nameMax: 16, titleMax: 14 },
-  { id: "large",  label: "Large",  hw: "8×8",  previewPx: "13px", nameMax: 13, titleMax: 11 },
-  { id: "xl",     label: "XL",     hw: "8×16", previewPx: "16px", nameMax: 11, titleMax:  9 },
+  { id: "small",  label: "Small",  scale: 1, hw: "5×7",   previewPx: "8px",  nameMax: 21, titleMax: 21 },
+  { id: "medium", label: "Medium", scale: 2, hw: "10×14", previewPx: "13px", nameMax: 10, titleMax: 10 },
+  { id: "large",  label: "Large",  scale: 3, hw: "15×21", previewPx: "19px", nameMax:  7, titleMax:  7 },
+  { id: "xl",     label: "XL",     scale: 4, hw: "20×28", previewPx: "25px", nameMax:  5, titleMax:  5 },
 ];
 let oledFontId = localStorage.getItem("kf-oled-font") || "medium";
 function getOledFont() { return OLED_FONTS.find(f => f.id === oledFontId) ?? OLED_FONTS[1]; }
@@ -219,17 +314,52 @@ function pomoTick() {
     } else if (oledPomoCompleted >= oledPomo.cycles) {
       oledPomoDone    = true;
       oledPomoRunning = false;
+      // The last phase ending is a phase change too, and the one most worth
+      // noticing since nothing follows it. Mirrors pomo_advance().
+      startAlertPulse(POMO_PHASE_FLASHES);
       return;
     } else {
       oledPomoPhase = "work";
     }
     oledPomoAcc   = 0;
     oledPomoStart = performance.now();
+    // Work -> break or break -> work. Inside the loop, so a tick that rolls
+    // two phases at once still announces the one you land on.
+    startAlertPulse(POMO_PHASE_FLASHES);
   }
 }
 
-let oledFlashKeys    = false;
-let oledFlashStart   = 0;
+// ── LED alerts ────────────────────────────────────────────────────────────
+//
+// The whole board flashing red, for the two events you are meant to notice
+// without reading the panel. Mirrors kf_led_alert_render() in the firmware,
+// same colour and the same two rates: the countdown holds until reset (an alarm
+// you can miss is not an alarm), the pomodoro fires a fixed burst and stops.
+const POMO_PHASE_FLASHES = 5;
+const ALERT_HOLD_MS      = 250;   // 2 Hz, countdown
+const ALERT_PULSE_MS     = 100;   // 5 Hz, pomodoro burst
+let alertHold   = false;
+let alertPulses = 0;
+let alertPulseStart = 0;
+let alertWasPainting = false;
+
+function startAlertPulse(count) {
+  alertPulses     = count;
+  alertPulseStart = performance.now();
+}
+
+// null when no alert is up, else true/false for the current half-period.
+function alertPhase(now) {
+  if (alertPulses > 0) {
+    const halves = Math.floor((now - alertPulseStart) / ALERT_PULSE_MS);
+    if (halves >= alertPulses * 2) { alertPulses = 0; return null; }
+    return halves % 2 === 0;
+  }
+  if (alertHold) return Math.floor(now / ALERT_HOLD_MS) % 2 === 0;
+  return null;
+}
+
+// Countdown-done drives alertHold now, so there is no second flash flag.
 
 // No back key. It duplicated Present Keys, which already toggles the sub-mode
 // both ways, and its assignment UI is gone — so a stale "kf-oled-back" entry
@@ -346,48 +476,110 @@ function checkImageSize(dataUrl) {
   });
 }
 
+// The board's icon: 32x32 1-bit, 4 bytes per row, MSB = leftmost pixel.
+const ICON_MASK_W = 32, ICON_MASK_BYTES = (ICON_MASK_W / 8) * ICON_MASK_W;
+
+// Rasterise a PNG or SVG down to that mask, returned base64.
+//
+// A mask, not pixels: the board draws the icon in the panel's own amber like
+// every other element, so colour would cost 32x the RAM to render artwork a
+// 128px amber panel cannot show off anyway.
+//
+// Coverage, not luminance. Icons are overwhelmingly opaque artwork on a
+// transparent ground, so alpha is the shape; a black-on-transparent glyph
+// thresholded by brightness would come out completely blank.
+function rasterizeIconMask(dataUrl) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onerror = () => reject(new Error("image failed to decode"));
+    img.onload = () => {
+      const c = document.createElement("canvas");
+      c.width = c.height = ICON_MASK_W;
+      const ctx = c.getContext("2d", { willReadFrequently: true });
+      // Fit inside the square without distorting: an icon squashed to fit is
+      // worse than one with margin.
+      const scale = Math.min(ICON_MASK_W / img.width, ICON_MASK_W / img.height);
+      const w = Math.max(1, Math.round(img.width * scale));
+      const h = Math.max(1, Math.round(img.height * scale));
+      ctx.drawImage(img, (ICON_MASK_W - w) >> 1, (ICON_MASK_W - h) >> 1, w, h);
+      const px = ctx.getImageData(0, 0, ICON_MASK_W, ICON_MASK_W).data;
+
+      const bytes = new Uint8Array(ICON_MASK_BYTES);
+      for (let y = 0; y < ICON_MASK_W; y++) {
+        for (let x = 0; x < ICON_MASK_W; x++) {
+          const a = px[(y * ICON_MASK_W + x) * 4 + 3];
+          if (a >= 128) bytes[y * 4 + (x >> 3)] |= 0x80 >> (x & 7);
+        }
+      }
+      let bin = "";
+      for (const b of bytes) bin += String.fromCharCode(b);
+      resolve(btoa(bin));
+    };
+    img.src = dataUrl;
+  });
+}
+
+function iconMaskBytes(b64) {
+  if (!b64) return null;
+  const bin = atob(b64);
+  return Array.from({ length: bin.length }, (_, i) => bin.charCodeAt(i));
+}
+
 function renderOledScreenContent(screenEl) {
   const screens = getOledScreens();
   if (!screens.length) { screenEl.innerHTML = ""; return; }
   if (oledScreenIdx >= screens.length) oledScreenIdx = screens.length - 1;
   const screen = screens[oledScreenIdx];
 
+  // Present Keys is an inspection mode for the BOARD, so it renders whatever
+  // screen you are on rather than only layer screens. It used to live inside
+  // the layer case, which is why triggering it elsewhere did nothing.
+  if (oledSubMode === "keycycle") {
+    const cyclePos    = BOARD_POSITIONS[oledKeyCycleIdx];
+    const cycleKeyI   = cyclePos?.idx ?? 0;
+    const ksk         = currentOledScreenKey();
+    const kScreenEvMap = ksk ? (oledEventKeys[ksk] || {}) : {};
+    const evEntry     = Object.entries(kScreenEvMap).find(([, v]) => evIdx(v) === cycleKeyI);
+    const evLabel     = evEntry ? OLED_EVENT_LABELS[evEntry[0]] : null;
+    let numLabel, icon, text;
+    if (cyclePos?.type === "encoder") {
+      numLabel = "ENC"; icon = null; text = "ENCODER";
+    } else {
+      numLabel = String(cycleKeyI + 1).padStart(2, "0");
+      // Exactly one of icon / macro title / keycode, in that priority — the
+      // same rule the board applies.
+      const info = keyPresentInfo(cycleKeyI);
+      icon = info.icon;
+      text = icon ? "" : keyPresentText(cycleKeyI);
+    }
+    // The screen action is a separate line, not a competitor. Those three
+    // answer "what is this key"; this answers "what does it do HERE" — and on
+    // this screen the binding swallows the press entirely, so the keycode and
+    // the action are both true and both worth saying.
+    const body = icon
+      ? `<img class="oled-kc-icon-img" src="${icon}" alt="" />`
+      : `<div class="oled-kc-val">${escapeHtml(text || "—")}</div>`;
+    screenEl.innerHTML = `<div class="oled-keycycle">
+      <div class="oled-kc-num">${numLabel}</div>
+      ${body}
+      ${evLabel ? `<div class="oled-kc-event">${escapeHtml(evLabel)}</div>` : ""}
+    </div>`;
+    return;
+  }
+
   switch (screen.type) {
     case "layer": {
-      if (oledSubMode === "keycycle") {
-        const cyclePos    = BOARD_POSITIONS[oledKeyCycleIdx];
-        const cycleKeyI   = cyclePos?.idx ?? 0;
-        const ksk         = currentOledScreenKey();
-        const kScreenEvMap = ksk ? (oledEventKeys[ksk] || {}) : {};
-        const evEntry     = Object.entries(kScreenEvMap).find(([, v]) => evIdx(v) === cycleKeyI);
-        const evLabel     = evEntry ? OLED_EVENT_LABELS[evEntry[0]] : null;
-        let numLabel, icon, disp;
-        if (cyclePos?.type === "encoder") {
-          numLabel = "ENC"; icon = ""; disp = evLabel || "ENCODER";
-        } else {
-          numLabel = String(cycleKeyI + 1).padStart(2, "0");
-          const kc = keymap?.layers[0]?.keys[cycleKeyI] ?? "KC_NO";
-          icon = keyIconLabels[cycleKeyI] || "";
-          disp = evLabel || kc.replace(/^KC_/, "");
-        }
-        screenEl.innerHTML = `<div class="oled-keycycle">
-          <div class="oled-kc-num">${numLabel}</div>
-          ${icon ? `<div class="oled-kc-icon">${icon}</div>` : ""}
-          <div class="oled-kc-val">${disp}</div>
-        </div>`;
-      } else {
-        const layers    = getSavedLayers();
-        const layer     = layers.find(l => l.id === screen.layerId);
-        const idx       = String(layers.indexOf(layer) + 1).padStart(2, "0");
-        // The name IS the screen. It used to be a secondary line under a fixed
-        // "LAYER NN", gated behind a Show toggle, so renaming a layer appeared
-        // to do nothing — the big text never changed. Falls back to LAYER NN
-        // only when the layer has no name at all.
-        const name = (layer?.name || "").toUpperCase().slice(0, oledNameMax());
-        screenEl.innerHTML = `<div class="oled-layer-screen">
-          <div class="oled-lyr-name">${escapeHtml(name || `LAYER ${idx}`)}</div>
-        </div>`;
-      }
+      const layers = getSavedLayers();
+      const layer  = layers.find(l => l.id === screen.layerId);
+      const idx    = String(layers.indexOf(layer) + 1).padStart(2, "0");
+      // The name IS the screen. It used to be a secondary line under a fixed
+      // "LAYER NN", gated behind a Show toggle, so renaming a layer appeared
+      // to do nothing — the big text never changed. Falls back to LAYER NN
+      // only when the layer has no name at all.
+      const name = (layer?.name || "").toUpperCase().slice(0, oledNameMax());
+      screenEl.innerHTML = `<div class="oled-layer-screen">
+        <div class="oled-lyr-name">${escapeHtml(name || `LAYER ${idx}`)}</div>
+      </div>`;
       break;
     }
     case "timer": {
@@ -487,12 +679,13 @@ function updateOledDisplay() {
 }
 
 function oledScreenNav(dir) {
-  if (oledCdDone) { oledCdDone = false; oledFlashKeys = false; oledCdAcc = 0; }
+  if (oledCdDone) { oledCdDone = false; alertHold = false; oledCdAcc = 0; }
   oledSubMode = "nav";
   const screens = getOledScreens();
   oledScreenIdx = (oledScreenIdx + dir + screens.length) % screens.length;
   const screen = screens[oledScreenIdx];
-  if (screen?.type === "layer") switchToLayer(screen.layerId, { silent: true });
+  // Every screen, not just layers: a custom screen owns a profile too.
+  switchToScreen(screen);
   updateOledDisplay();
   renderLayerBar();
 }
@@ -523,20 +716,11 @@ function triggerOledEvent(eventName) {
       if (oledSubMode === "keycycle") {
         oledSubMode = "nav"; oledKeyCycleIdx = 0;
       } else {
-        // Present Keys only renders on a layer screen, so we have to be ON one.
-        // Prefer the active profile's screen, but fall back to any layer screen:
-        // requiring activeProfileId meant that with no saved layer the mode was
-        // entered and then rendered nothing, looking like a dead key.
-        const pscreens = getOledScreens();
-        if (pscreens[oledScreenIdx]?.type !== "layer") {
-          let layerScrIdx = pscreens.findIndex(s => s.type === "layer" && s.layerId === activeProfileId);
-          if (layerScrIdx === -1) layerScrIdx = pscreens.findIndex(s => s.type === "layer");
-          if (layerScrIdx === -1) {
-            console.warn("Present Keys needs a layer screen; none exists (no saved layers yet)");
-            break;
-          }
-          oledScreenIdx = layerScrIdx;
-        }
+        // Stays on the current screen. It used to jump to a layer screen,
+        // because Present Keys only rendered on one — so triggering it from a
+        // Pomodoro screen silently moved you somewhere else. It is an
+        // inspection mode for the board, and the board is the same whichever
+        // screen is showing.
         oledSubMode = "keycycle"; oledKeyCycleIdx = 0;
       }
       updateOledDisplay(); renderBoard();
@@ -587,7 +771,7 @@ function triggerOledEvent(eventName) {
       break;
     case "cdEvent":
       if (oledCdDone) {
-        oledCdDone = false; oledCdRunning = false; oledCdAcc = 0; oledFlashKeys = false;
+        oledCdDone = false; oledCdRunning = false; oledCdAcc = 0; alertHold = false;
         updateOledDisplay(); renderBoard();
       } else if (oledCdRunning) {
         oledCdAcc += (performance.now() - oledCdStart) / 1000;
@@ -638,7 +822,7 @@ function onEncoderPress() {
   if (screen?.type === "countdown") {
     if (oledCdDone) {
       oledCdDone = false; oledCdRunning = false;
-      oledCdAcc  = 0;    oledFlashKeys = false;
+      oledCdAcc  = 0;    alertHold = false;
       updateOledDisplay(); renderBoard(); return;
     }
     if (oledCdRunning) {
@@ -787,6 +971,127 @@ const OLED_SLEEP_TIMEOUT_S = 60;
 
 function screenSleepEnabled(sk) {
   return sk ? oledSleepScreens[sk] === true : false;
+}
+
+// Stable wire ids, matching `enum kf_event` in kf_hid.h. Anything not listed
+// here is app-only and simply is not sent.
+const EVENT_WIRE_ID = {
+  presentKeys:    0,
+  timerStartStop: 1,
+  timerReset:     2,
+  cdEvent:        3,
+  cdLeft:         4,
+  cdRight:        5,
+  cdUp:           6,
+  cdDown:         7,
+  pomoStartStop:  8,
+};
+
+// What Present Keys says about a key, in priority order: the ICON if the key
+// has one, else the macro title, else the keycode. Exactly one of the three.
+//
+// The icon wins because it is the user's explicit statement of what this key
+// is — a name they chose over one the app derived. The text fields are what
+// stands in when there isn't one.
+//
+// The board is sent all of it (text via 0x5D, the icon's 32x32 mask via 0x5F)
+// and applies the same priority, so the two views cannot disagree.
+function keyPresentInfo(idx) {
+  const macroName = keyMacros[idx] ? (findMacroById(keyMacros[idx])?.name ?? "") : "";
+  const kc = keycodeAt(idx);
+  return {
+    icon: keyIconImages[idx] || null,
+    macro_title: macroName,
+    keycode: (kc === "KC_NO" || kc === "KC_TRNS") ? "" : kc.replace(/^KC_/, ""),
+  };
+}
+
+// Which of the three actually shows, as one string — or null when it is the
+// icon, which is an image rather than text.
+function keyPresentText(idx) {
+  const i = keyPresentInfo(idx);
+  if (i.icon) return null;
+  return i.macro_title || i.keycode || "";
+}
+
+function buildKeyInfo() {
+  return Array.from({ length: 21 }, (_, i) => {
+    const info = keyPresentInfo(i);
+    return { macro_title: info.macro_title, keycode: info.keycode };
+  });
+}
+
+// The icon masks, in board key order. `null` means "this key has no icon",
+// which the board is told explicitly so a removed icon actually goes away.
+function buildKeyIcons() {
+  return Array.from({ length: 21 }, (_, i) => iconMaskBytes(keyIconBits[i]));
+}
+
+function buildEventKeys() {
+  // Same nav-index convention as the sleep mask: the first four saved layers
+  // are slots 0..3, custom screens follow at 4..9.
+  const slotOf = {};
+  getSavedLayers().slice(0, 4).forEach((l, i) => { slotOf[l.id] = i; });
+  oledCustomScreens.slice(0, 6).forEach((sc, i) => { slotOf[sc.id] = 4 + i; });
+
+  const out = [];
+  for (const [screenKey, events] of Object.entries(oledEventKeys)) {
+    const slot = slotOf[screenKey];
+    if (slot === undefined) continue;
+    for (const [name, entry] of Object.entries(events)) {
+      const wire = EVENT_WIRE_ID[name];
+      const key  = evIdx(entry);
+      if (wire === undefined || key === null || key === undefined) continue;
+      out.push([slot, wire, key]);
+    }
+  }
+  return out;
+}
+
+// Every screen's LED profile, in the same fixed slot space as the sleep mask
+// and the event keys.
+//
+// The app has always kept a profile per screen; the board held exactly one, so
+// an animation set on the first layer went on running after you rotated to a
+// pomodoro screen. It cannot be fixed by pushing the active profile harder:
+// the encoder changes screens with no app involved and has to keep working
+// with the app closed, so the board needs all of them up front.
+//
+// The screen being edited reads from the LIVE state rather than storage —
+// captureProfile() has not run for it yet, and pushing its stale stored copy
+// would undo the edit that triggered the push.
+function buildScreenLeds() {
+  const out = [];
+  const add = (slot, id, stored) => {
+    const live = id === activeProfileId;
+    const prof = live ? captureProfile() : stored;
+    const cols = prof?.leds ?? [];
+    const anim = animFromStored(prof?.animStates);
+    const ug   = prof?.underglow ?? null;
+    const corners = Array.isArray(ug?.cornerColors) ? ug.cornerColors : cornerColors;
+    // Same tint rule buildAnimState() uses: a palette's first entry stands in
+    // for the base colour, so a cycling screen does not push a stale tint.
+    const tint = (Array.isArray(anim.palette) && anim.palette.length > 0)
+      ? anim.palette[0]
+      : "#ffb454";
+    out.push({
+      slot,
+      leds: {
+        keys: Array.from({ length: 21 }, (_, i) => hexToRgbArr(cols[i] || "#ffffff")),
+        underglow: UG_APP_TO_WIRE.map(i => hexToRgbArr(corners[i] || "#ffffff")),
+        brightness: ledBrightness,
+      },
+      anim: { name: anim.animation ?? "solid", speed: anim.rate ?? 128, color: hexToRgbArr(tint) },
+      underglow: {
+        name:      ug?.animation ?? "solid",
+        speed:     ug?.rate      ?? 128,
+        intensity: ug?.intensity ?? 180,
+      },
+    });
+  };
+  getSavedLayers().slice(0, 4).forEach((l, i) => add(i, l.id, l));
+  oledCustomScreens.slice(0, 6).forEach((s, i) => add(4 + i, s.id, s.profile));
+  return out;
 }
 
 function buildSleepMask() {
@@ -1257,7 +1562,11 @@ function renderOledPill() {
   renderOledPillContent();
 }
 
-function applyOledFont(fontId) {
+// `push` false for the boot-time call that just re-applies the stored choice.
+// scheduleLiveSync() also auto-saves, and at boot there is no device selected
+// yet — so syncing there wrote a stray kf-devcfg::default alongside the real
+// per-device blob, and whichever one a reader found first won.
+function applyOledFont(fontId, push = true) {
   oledFontId = fontId;
   localStorage.setItem("kf-oled-font", fontId);
   const font = getOledFont();
@@ -1271,6 +1580,9 @@ function applyOledFont(fontId) {
   });
   updateOledDisplay();
   renderOledPillContent();
+  // The board draws titles at this scale too. Without this the picker moved
+  // the preview and nothing else — the panel stayed on its hardcoded size.
+  if (push) scheduleLiveSync("oled");
 }
 
 function startOledAnim() {
@@ -1282,7 +1594,9 @@ function oledAnimTick(now) {
   // Countdown completion
   if (oledCdRunning && getCdRemaining() <= 0) {
     oledCdRunning = false; oledCdDone = true;
-    oledFlashKeys = true;  oledFlashStart = performance.now();
+    // Red until the countdown is reset. The screen already says DONE, but only
+    // if you happen to be looking at it.
+    alertHold = true;
     updateOledDisplay(); flashBoard();
   }
 
@@ -1315,13 +1629,13 @@ function buildTooltipHTML(idx) {
   const kcDisp = (kc === "KC_NO" || kc === "KC_TRNS") ? null : kc.replace(/^KC_/, "");
   const led   = keyLedColors[idx];
   const hasLed = !!led;
-  const icon  = keyIconLabels[idx];
+  const icon  = keyIconImages[idx];
   const anim  = klAnimation;
   const macro = keyMacros[idx] ? findMacroById(keyMacros[idx]) : null;
   const layer = getSavedLayers().find(l => l.id === activeProfileId);
 
   let html = `<div class="ktt-kc">`;
-  if (icon) html += `<span class="ktt-icon">${icon}</span>`;
+  if (icon) html += `<img class="ktt-icon-img" src="${icon}" alt="" />`;
   html += kcDisp
     ? `<span>${kcDisp}</span>`
     : `<span class="ktt-empty">—</span>`;
@@ -1347,6 +1661,20 @@ function buildTooltipHTML(idx) {
     html += `<div class="ktt-row">
       <span class="ktt-label">MACRO</span>
       <span class="ktt-val">${escapeHtml(macro.name)}</span>
+    </div>`;
+  }
+
+  // What this key does on the screen currently showing. Worth its own row
+  // rather than folding into KEYCODE: on this screen the binding swallows the
+  // press, so the keycode above it does not fire at all — and that is exactly
+  // the thing a tooltip listing the keycode would otherwise be lying about.
+  const ttScreenKey = currentOledScreenKey();
+  const ttEvents    = ttScreenKey ? (oledEventKeys[ttScreenKey] || {}) : {};
+  const ttEvEntry   = Object.entries(ttEvents).find(([, v]) => evIdx(v) === idx);
+  if (ttEvEntry) {
+    html += `<div class="ktt-row">
+      <span class="ktt-label">EVENT</span>
+      <span class="ktt-val ktt-event">${escapeHtml(OLED_EVENT_LABELS[ttEvEntry[0]] ?? ttEvEntry[0])}</span>
     </div>`;
   }
 
@@ -1942,19 +2270,45 @@ function klAnimTick(now) {
     document.documentElement.style.setProperty("--kl-cycle-color", hexToRgbTriple(klPalette[pi]));
   }
 
-  // Countdown-done: flash all key LEDs until encoder press resets
-  if (oledFlashKeys) {
-    const age    = (now - oledFlashStart) / 1000;
-    const flashOp = 0.35 + 0.35 * Math.sin(age * Math.PI * 5);
+  // An alert owns the whole board while it is up: red, on/off, over every
+  // other LED layer including the underglow. Same square wave the firmware
+  // renders, so the two read identically.
+  const alertOn = alertPhase(now);
+  if (alertOn !== null) {
+    const border = alertOn ? "rgba(255,40,40,0.95)" : "rgba(255,40,40,0.10)";
+    const glow   = alertOn ? "0 0 16px rgba(255,40,40,0.85)" : "none";
     for (const pos of BOARD_POSITIONS) {
       const el = document.getElementById("key-" + pos.idx);
       if (!el) continue;
-      el.style.borderColor = `rgba(255,180,84,${flashOp.toFixed(3)})`;
-      el.style.boxShadow   = `0 0 14px rgba(255,180,84,${(flashOp * 0.8).toFixed(3)})`;
-      el.style.color       = "";
+      // !important, because a screen-event key's own border colour is declared
+      // !important in the stylesheet and a plain inline style loses to it —
+      // those keys simply would not join the alert. An alarm with holes in it
+      // is not an alarm.
+      el.style.setProperty("border-color", border, "important");
+      el.style.setProperty("box-shadow", glow, "important");
+      el.style.color = "";
     }
+    for (const dot of document.querySelectorAll(".ug-dot")) {
+      dot.style.background = alertOn ? "#ff2828" : "#2a0808";
+    }
+    alertWasPainting = true;
     klAnimFrame = requestAnimationFrame(klAnimTick);
     return;
+  }
+  // Hand everything back. The !important properties have to be REMOVED, not
+  // overwritten — the normal per-frame path assigns plain inline styles, which
+  // would lose to them exactly as the stylesheet did. The corner dots are set
+  // by applyCornerColors() rather than recomputed per frame, so they need the
+  // same explicit restore.
+  if (alertWasPainting) {
+    alertWasPainting = false;
+    for (const pos of BOARD_POSITIONS) {
+      const el = document.getElementById("key-" + pos.idx);
+      if (!el) continue;
+      el.style.removeProperty("border-color");
+      el.style.removeProperty("box-shadow");
+    }
+    applyCornerColors();
   }
 
   for (const pos of BOARD_POSITIONS) {
@@ -2037,7 +2391,7 @@ async function init() {
       await invoke("eeprom_commit");
       btn.textContent = "Saved ✓";
     } catch (e) {
-      console.warn("save to board failed", e);
+      logError(e, "saveToBoard");
       btn.textContent = _wasConnected ? "Failed" : "No Board";
     } finally {
       setTimeout(() => { btn.textContent = "Save to Board"; btn.disabled = false; }, 1500);
@@ -2046,6 +2400,35 @@ async function init() {
 
   // ── Home page ─────────────────────────────────────────────────────────────
   document.getElementById("home-add")?.addEventListener("click", scanForDevices);
+
+  // ── Log panel ─────────────────────────────────────────────────────────────
+  loadLog();
+  const logPanel = document.getElementById("log-panel");
+  document.getElementById("log-toggle")?.addEventListener("click", () => {
+    const open = logPanel.classList.toggle("open");
+    document.getElementById("log-caret").innerHTML = open ? "&#9662;" : "&#9656;";
+  });
+  document.getElementById("log-clear")?.addEventListener("click", clearLog);
+  document.getElementById("log-copy")?.addEventListener("click", async () => {
+    const btn = document.getElementById("log-copy");
+    try {
+      await navigator.clipboard.writeText(logAsText());
+      btn.textContent = "Copied";
+    } catch {
+      btn.textContent = "Failed";
+    }
+    setTimeout(() => { btn.textContent = "Copy"; }, 1200);
+  });
+
+  // Anything that escapes a handler still lands in the log rather than only in
+  // devtools, which is where the last round of silent failures went to die.
+  window.addEventListener("error", (e) => {
+    logError(e.message || "uncaught error", `${e.filename || "app"}:${e.lineno || "?"}`);
+  });
+  window.addEventListener("unhandledrejection", (e) => {
+    logError(e.reason?.message ?? e.reason ?? "unhandled rejection", "promise");
+  });
+  renderLogPanel();
   document.getElementById("app-home")?.addEventListener("click", () => {
     if (document.body.classList.contains("editor")) leaveEditor();
   });
@@ -2131,7 +2514,7 @@ async function init() {
         console.log("board-connection", connected ? "attached" : "detached");
         onConnectionChange(connected);
       });
-    } catch (e) { console.warn("event listen failed", e); }
+    } catch (e) { logError(e, "backendEvents"); }
   }
 
   // Restore underglow + corner + advanced settings from localStorage
@@ -2203,8 +2586,8 @@ async function init() {
   const bootLayer = getSavedLayers()[0];
   keymap         = sanitizeKeymap(structuredClone(bootLayer.keymap));
   keyLedColors   = [...bootLayer.leds];
-  keyIconLabels  = bootLayer.icons ? [...bootLayer.icons] : Array(21).fill("");
   keyIconImages  = bootLayer.iconImages ? [...bootLayer.iconImages] : Array(21).fill(null);
+  keyIconBits    = bootLayer.iconBits ? [...bootLayer.iconBits] : Array(21).fill(null);
   if (bootLayer.animStates) {
     try { applyAnimState(animFromStored(bootLayer.animStates)); } catch {}
   }
@@ -2401,39 +2784,46 @@ async function init() {
     }
   });
 
-  document.getElementById("kl-icon").addEventListener("input", (e) => {
-    const val = [...e.target.value].slice(0, 2).join(""); // safe emoji-aware slice
-    e.target.value = val;
+  document.getElementById("kl-icon-file")?.addEventListener("change", async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    e.target.value = "";
+    // PNG and SVG only. Both rasterise cleanly to the board's 1-bit mask, and
+    // an animated format could not be one anyway — the board draws a still.
+    const isPng = file.type === "image/png" || /\.png$/i.test(file.name);
+    const isSvg = file.type === "image/svg+xml" || /\.svg$/i.test(file.name);
+    if (!isPng && !isSvg) {
+      logWarn(`Rejected icon ${file.name}: not PNG or SVG`, "icon-upload");
+      alert("Icons must be a PNG or an SVG.");
+      return;
+    }
+    const url = await readFileAsDataUrl(file);
+    const ok  = await checkImageSize(url);
+    if (!ok) { alert("Image must be 128×128 pixels or smaller."); return; }
+    let bits = null;
+    try {
+      bits = await rasterizeIconMask(url);
+    } catch (err) {
+      // The app can still show the icon; only the board loses it. Say so
+      // rather than failing the upload outright.
+      logError(`Could not rasterise ${file.name} for the board: ${err?.message ?? err}`, "icon-upload");
+    }
     for (const idx of selectedKeys) {
-      keyIconLabels[idx] = val;
-      if (val) keyIconImages[idx] = null; // text replaces image
+      keyIconImages[idx] = url;
+      keyIconBits[idx]   = bits;
     }
     if (selectedKeys.size === 1) updateIconPreview([...selectedKeys][0]);
     renderBoard();
-    // Icons are host-side only, so they never reach scheduleLiveSync — they
+    // Icons are host-side state, so they never reach scheduleLiveSync — they
     // need saving explicitly or they are lost on restart.
     scheduleAutoSave();
   });
 
-  document.getElementById("kl-icon-file")?.addEventListener("change", async (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-    const url = await readFileAsDataUrl(file);
-    const ok  = await checkImageSize(url);
-    if (!ok) { alert("Image must be 128×128 pixels or smaller."); e.target.value = ""; return; }
-    for (const idx of selectedKeys) {
-      keyIconImages[idx] = url;
-      keyIconLabels[idx] = "";
-    }
-    document.getElementById("kl-icon").value = "";
-    if (selectedKeys.size === 1) updateIconPreview([...selectedKeys][0]);
-    renderBoard();
-    scheduleAutoSave();
-    e.target.value = "";
-  });
-
   document.getElementById("kc-icon-clear")?.addEventListener("click", () => {
-    for (const idx of selectedKeys) keyIconImages[idx] = null;
+    for (const idx of selectedKeys) {
+      keyIconImages[idx] = null;
+      keyIconBits[idx]   = null;
+    }
     if (selectedKeys.size === 1) updateIconPreview([...selectedKeys][0]);
     renderBoard();
     scheduleAutoSave();
@@ -2446,7 +2836,7 @@ async function init() {
     const btn = e.target.closest(".oled-font-btn");
     if (btn) { e.stopPropagation(); applyOledFont(btn.dataset.font); }
   });
-  applyOledFont(oledFontId);
+  applyOledFont(oledFontId, false);
 }
 
 function evIdx(v)   { return typeof v === "number" ? v : (v?.idx ?? null); }
@@ -2556,38 +2946,43 @@ function renderBoard() {
       const isEventKey     = !!evEntry;
       const isAssigning    = pendingEventAssign !== null && !isEventKey;
       const isSpecial      = isSpecialKeyForScreen(kc, isEventKey);
+      // While Present Keys is up the board owns the whole key field: every key
+      // goes plain white, the focused one blinks 2 Hz and the screen's event
+      // keys blink RED at 4 Hz. Mirrored here so the two views agree about
+      // which keys are lit and why.
+      const inPresent = oledSubMode === "keycycle";
       k.className = "key"
         + (isSel ? " sel" : "")
         + (isEmpty ? " empty" : "")
         + (isCycleActive ? " oled-key-active" : "")
+        + (inPresent && isCycleActive ? " oled-present-focus" : "")
         + (isEventKey ? " oled-event-key" : "")
+        + (inPresent && isEventKey && !isCycleActive ? " oled-present-event" : "")
         + (isSpecial && !isAssigning ? " key-special-blink" : "")
         + (isAssigning ? " oled-assigning" : "");
       k.style.cssText = `grid-row:${pos.row};grid-column:${pos.col}`;
-      if (isEventKey) {
+      if (isEventKey && !inPresent) {
         const { r, g, b } = hexToRgb(evColor(evEntry));
         k.style.setProperty("--oled-ev-color", `rgba(${r},${g},${b},0.75)`);
       }
-      const icon = keyIconLabels[pos.idx];
       const imgSrc = keyIconImages[pos.idx];
       if (imgSrc) {
+        // Label priority: icon > macro name > keycode. An icon is an explicit
+        // choice about how this key should read, so it outranks the macro name
+        // even when a macro is bound. Same rule the board applies.
         const imgEl = document.createElement("img");
         imgEl.src = imgSrc;
         imgEl.className = "key-icon-img";
         k.appendChild(imgEl);
       } else {
-        // Label priority: uploaded image > icon > macro name > keycode.
-        // An icon is an explicit choice about how this key should read, so it
-        // outranks the macro name even when a macro is bound.
         const macroName = keyMacros[pos.idx]
           ? (findMacroById(keyMacros[pos.idx])?.name ?? null)
           : null;
-        const usingMacroName = !icon && !!macroName;
         const label = document.createElement("span");
         // Macro names are free text and far longer than a keycode, so they get
         // the smaller, wrapping treatment.
-        label.className = "key-label" + (usingMacroName ? " macro" : "");
-        label.textContent = icon || macroName || (isEmpty ? "·" : kc.replace(/^KC_/, ""));
+        label.className = "key-label" + (macroName ? " macro" : "");
+        label.textContent = macroName || (isEmpty ? "·" : kc.replace(/^KC_/, ""));
         k.appendChild(label);
       }
       k.addEventListener("mousedown", (e) => { e.preventDefault(); onKeyDown(pos.idx); });
@@ -2677,12 +3072,6 @@ function onKeyEnter(idx) {
   flashKey(idx);
 }
 
-function updateBackKeyRow() {
-  // The layer-events block moved out of the key pill; a screen's actions are
-  // assigned from its own SCREEN EVENTS rows now. Kept as a no-op rather than
-  // hunting every call site, since it is called from several render paths.
-}
-
 function syncKeyLedPill() {
   const n          = selectedKeys.size;
   const encOnly    = n === 1 && selectedKeys.has(ENCODER_IDX);
@@ -2692,20 +3081,20 @@ function syncKeyLedPill() {
     const [idx] = selectedKeys;
     const kc = keymap.layers[0].keys[idx] ?? "KC_NO";
     document.getElementById("kl-kc").value   = kc === "KC_NO" ? "" : kc;
-    document.getElementById("kl-icon").value = keyIconLabels[idx] || "";
     const col = keyLedColors[idx];
     document.getElementById("kl-color").value = col || "#ffffff";
     updateIconPreview(idx);
   } else {
     document.getElementById("kl-kc").value   = "";
-    document.getElementById("kl-icon").value = "";
     const colors = [...selectedKeys].map(i => keyLedColors[i]).filter(c => !!c);
     document.getElementById("kl-color").value =
       (colors.length && colors.every(c => c === colors[0])) ? colors[0] : "#ffffff";
     updateIconPreview(null);
   }
   updateKlColorVars();
-  updateBackKeyRow();
+  // The MACRO dropdown is per-key: it has to be rebuilt whenever the selection
+  // changes, or it shows the previous key's binding (or nothing at all).
+  renderKeyMacroRow();
 }
 
 function updateIconPreview(idx) {
@@ -2732,21 +3121,99 @@ function getSavedLayers() {
   } catch { return []; }
 }
 
-function saveCurrentLayerState() {
+// A PROFILE is everything a screen owns: its keymap, per-key colours, icons,
+// macros, LED animation and underglow. Saved layers always had one; custom
+// screens did not, so navigating to a Pomodoro screen left the previous
+// layer's keys and LEDs in place — a macro bound on one screen appeared to
+// follow you to the next, and its animation kept running. Every screen owns
+// one now, and a screen without a stored profile starts at the same defaults a
+// blank layer does: no keycodes, white keys, white underglow, solid.
+function captureProfile() {
+  return {
+    keymap:     structuredClone(keymap),
+    leds:       [...keyLedColors],
+    iconImages: [...keyIconImages],
+    iconBits:   [...keyIconBits],
+    // Kept with the profile: it owns the keymap, and MACRO(n) keycodes are
+    // meaningless without the bindings that produced them.
+    keyMacros:  [...keyMacros],
+    animStates: currentAnimState(),
+    underglow:  currentUnderglowSnapshot(),
+  };
+}
+
+function applyProfile(p) {
+  keymap = p?.keymap
+    ? sanitizeKeymap(structuredClone(p.keymap))
+    : { layers: Array.from({ length: 4 }, () => ({ keys: Array(21).fill("KC_NO") })) };
+  keyLedColors  = p?.leds       ? [...p.leds]       : Array.from({ length: 21 }, () => "#ffffff");
+  keyIconImages = p?.iconImages ? [...p.iconImages] : Array(21).fill(null);
+  keyIconBits   = p?.iconBits   ? [...p.iconBits]   : Array(21).fill(null);
+  keyMacros     = p?.keyMacros  ? [...p.keyMacros]  : Array(21).fill(null);
+  // Both of these already fall back to the defaults on null/undefined.
+  applyAnimState(animFromStored(p?.animStates));
+  applyUnderglowSnapshot(p?.underglow ?? null);
+}
+
+/// The id of whatever screen a profile belongs to.
+function screenProfileId(screen) {
+  if (!screen) return null;
+  return screen.type === "layer" ? screen.layerId : screen.id;
+}
+
+function profileForScreen(screen) {
+  if (!screen) return null;
+  return screen.type === "layer"
+    ? getSavedLayers().find(l => l.id === screen.layerId)
+    : screen.profile;
+}
+
+// Write the live state back to whichever screen it belongs to. Replaces the
+// layer-only version: activeProfileId can now name a custom screen too.
+function saveCurrentProfile() {
   if (!activeProfileId) return;
   const layers = getSavedLayers();
-  const cur = layers.find(l => l.id === activeProfileId);
-  if (!cur) return;
-  cur.keymap     = structuredClone(keymap);
-  cur.leds       = [...keyLedColors];
-  cur.icons      = [...keyIconLabels];
-  cur.iconImages = [...keyIconImages];
-  // Kept with the layer: the layer owns the keymap, and MACRO(n) keycodes are
-  // meaningless without the bindings that produced them.
-  cur.keyMacros  = [...keyMacros];
-  cur.animStates = currentAnimState();
-  cur.underglow  = currentUnderglowSnapshot();
-  localStorage.setItem(layersKeyScoped(), JSON.stringify(layers));
+  const layer  = layers.find(l => l.id === activeProfileId);
+  if (layer) {
+    Object.assign(layer, captureProfile());
+    localStorage.setItem(layersKeyScoped(), JSON.stringify(layers));
+    return;
+  }
+  const scr = oledCustomScreens.find(x => x.id === activeProfileId);
+  if (scr) {
+    scr.profile = captureProfile();
+    saveOledCustomScreens();
+    scheduleAutoSave();
+  }
+}
+
+// Move the board onto a screen's own profile. Silent by default because this
+// runs on every navigation; the layer bar handles its own focus.
+async function switchToScreen(screen) {
+  const id = screenProfileId(screen);
+  if (!id || id === activeProfileId) return;
+  saveCurrentProfile();
+  applyProfile(profileForScreen(screen));
+  activeProfileId = id;
+  keySelectionOrder = [];
+  selectedKeys.clear();
+  closeKeyLedPill();
+  // The pills read the profile's animation state, so they have to be rebuilt
+  // too — switching layers never did this either, leaving the previous
+  // screen's animation highlighted while a different one actually ran.
+  renderKlAnimChips();
+  renderBoard();
+  try {
+    await invoke("set_keymap", { map: keymap });
+    scheduleLiveSync("leds");
+    scheduleLiveSync("anim");
+  } catch (e) {
+    logError(e, "switchToScreen");
+  }
+}
+
+function saveCurrentLayerState() {
+  saveCurrentProfile();
 }
 
 // A blank layer record, built from the defaults rather than from whatever is in
@@ -2776,8 +3243,8 @@ function saveCurrentAsLayer(name) {
     id, name,
     keymap:     structuredClone(keymap),
     leds:       [...keyLedColors],
-    icons:      [...keyIconLabels],
     iconImages: [...keyIconImages],
+    iconBits:   [...keyIconBits],
     keyMacros:  [...keyMacros],
     animStates: currentAnimState(),
     underglow:  currentUnderglowSnapshot(),
@@ -2914,23 +3381,10 @@ function reorderLayers(srcId, dstId) {
 }
 
 async function switchToLayer(id, { silent = false } = {}) {
-  saveCurrentLayerState();
   const layer = getSavedLayers().find(l => l.id === id);
   if (!layer) return;
-  keymap         = sanitizeKeymap(structuredClone(layer.keymap));
-  keyLedColors   = [...layer.leds];
-  keyIconLabels  = layer.icons ? [...layer.icons] : Array(21).fill("");
-  keyIconImages  = layer.iconImages ? [...layer.iconImages] : Array(21).fill(null);
-  keyMacros      = layer.keyMacros ? [...layer.keyMacros] : Array(21).fill(null);
-  applyAnimState(animFromStored(layer.animStates));
-  applyUnderglowSnapshot(layer.underglow ?? null);
-  activeProfileId = id;
-  keySelectionOrder = [];
-  selectedKeys.clear();
-  closeKeyLedPill();
-  renderBoard();
+  await switchToScreen({ type: "layer", layerId: id });
   flashBoard();
-  await invoke("set_keymap", { map: keymap });
   renderLayerBar();
   if (!silent) {
     // The bar's name field is always editable, so "selected for rename" is the
@@ -2942,14 +3396,14 @@ async function switchToLayer(id, { silent = false } = {}) {
 
 // A new layer starts from the SAME default state in every respect: no
 // keycodes, white keys, white underglow, solid animation, no icons or macros.
-// `keyIconLabels` was missing here, so a new blank layer silently inherited the
-// previous layer's icons — the one array that was not being cleared.
+// `keyIconImages` was missing here once, so a new blank layer silently inherited
+// the previous layer's icons — the one array that was not being cleared.
 function switchToBlankLayer() {
   saveCurrentLayerState();
   keymap         = { layers: Array.from({ length: 4 }, () => ({ keys: Array(21).fill("KC_NO") })) };
   keyLedColors   = Array.from({ length: 21 }, () => "#ffffff");
-  keyIconLabels  = Array(21).fill("");
   keyIconImages  = Array(21).fill(null);
+  keyIconBits    = Array(21).fill(null);
   keyMacros      = Array(21).fill(null);
   applyAnimState(mkKeyAnim());
   applyUnderglowSnapshot(null);
@@ -3431,6 +3885,24 @@ function buildOledConfig() {
     // first-4-saved-layers convention as `layers` above — the open question of
     // how an arbitrary-count profile list maps onto four fixed hardware layers
     // is unchanged here, this just does not invent a second answer to it.
+    // Which key triggers which screen action, in the board's nav-index space.
+    // Without these the board can only reach a screen's actions through the
+    // encoder push, which hardware revision 1.0.0 does not have soldered.
+    event_keys: buildEventKeys(),
+    // Present Keys on the board shows these; it cannot derive either the macro
+    // title or a short keycode name for itself.
+    key_info: buildKeyInfo(),
+    // The icon masks. Separate from key_info because they are pixels, not text:
+    // the board renders a 32x32 1-bit mask in its own amber, and picks it over
+    // both text fields when a key has one.
+    key_icons: buildKeyIcons(),
+    // Title size. The board has one font drawn at integer scales, so this is
+    // the whole of what the font picker can mean there.
+    font_scale: getOledFont().scale,
+    // Each screen's own colours and animations, so navigating on the board
+    // changes the LEDs the way navigating in the app does — with the app closed
+    // too, which is the whole point of the board holding them.
+    screen_leds: buildScreenLeds(),
     sleep_mask: buildSleepMask(),
     sleep_timeout_s: OLED_SLEEP_TIMEOUT_S,
     pomodoro: {
@@ -3484,7 +3956,7 @@ async function pushImageToBoard(force = false) {
   } catch (e) {
     // Leave the key unset so the next sync retries rather than assuming success.
     _uploadedImageKey = null;
-    console.warn("oled image upload failed", e);
+    logError(e, "oledImageUpload");
   }
 }
 
@@ -3518,8 +3990,12 @@ async function pushStateToBoard() {
   await invoke("set_ug_anim", { ug: buildUgAnimState() });
   await invoke("set_palette", { target: 0, palette: buildKeyPalette() });
   await invoke("set_palette", { target: 1, palette: buildUgPalette() });
-  try { notePomodoroSupport(await invoke("oled_push", { config: buildOledConfig() })); }
-  catch (e) { console.warn("oled_push failed", e); }
+  // NOT wrapped in a catch. It used to be, so that a board too old for the
+  // pomodoro command could not break the rest of the push — but that case is
+  // handled inside push_oled now, and the catch went on to hide a payload the
+  // backend was rejecting outright. Save reported success while nothing OLED
+  // ever reached the board. Let it throw; the Save button says "Failed".
+  notePomodoroSupport(await invoke("oled_push", { config: buildOledConfig() }));
   // Force: a full push follows a reconnect or a Save, where the board's buffer
   // may have been lost, so the cache cannot be trusted.
   await pushImageToBoard(true);
@@ -3577,7 +4053,7 @@ async function runLiveSync() {
       await pushImageToBoard(false);
     }
   } catch (e) {
-    console.warn("live sync failed", e);
+    logError(e, "liveSync");
     // Put the work back so the next edit retries it rather than dropping it.
     for (const p of parts) _liveSyncPending.add(p);
   } finally {
@@ -3785,7 +4261,7 @@ async function pushDefaultsToBoard() {
     // dark-commit trap by construction: white at full brightness renders.
     await invoke("eeprom_commit");
   } catch (e) {
-    console.warn("reset: pushing defaults to the board failed", e);
+    logError(e, "resetDevice:pushDefaults");
   }
 }
 
@@ -3806,7 +4282,7 @@ async function syncDeviceListConnection(connected) {
     // which device it is rather than guessing it is the one already marked.
     let found = [];
     try { found = await invoke("scan_devices"); }
-    catch (e) { console.warn("identify on connect failed", e); return; }
+    catch (e) { logError(e, "identifyOnConnect"); return; }
     // A board that has never been seen belongs in the list, not ignored.
     for (const f of found) devices = upsertDevice(f);
     const live = new Set(found.map(deviceKey));
@@ -3909,7 +4385,7 @@ async function scanForDevices() {
         </div>`);
     }
   } catch (e) {
-    console.warn("device scan failed", e);
+    logError(e, "scanDevices");
     showScanNotice("warn", `
       <div class="scan-notice-title">Scan failed</div>
       <div>${escapeHtml(String(e))}</div>
@@ -3928,8 +4404,8 @@ let activeDevice = null;
 function resetInMemoryState() {
   keymap        = { layers: Array.from({ length: 4 }, () => ({ keys: Array(21).fill("KC_NO") })) };
   keyLedColors  = Array.from({ length: 21 }, () => "#ffffff");
-  keyIconLabels = Array(21).fill("");
   keyIconImages = Array(21).fill(null);
+  keyIconBits   = Array(21).fill(null);
   keyMacros     = Array(21).fill(null);
   applyAnimState(mkKeyAnim());
   applyUnderglowSnapshot(null);
@@ -4110,7 +4586,7 @@ async function syncHostBindings() {
     });
   }
   try { await invoke("set_bindings", { bindings }); }
-  catch (e) { console.warn("set_bindings failed", e); }
+  catch (e) { logError(e, "syncHostBindings"); }
 }
 
 function bindMacroToKey(idx, macroId) {
@@ -4186,7 +4662,7 @@ function renderKeyMacroRow() {
 // Everything the editor holds is saved automatically, scoped to the device it
 // belongs to. Three problems this exists to fix:
 //
-//   1. `keyLedColors`, `keyIconLabels`, `keyIconImages` and `keymap` only ever
+//   1. `keyLedColors`, `keyIconImages` and `keymap` only ever
 //      reached storage through saveCurrentLayerState(), which returns early
 //      when there is no active saved layer — the default state. Key colours,
 //      icons and keycode edits were simply lost on restart.
@@ -4216,8 +4692,8 @@ function snapshotDeviceState() {
     v: 1,
     keymap,
     keyLedColors:   [...keyLedColors],
-    keyIconLabels:  [...keyIconLabels],
     keyIconImages:  [...keyIconImages],
+    keyIconBits:    [...keyIconBits],
     keyMacros:      [...keyMacros],
     anim:           currentAnimState(),
     underglow:      currentUnderglowSnapshot(),
@@ -4240,7 +4716,7 @@ function persistDeviceState() {
     localStorage.setItem(deviceCfgKey(), JSON.stringify(snapshotDeviceState()));
   } catch (e) {
     // Quota is the realistic failure here — icon images are data URLs.
-    console.warn("device config save failed", e);
+    logError(e, "persistDeviceState");
   }
 }
 
@@ -4259,8 +4735,8 @@ function loadDeviceState() {
 
   if (s.keymap)          keymap          = sanitizeKeymap(s.keymap);
   if (s.keyLedColors)    keyLedColors    = [...s.keyLedColors];
-  if (s.keyIconLabels)   keyIconLabels   = [...s.keyIconLabels];
   if (s.keyIconImages)   keyIconImages   = [...s.keyIconImages];
+  if (s.keyIconBits)     keyIconBits     = [...s.keyIconBits];
   if (Array.isArray(s.keyMacros)) {
     keyMacros = [...s.keyMacros];
     // A macro deleted from its library since the last save leaves a dangling
@@ -4801,7 +5277,7 @@ async function importMacroLibrary(file) {
     renderMacroList();
     console.log(`imported library "${lib.name}" with ${added} macro(s)`);
   } catch (e) {
-    console.warn("macro import failed", e);
+    logError(e, "macroImport");
     if (err) err.textContent = `Import failed: ${e.message}`;
     alert(`Import failed: ${e.message}`);
   }
@@ -5011,7 +5487,7 @@ async function onConnectionChange(connected) {
   if (connected !== _wasConnected) await syncDeviceListConnection(connected);
   if (connected && !_wasConnected) {
     try { await applyActiveProfileToBoard(); }
-    catch (e) { console.warn("apply on connect failed", e); }
+    catch (e) { logError(e, "applyOnConnect"); }
   }
   _wasConnected = connected;
 }
@@ -5049,7 +5525,7 @@ init().then(async () => {
   // the active profile once here. A board attached later is handled by the event.
   if (_wasConnected) {
     try { await applyActiveProfileToBoard(); }
-    catch (e) { console.warn("initial apply failed", e); }
+    catch (e) { logError(e, "initialApply"); }
   }
   setInterval(pollConnection, 3000);
 });

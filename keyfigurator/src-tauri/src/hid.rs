@@ -286,6 +286,95 @@ pub trait HidTransport: Send + Sync {
                 }
             }
         }
+        // Group by screen: one frame per screen carries all of its bindings.
+        for slot in 0u8..10 {
+            let pairs: Vec<(u8, u8)> = cfg
+                .event_keys
+                .iter()
+                .filter(|(s, _, _)| *s == slot)
+                .map(|(_, e, k)| (*e, *k))
+                .collect();
+            if pairs.is_empty() {
+                continue;
+            }
+            for f in kf::oled_set_event_keys_frames(slot, &pairs) {
+                let resp = self.transceive(&f)?;
+                expect_ok(&resp)?;
+            }
+        }
+
+        // Title size. 0 means the payload predates the setting, so leave the
+        // board on whatever it has rather than snapping it to a default.
+        if cfg.font_scale > 0 {
+            let resp = self.transceive(&kf::oled_set_font_frame(cfg.font_scale))?;
+            let _ = expect_ok(&resp); // old firmware simply has no font command
+        }
+
+        // Each screen's own LEDs. Rejection is not fatal: a board too old for
+        // this keeps one global profile, which is exactly how it behaved before
+        // the command existed, and everything else in this push still lands.
+        for sl in &cfg.screen_leds {
+            let (h, s, v) = sl.anim.hsv();
+            for f in kf::set_screen_leds_frames(
+                sl.slot,
+                &sl.leds.to_slots(),
+                kf::anim_id(&sl.anim.name),
+                sl.anim.speed,
+                (h, s, v),
+                kf::anim_id(&sl.underglow.name),
+                sl.underglow.speed,
+                sl.underglow.intensity,
+            ) {
+                let resp = self.transceive(&f)?;
+                if expect_ok(&resp).is_err() {
+                    break;
+                }
+            }
+        }
+
+        // Icon / macro / keycode go over as three fields. A board that predates
+        // SET_KEY_INFO answers STATUS_ERROR, so fall back to the single-string
+        // command it does understand rather than failing the whole save — the
+        // rest of this push is perfectly good on such a board.
+        for (i, info) in cfg.key_info.iter().enumerate().take(kf::KEY_COUNT) {
+            let fields = [
+                (kf::KEY_INFO_MACRO, &info.macro_title),
+                (kf::KEY_INFO_KEYCODE, &info.keycode),
+            ];
+            let mut supported = true;
+            for (field, text) in fields {
+                let resp = self.transceive(&kf::oled_set_key_info_frame(i as u8, field, text))?;
+                if expect_ok(&resp).is_err() {
+                    supported = false;
+                    break;
+                }
+            }
+            if !supported {
+                // Same priority the old command carried: the macro names the
+                // key if it has one, otherwise its keycode does.
+                let legacy = if info.macro_title.is_empty() {
+                    &info.keycode
+                } else {
+                    &info.macro_title
+                };
+                let resp = self.transceive(&kf::oled_set_key_label_frame(i as u8, legacy))?;
+                expect_ok(&resp)?;
+            }
+        }
+
+        // The icon masks. Sent for every key, `None` included: a cleared icon
+        // has to be told to the board or the old one lingers there. Rejection
+        // is not fatal — a board too old for this falls back to the text, which
+        // it already has.
+        for (i, mask) in cfg.key_icons.iter().enumerate().take(kf::KEY_COUNT) {
+            for f in kf::oled_set_key_icon_frames(i as u8, mask.as_deref()) {
+                let resp = self.transceive(&f)?;
+                if expect_ok(&resp).is_err() {
+                    break;
+                }
+            }
+        }
+
         let (h, m, s) = cfg.countdown;
         let resp = self.transceive(&kf::oled_set_countdown_frame(h, m, s))?;
         expect_ok(&resp)?;
@@ -308,9 +397,8 @@ pub trait HidTransport: Send + Sync {
     fn push_pomodoro(&mut self, p: &PomodoroConfig) -> Result<bool, HidError> {
         let resp = self.transceive(&kf::oled_set_pomodoro_frame(
             p.work_min,
-            p.short_break_min,
-            p.long_break_min,
-            p.long_every,
+            p.pause_min,
+            p.cycles,
         ))?;
         Ok(expect_ok(&resp).is_ok())
     }
@@ -714,6 +802,50 @@ mod tests {
         assert!(!hid.board.oled_img_ready);
     }
 
+    /// Ask an attached board which of the NEW commands it understands.
+    ///
+    /// The only reliable way to tell what is actually flashed: firmware that
+    /// predates a command answers STATUS_ERROR for it. Run with:
+    ///   cargo test real_board_probe -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn real_board_probe() {
+        let (host_cmd_tx, _rx) = channel::<u8>();
+        let (conn_tx, _c) = channel::<bool>();
+        let mut real = RealHid::start(host_cmd_tx, conn_tx);
+        let mut waited = 0;
+        while !real.is_connected() && waited < 6000 {
+            std::thread::sleep(Duration::from_millis(100));
+            waited += 100;
+        }
+        if !real.is_connected() {
+            println!("NO BOARD ATTACHED");
+            return;
+        }
+        println!("identity: {:?}", real.identity());
+
+        let probes: [(&str, [u8; REPORT_LEN]); 5] = [
+            ("SET_UG_ANIM 0x22", kf::set_ug_anim_frame(0, 128, 180)),
+            ("SET_PALETTE 0x23", kf::set_palette_len_frame(0, 0, 128)),
+            ("SET_LAYER_COUNT 0x5A", kf::oled_set_layer_count_frame(1)),
+            ("SET_SLEEP 0x59", kf::oled_set_sleep_frame(60, 0)),
+            (
+                "SET_EVENT_KEYS 0x5B",
+                kf::oled_set_event_keys_frames(0, &[(0, 5)])[0],
+            ),
+        ];
+        for (name, f) in probes {
+            match real.transceive(&f) {
+                Ok(r) => println!(
+                    "{name:22} -> status {:#04x}  {}",
+                    r[2],
+                    if r[2] == kf::STATUS_OK { "SUPPORTED" } else { "NOT in this firmware" }
+                ),
+                Err(e) => println!("{name:22} -> transport error: {e}"),
+            }
+        }
+    }
+
     /// Walk the whole Save-to-Board sequence against a physically attached
     /// board, reporting which step fails rather than just that one did.
     ///
@@ -750,7 +882,7 @@ mod tests {
         println!("set_ug_anim: {:?}", real.set_ug_anim(&UnderglowAnim::default()));
 
         let cfg = OledConfig {
-            layers: vec![crate::model::OledLayer { name: "PROBE".into(), show_title: true }],
+            layers: vec![crate::model::OledLayer { name: "ORBIT".into(), show_title: true }],
             screens: vec![crate::model::OledScreen {
                 kind: "pomodoro".into(), title: String::new(), body: String::new(),
             }],
@@ -758,6 +890,11 @@ mod tests {
             pomodoro: PomodoroConfig::default(),
             sleep_mask: 0,
             sleep_timeout_s: 60,
+            event_keys: Vec::new(),
+            key_info: Vec::new(),
+            key_icons: Vec::new(),
+            font_scale: 0,
+            screen_leds: Vec::new(),
         };
         println!("push_oled:   {:?}", real.push_oled(&cfg));
         println!("eeprom:      {:?}", real.eeprom_commit());
@@ -948,18 +1085,13 @@ mod tests {
         let mut hid = MockHid::new();
         assert_eq!(
             hid.board.pomodoro,
-            (25, 5, 15, 4),
+            (25, 5, 4),
             "an unconfigured board runs the firmware's compile-time defaults"
         );
 
-        let cfg = PomodoroConfig {
-            work_min: 50,
-            short_break_min: 10,
-            long_break_min: 30,
-            long_every: 3,
-        };
+        let cfg = PomodoroConfig { work_min: 50, pause_min: 10, cycles: 3 };
         assert!(hid.push_pomodoro(&cfg).unwrap(), "mock supports the command");
-        assert_eq!(hid.board.pomodoro, (50, 10, 30, 3));
+        assert_eq!(hid.board.pomodoro, (50, 10, 3));
     }
 
     /// 0 is the protocol's "leave this one alone", so a host that only wants to
@@ -967,14 +1099,9 @@ mod tests {
     #[test]
     fn pomodoro_zero_field_keeps_the_current_value() {
         let mut hid = MockHid::new();
-        hid.push_pomodoro(&PomodoroConfig {
-            work_min: 45,
-            short_break_min: 0,
-            long_break_min: 0,
-            long_every: 0,
-        })
-        .unwrap();
-        assert_eq!(hid.board.pomodoro, (45, 5, 15, 4), "only work_min moved");
+        hid.push_pomodoro(&PomodoroConfig { work_min: 45, pause_min: 0, cycles: 0 })
+            .unwrap();
+        assert_eq!(hid.board.pomodoro, (45, 5, 4), "only work_min moved");
     }
 
     /// The firmware clamps instead of rejecting, so the app must not believe a
@@ -983,21 +1110,11 @@ mod tests {
     fn pomodoro_out_of_range_is_clamped_not_rejected() {
         let mut hid = MockHid::new();
         assert!(hid
-            .push_pomodoro(&PomodoroConfig {
-                work_min: 255,
-                short_break_min: 255,
-                long_break_min: 255,
-                long_every: 255,
-            })
+            .push_pomodoro(&PomodoroConfig { work_min: 255, pause_min: 255, cycles: 255 })
             .unwrap());
         assert_eq!(
             hid.board.pomodoro,
-            (
-                kf::POMO_MAX_MINUTES,
-                kf::POMO_MAX_MINUTES,
-                kf::POMO_MAX_MINUTES,
-                kf::POMO_MAX_EVERY
-            )
+            (kf::POMO_MAX_MINUTES, kf::POMO_MAX_MINUTES, kf::POMO_MAX_CYCLES)
         );
     }
 
@@ -1019,11 +1136,16 @@ mod tests {
             pomodoro: PomodoroConfig { work_min: 50, ..Default::default() },
             sleep_mask: 0,
             sleep_timeout_s: 60,
+            event_keys: Vec::new(),
+            key_info: Vec::new(),
+            key_icons: Vec::new(),
+            font_scale: 0,
+            screen_leds: Vec::new(),
         };
         hid.push_oled(&cfg).expect("the rest of the config still lands");
         assert_eq!(hid.board.oled_layer_names[0], "GIT");
         assert_eq!(hid.board.oled_countdown, (0, 5, 0));
-        assert_eq!(hid.board.pomodoro, (25, 5, 15, 4), "old firmware keeps its defaults");
+        assert_eq!(hid.board.pomodoro, (25, 5, 4), "old firmware keeps its defaults");
 
         assert!(
             !hid.push_pomodoro(&cfg.pomodoro).unwrap(),
@@ -1087,6 +1209,264 @@ mod tests {
         assert_eq!(hid.board.palettes[0].len, 0);
     }
 
+    /// The board gets the macro title AND the keycode, and decides between
+    /// them itself. Worth pinning that each lands in its own slot, that a long
+    /// name is clipped rather than overrunning the frame, and that non-ASCII is
+    /// dropped: the board's 5x7 font covers 32..126 and renders a star as '?'.
+    #[test]
+    fn key_text_reaches_the_board_as_two_fields() {
+        let mut hid = MockHid::new();
+        let info = |m: &str, kc: &str| crate::model::KeyInfo {
+            macro_title: m.into(),
+            keycode: kc.into(),
+        };
+        let cfg = OledConfig {
+            layers: Vec::new(),
+            screens: Vec::new(),
+            countdown: (0, 0, 0),
+            pomodoro: PomodoroConfig::default(),
+            sleep_mask: 0,
+            sleep_timeout_s: 60,
+            event_keys: Vec::new(),
+            screen_leds: Vec::new(),
+            key_icons: Vec::new(),
+            font_scale: 0,
+            key_info: vec![
+                info("Open terminal", "ENTER"),
+                info("", "F5"),
+                info("\u{2605} starred", "A"),
+                info("a-very-long-macro-name-here", "B"),
+            ],
+        };
+        hid.push_oled(&cfg).unwrap();
+
+        let k = |i: usize| hid.board.key_info[i].clone();
+        assert_eq!(
+            k(0),
+            ["Open terminal".to_string(), "ENTER".into()],
+            "both go over; which one shows is the board's decision, not the app's"
+        );
+        assert_eq!(k(1)[kf::KEY_INFO_MACRO as usize], "");
+        assert_eq!(k(1)[kf::KEY_INFO_KEYCODE as usize], "F5");
+        assert_eq!(
+            k(2)[kf::KEY_INFO_MACRO as usize],
+            " starred",
+            "the star's bytes are dropped, the rest of the title survives"
+        );
+        assert_eq!(
+            k(3)[kf::KEY_INFO_MACRO as usize].len(),
+            kf::KEY_LABEL_MAX,
+            "clipped to what the panel and the frame can hold"
+        );
+        assert_eq!(k(4), ["".to_string(), "".into()], "untouched keys stay empty");
+    }
+
+    /// The icon mask reaches the board whole, and a key with no icon is told so
+    /// explicitly — otherwise removing an icon in the app would leave the old
+    /// one on the panel forever.
+    #[test]
+    fn icon_masks_reach_the_board_and_clears_are_sent() {
+        let mut hid = MockHid::new();
+        // A recognisable pattern rather than a uniform fill, so a chunk landing
+        // at the wrong offset actually fails the test.
+        let mask: Vec<u8> = (0..kf::KEY_ICON_BYTES).map(|i| (i * 7) as u8).collect();
+        let cfg = OledConfig {
+            layers: Vec::new(),
+            screens: Vec::new(),
+            countdown: (0, 0, 0),
+            pomodoro: PomodoroConfig::default(),
+            sleep_mask: 0,
+            sleep_timeout_s: 60,
+            event_keys: Vec::new(),
+            screen_leds: Vec::new(),
+            key_info: Vec::new(),
+            key_icons: vec![Some(mask.clone()), None],
+            font_scale: 0,
+        };
+        hid.push_oled(&cfg).unwrap();
+
+        assert_eq!(
+            hid.board.key_icons[0].expect("key 0 has an icon").as_slice(),
+            mask.as_slice(),
+            "all 128 bytes, in order, across every chunk"
+        );
+        assert!(hid.board.key_icons[1].is_none(), "key 1 has no icon");
+
+        // Now clear key 0 the way the app does when the user removes the icon.
+        let cleared = OledConfig { key_icons: vec![None], ..cfg };
+        hid.push_oled(&cleared).unwrap();
+        assert!(
+            hid.board.key_icons[0].is_none(),
+            "a removed icon is actively cleared, not just left unsent"
+        );
+    }
+
+    /// The font picker has to actually reach the board.
+    ///
+    /// It used to change the app's preview and nothing else: the firmware drew
+    /// every title at a hardcoded scale 2. Also pins that a payload with no
+    /// font_scale leaves the board alone rather than snapping it to a default,
+    /// which is what an older app's payload looks like.
+    #[test]
+    fn font_scale_reaches_the_board() {
+        let mut hid = MockHid::new();
+        let base = OledConfig {
+            layers: Vec::new(),
+            screens: Vec::new(),
+            countdown: (0, 0, 0),
+            pomodoro: PomodoroConfig::default(),
+            sleep_mask: 0,
+            sleep_timeout_s: 60,
+            event_keys: Vec::new(),
+            screen_leds: Vec::new(),
+            key_info: Vec::new(),
+            key_icons: Vec::new(),
+            font_scale: 0,
+        };
+        assert_eq!(hid.board.font_scale, 2, "the firmware's own default");
+
+        hid.push_oled(&OledConfig { font_scale: 4, ..base.clone() }).unwrap();
+        assert_eq!(hid.board.font_scale, 4, "XL reaches the panel");
+
+        hid.push_oled(&base).unwrap();
+        assert_eq!(
+            hid.board.font_scale, 4,
+            "a payload with no font_scale leaves the board on what it had"
+        );
+
+        // Out of range is clamped on the way out, never sent as-is.
+        let f = kf::oled_set_font_frame(9);
+        assert_eq!(f[2], kf::FONT_SCALE_MAX);
+    }
+
+    /// Every screen gets its own LED profile on the board.
+    ///
+    /// The app has always had per-screen profiles, but the board held exactly
+    /// one — so an animation set on the first layer ran on every screen the
+    /// moment you rotated away from it, which is the reported bug. Pins that
+    /// each slot lands separately and that slots the app never sent stay
+    /// untouched, since those are the ones the board leaves on its global state.
+    #[test]
+    fn each_screen_gets_its_own_led_profile() {
+        use crate::model::ScreenLeds;
+        let mut hid = MockHid::new();
+        let profile = |slot: u8, anim: &str, key0: [u8; 3], ug: &str| ScreenLeds {
+            slot,
+            leds: LedState {
+                keys: vec![key0; kf::KEY_COUNT],
+                underglow: vec![[255, 255, 255]; 4],
+                brightness: 255,
+            },
+            anim: AnimState { name: anim.into(), speed: 200, color: [255, 0, 0] },
+            underglow: UnderglowAnim { name: ug.into(), speed: 90, intensity: 120 },
+        };
+        let cfg = OledConfig {
+            layers: Vec::new(),
+            screens: Vec::new(),
+            countdown: (0, 0, 0),
+            pomodoro: PomodoroConfig::default(),
+            sleep_mask: 0,
+            sleep_timeout_s: 60,
+            event_keys: Vec::new(),
+            key_info: Vec::new(),
+            key_icons: Vec::new(),
+            font_scale: 0,
+            screen_leds: vec![
+                profile(0, "breathe", [255, 0, 0], "wave"),
+                profile(4, "solid", [255, 255, 255], "solid"),
+            ],
+        };
+        hid.push_oled(&cfg).unwrap();
+
+        let s0 = hid.board.screen_leds[0].as_ref().expect("layer screen 0 configured");
+        assert_eq!(s0.anim, kf::ANIM_BREATHE);
+        assert_eq!(s0.anim_speed, 200);
+        assert_eq!(s0.rgb[0], [255, 0, 0]);
+        assert_eq!(s0.ug_anim, kf::ANIM_WAVE, "underglow is its own animation");
+        assert_eq!(s0.ug_intensity, 120);
+
+        let s4 = hid.board.screen_leds[4].as_ref().expect("first custom screen configured");
+        assert_eq!(s4.anim, kf::ANIM_SOLID, "a different screen keeps a different anim");
+        assert_eq!(s4.rgb[0], [255, 255, 255]);
+        assert_eq!(s4.rgb[kf::KEY_COUNT], [255, 255, 255], "underglow slot 21 too");
+
+        assert!(
+            hid.board.screen_leds[1].is_none(),
+            "a slot the app never sent is left alone, so an unconfigured board \
+             behaves exactly as it did before this command existed"
+        );
+    }
+
+    /// A board that predates SET_KEY_INFO must not fail the whole save: the app
+    /// falls back to the single-string command such firmware does understand.
+    #[test]
+    fn old_firmware_falls_back_to_the_single_label() {
+        let mut hid = MockHid::new();
+        hid.board.reject_key_info = true;
+        let cfg = OledConfig {
+            layers: Vec::new(),
+            screens: Vec::new(),
+            countdown: (0, 0, 0),
+            pomodoro: PomodoroConfig::default(),
+            sleep_mask: 0,
+            sleep_timeout_s: 60,
+            event_keys: Vec::new(),
+            screen_leds: Vec::new(),
+            key_icons: Vec::new(),
+            font_scale: 0,
+            key_info: vec![
+                crate::model::KeyInfo {
+                    macro_title: "Open terminal".into(),
+                    keycode: "ENTER".into(),
+                },
+                crate::model::KeyInfo {
+                    macro_title: "".into(),
+                    keycode: "F5".into(),
+                },
+            ],
+        };
+        hid.push_oled(&cfg).expect("an old board is not a failed save");
+        assert_eq!(
+            hid.board.key_info[0][kf::KEY_INFO_MACRO as usize],
+            "Open terminal",
+            "the macro names the key when it has one"
+        );
+        assert_eq!(
+            hid.board.key_info[1][kf::KEY_INFO_MACRO as usize],
+            "F5",
+            "otherwise the keycode does"
+        );
+    }
+
+    /// Event keys are what make a screen's actions reachable on hardware with
+    /// no encoder push, so "did they land" is worth pinning.
+    #[test]
+    fn event_keys_reach_the_board() {
+        let mut hid = MockHid::new();
+        assert_eq!(hid.board.event_keys[0][0], kf::EVENT_KEY_NONE, "unbound until told");
+
+        let cfg = OledConfig {
+            layers: Vec::new(),
+            screens: Vec::new(),
+            countdown: (0, 0, 0),
+            pomodoro: PomodoroConfig::default(),
+            sleep_mask: 0,
+            sleep_timeout_s: 60,
+            // Present Keys on layer screen 0 -> key 5; pomodoro start on the
+            // first custom screen -> key 11.
+            event_keys: vec![(0, 0, 5), (4, 8, 11)],
+            key_info: Vec::new(),
+            key_icons: Vec::new(),
+            font_scale: 0,
+            screen_leds: Vec::new(),
+        };
+        hid.push_oled(&cfg).unwrap();
+        assert_eq!(hid.board.event_keys[0][0], 5);
+        assert_eq!(hid.board.event_keys[4][8], 11);
+        // Nothing else was touched.
+        assert_eq!(hid.board.event_keys[0][1], kf::EVENT_KEY_NONE);
+    }
+
     /// Sleep is opt-in per screen, so an unconfigured board must never blank
     /// itself. The mask is over the nav-index space, NOT the app's screen list.
     #[test]
@@ -1103,6 +1483,11 @@ mod tests {
             pomodoro: PomodoroConfig::default(),
             sleep_mask: (1 << 2) | (1 << 4),
             sleep_timeout_s: 90,
+            event_keys: Vec::new(),
+            key_info: Vec::new(),
+            key_icons: Vec::new(),
+            font_scale: 0,
+            screen_leds: Vec::new(),
         };
         hid.push_oled(&cfg).unwrap();
         assert_eq!(hid.board.sleep_mask, 0b0001_0100);
@@ -1164,6 +1549,11 @@ mod tests {
             pomodoro: PomodoroConfig::default(),
             sleep_mask: 0,
             sleep_timeout_s: 60,
+            event_keys: Vec::new(),
+            key_info: Vec::new(),
+            key_icons: Vec::new(),
+            font_scale: 0,
+            screen_leds: Vec::new(),
         };
         assert!(hid.push_oled(&cfg).is_ok());
         assert!(hid.eeprom_commit().is_ok());
