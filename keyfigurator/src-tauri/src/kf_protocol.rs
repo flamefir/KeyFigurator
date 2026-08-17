@@ -888,7 +888,9 @@ impl Default for BoardModel {
             ug_anim: ANIM_SOLID,
             ug_speed: 128,
             ug_intensity: 180,
-            layer_screen_count: LAYER_COUNT as u8,
+            // Zero, like the firmware: an unconfigured board has no screens
+            // and shows the Orbit mark, not four empty layer screens.
+            layer_screen_count: 0,
             event_keys: [[EVENT_KEY_NONE; 9]; 10],
             key_info: Default::default(),
             key_icons: [None; KEY_COUNT],
@@ -1196,9 +1198,9 @@ impl BoardModel {
                 }
             }
             CMD_OLED_SET_LAYER_COUNT => {
-                if p[0] > 0 {
-                    self.layer_screen_count = p[0].min(LAYER_COUNT as u8);
-                }
+                // 0 is accepted. The `if p[0] > 0` guard mirrored the firmware's
+                // old one, and both meant an app with no layers could not say so.
+                self.layer_screen_count = p[0].min(LAYER_COUNT as u8);
                 r[0] = STATUS_OK;
             }
             CMD_OLED_SET_SLEEP => {

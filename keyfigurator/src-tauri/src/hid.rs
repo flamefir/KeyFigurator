@@ -281,7 +281,10 @@ pub trait HidTransport: Send + Sync {
         // Tell the board how many layer screens to show BEFORE the screen list,
         // so navigation is never briefly sized against the old count. Failure is
         // not fatal — older firmware simply keeps showing four.
-        let n = cfg.layers.len().clamp(1, kf::LAYER_COUNT) as u8;
+        // min, not clamp(1, ..): zero layer screens is a real state, and the
+        // floor of 1 meant the app could never tell the board it had none. A
+        // config with no screens still lit four of them on the hardware.
+        let n = cfg.layers.len().min(kf::LAYER_COUNT) as u8;
         let _ = self.transceive(&kf::oled_set_layer_count_frame(n))?;
 
         let types: Vec<u8> = cfg
@@ -1134,6 +1137,38 @@ mod tests {
             hid.board.pomodoro,
             (kf::POMO_MAX_MINUTES, kf::POMO_MAX_MINUTES, kf::POMO_MAX_CYCLES)
         );
+    }
+
+    /// A config with no layers must reach the board AS no layers.
+    ///
+    /// This was `clamp(1, LAYER_COUNT)`, so zero became one and the board kept
+    /// showing a layer screen for a layer the app did not have. Combined with
+    /// the firmware ignoring a count of 0, "no screens" was unreachable on the
+    /// hardware — which also made the no-screens logo and its sleep exemption
+    /// dead code in practice.
+    #[test]
+    fn no_layers_pushes_a_layer_count_of_zero() {
+        let mut hid = MockHid::new();
+        // Not the default, so the assertion cannot pass by accident.
+        hid.board.layer_screen_count = 4;
+
+        let cfg = OledConfig {
+            layers: vec![],
+            screens: vec![],
+            countdown: (0, 0, 0),
+            pomodoro: PomodoroConfig::default(),
+            sleep_mask: 0,
+            sleep_timeout_s: 60,
+            event_keys: Vec::new(),
+            key_info: Vec::new(),
+            key_icons: Vec::new(),
+            font_scale: 0,
+            screen_leds: Vec::new(),
+        };
+        hid.push_oled(&cfg).unwrap();
+
+        assert_eq!(hid.board.layer_screen_count, 0, "no layers means no layer screens");
+        assert!(hid.board.oled_screen_types.is_empty(), "and no custom screens either");
     }
 
     /// The whole point of not bumping the protocol version: a board that does
