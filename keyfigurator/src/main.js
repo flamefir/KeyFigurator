@@ -494,13 +494,25 @@ const KC_ALL_FLAT = KC_CATEGORIES.flatMap(c => c.keys);
 const ANIM_MIN_MS = 1050;  // at rate 255; the board's floor is 65536/64 = 1024
 const ANIM_MAX_MS = 8000;  // at rate 0
 
-// Keys. Mirrors kf_rate_to_qmk_speed() + effect_runner_i, in that order:
-// rate -> requested period -> quantised sc -> the period sc actually gives.
+// Keys. Mirrors kf_rate_to_m() + effect_runner_i, in that order:
+// rate -> requested period -> quantised M -> the period M actually gives.
+//
+// M, not sc. QMK builds lib8tion with -DFASTLED_SCALE8_FIXED=1, so
+// scale16by8(i, scale) is `(i * (1 + scale)) >> 8` — one MORE than the scale it
+// is handed. The effect's multiplier is therefore qadd8(speed/4,1) + 1, and one
+// cycle is 65536/M ms. Reading it as `scale` put every period here about
+// (M-1)/M of its real length, and made the board's palette drift a full cycle
+// against its own breath every M breaths.
+//
+// The define is set in builddefs/common_features.mk, not in a header, which is
+// why grepping lib/lib8tion/ for it finds only the `#if` and looks like "off".
 function rateToDuration(rate) {
   const r = Math.min(255, Math.max(0, Number(rate) || 0));
   const requested = ANIM_MIN_MS + Math.floor((255 - r) * (ANIM_MAX_MS - ANIM_MIN_MS) / 255);
-  const sc = Math.min(64, Math.max(1, Math.floor(65536 / requested)));
-  return 65536 / sc / 1000;
+  // speed 0 -> M 2 (32.8 s); speed 255 -> M 65 (1.008 s). Nothing else is
+  // reachable on the hardware, so previewing outside it would be a lie.
+  const m = Math.min(65, Math.max(2, Math.floor(65536 / requested)));
+  return 65536 / m / 1000;
 }
 
 // Underglow. Was its own line, `4000 - rate*14`, mirroring a firmware
