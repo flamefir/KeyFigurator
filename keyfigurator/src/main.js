@@ -2474,7 +2474,17 @@ function computeKeyLedColor(idx, row, col, elapsed) {
 
     case "snake": {
       // Snake is a group animation — only runs while the key is part of the active selection;
-      // when deselected, fall back to a dim solid glow so the key's color is still visible
+      // when deselected, fall back to a dim solid glow so the key's color is still visible.
+      //
+      // Read from selectedKeys, NOT from a parameter. The `isSel` parameter was
+      // removed on 2026-08-16 as "already dead, never read in the body" — it was
+      // read here, and nowhere else, so this line became a ReferenceError. ES
+      // modules are strict, so it THREW rather than reading undefined, and the
+      // throw is inside klAnimTick() whose requestAnimationFrame re-arm is the
+      // last statement. One frame on Snake killed the whole LED preview
+      // permanently: every key flat, no glow, until the app was restarted onto
+      // a different animation.
+      const isSel = selectedKeys.has(idx);
       if (!isSel || keySelectionOrder.length === 0) {
         if (!hasColor) return null;
         const { r, g, b } = hexToRgb(ownColor);
