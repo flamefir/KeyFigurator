@@ -737,14 +737,17 @@ function renderOledScreenContent(screenEl) {
     case "layer": {
       const layers = getSavedLayers();
       const layer  = layers.find(l => l.id === screen.layerId);
-      const idx    = String(layers.indexOf(layer) + 1).padStart(2, "0");
+      // Where this screen sits in the list, 1-based — the same thing the board
+      // now draws top-left. A layer with no name falls back to it rather than
+      // to "LAYER NN", which named an index nobody navigates by.
+      const idx    = `${oledScreenIdx + 1} / ${getOledScreens().length}`;
       // The name IS the screen. It used to be a secondary line under a fixed
       // "LAYER NN", gated behind a Show toggle, so renaming a layer appeared
       // to do nothing — the big text never changed. Falls back to LAYER NN
       // only when the layer has no name at all.
       const name = (layer?.name || "").toUpperCase().slice(0, oledNameMax());
       screenEl.innerHTML = `<div class="oled-layer-screen">
-        <div class="oled-lyr-name">${escapeHtml(name || `LAYER ${idx}`)}</div>
+        <div class="oled-lyr-name">${escapeHtml(name || idx)}</div>
       </div>`;
       break;
     }
@@ -753,7 +756,6 @@ function renderOledScreenContent(screenEl) {
       screenEl.innerHTML = `<div class="oled-timer-screen">
         <div class="oled-screen-lbl">TIMER</div>
         <div class="oled-time-val">${formatTime(elapsed)}</div>
-        <div class="oled-screen-hint">${oledTimerRunning ? "↓ stop" : "↓ start"}</div>
       </div>`;
       break;
     }
@@ -762,7 +764,6 @@ function renderOledScreenContent(screenEl) {
         screenEl.innerHTML = `<div class="oled-countdown-screen">
           <div class="oled-screen-lbl">COUNTDOWN</div>
           <div class="oled-time-val oled-cd-flash">00:00</div>
-          <div class="oled-screen-hint">↓ reset</div>
         </div>`;
       } else {
         const sel = f => oledCdField === f && !oledCdRunning ? "oled-cd-sel" : "";
@@ -774,7 +775,6 @@ function renderOledScreenContent(screenEl) {
         screenEl.innerHTML = `<div class="oled-countdown-screen">
           <div class="oled-screen-lbl">COUNTDOWN</div>
           <div class="oled-time-val">${timeDisplay}</div>
-          <div class="oled-screen-hint">${oledCdRunning ? "↓ stop" : "←→ field · ↑↓ set · ↓ start"}</div>
         </div>`;
       }
       break;
@@ -787,8 +787,6 @@ function renderOledScreenContent(screenEl) {
         <div class="oled-time-val${isBreak ? " oled-pomo-break" : ""}">${
           oledPomoDone ? "00:00" : formatTime(getPomoRemaining())}</div>
         <div class="oled-screen-hint">${oledPomoCompleted} / ${oledPomo.cycles}</div>
-        <div class="oled-screen-hint">${
-          oledPomoDone ? "↓ restart" : (oledPomoRunning ? "↓ pause" : "↓ start")}</div>
       </div>`;
       break;
     }
