@@ -1,4 +1,5 @@
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
+import { save } from "@tauri-apps/plugin-dialog";
 
 const hasTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
@@ -850,42 +851,25 @@ function adjustCdField(delta) {
   updateOledDisplay();
 }
 
-// Does this key DO something on the screen currently showing?
+// Keys with a screen action used to blink at 3 Hz to advertise themselves.
+// That is now an icon drawn on the key (OLED_EVENT_ICONS) — it names the action
+// instead of merely flagging it, and it holds still. Nothing here toggles a
+// class any more; the hint is part of the key's content and comes out of
+// renderBoard().
 //
-// Those keys blink at 3 Hz so the board says which keys work here, rather than
-// the user having to remember or go looking in the app. Four sources, all of
-// which are "press this and something happens on the OLED":
-//   - an event bound to this screen (Present Keys, Start/Stop, …)
-//   - the back key, which leaves a sub-mode
-//   - the arrows, while the countdown's fields are editable
+// Kept as a clearing pass rather than deleted outright: a key that was blinking
+// when the screen changed would otherwise keep its class until the next full
+// rebuild. Callers still invoke this on every OLED update.
 //
-// The firmware only knows the last of these; the first three live solely in
-// this app. See the note in kf_led_special_blink().
-function isSpecialKeyForScreen(kc, isEventKey) {
-  if (isEventKey) return true;
-
-  const screen = getOledScreens()[oledScreenIdx];
-  if (screen?.type === "countdown" && !oledCdRunning && !oledCdDone) {
-    return kc === "KC_LEFT" || kc === "KC_RIGHT" || kc === "KC_RGHT"
-        || kc === "KC_UP"   || kc === "KC_DOWN";
-  }
-  return false;
-}
-
-// Which keys are special changes with the screen and with the countdown's run
-// state, so the hint has to be refreshed on every OLED update. A full
-// renderBoard() would rebuild the DOM on each tick of a running timer and fight
-// the animation loop; toggling the one class is enough and costs 21 lookups.
+// NOTE: the countdown arrows on a countdown screen were also blinked from here,
+// including when they were plain KC_LEFT/KC_RIGHT/KC_UP/KC_DOWN keys rather
+// than bound events. Those keys now show nothing unless they are bound as
+// cdLeft/cdRight/cdUp/cdDown events, which is the supported way to get the
+// icon. The firmware still runs its own kf_led_special_blink() for the arrows,
+// so app and board no longer agree here — tracked in the Firmware backlog.
 function refreshSpecialKeyHints() {
-  const sk    = currentOledScreenKey();
-  const evMap = sk ? (oledEventKeys[sk] || {}) : {};
   for (const pos of BOARD_POSITIONS) {
-    const el = document.getElementById("key-" + pos.idx);
-    if (!el || el.classList.contains("oled-assigning")) continue;
-    const isEventKey = Object.values(evMap).some(v => evIdx(v) === pos.idx);
-    el.classList.toggle(
-      "key-special-blink",
-      isSpecialKeyForScreen(keycodeAt(pos.idx), isEventKey));
+    document.getElementById("key-" + pos.idx)?.classList.remove("key-special-blink");
   }
 }
 
@@ -948,6 +932,40 @@ const OLED_EVENT_LABELS = {
   cdDown:         "Value −",
   pomoStartStop:  "Start / Pause",
 };
+
+// One glyph per screen event, drawn on the key it is bound to.
+//
+// This replaces the 3 Hz blink that used to mark these keys. The blink said
+// "this key does something here" without saying WHAT, cost an animation on
+// every event key, and read as a fault rather than a hint. An icon says which
+// action the key performs and holds still while it does it.
+//
+// Line icons on a 24×24 grid, stroked in `currentColor` so each one picks up
+// its event's assigned colour. The three start/stop events deliberately share
+// a glyph: only one of them can appear on any given screen, and they are the
+// same gesture to the user.
+const OLED_EVENT_ICONS = {
+  presentKeys:
+    '<rect x="3" y="5" width="5" height="5" rx="1.2"/><rect x="9.5" y="5" width="5" height="5" rx="1.2"/>'
+  + '<rect x="16" y="5" width="5" height="5" rx="1.2"/><rect x="3" y="13" width="5" height="5" rx="1.2"/>'
+  + '<rect x="9.5" y="13" width="5" height="5" rx="1.2"/><rect x="16" y="13" width="5" height="5" rx="1.2"/>',
+  timerStartStop: '<circle cx="12" cy="12" r="8.5"/><path d="M10 8.4 L16.2 12 L10 15.6 Z"/>',
+  cdEvent:        '<circle cx="12" cy="12" r="8.5"/><path d="M10 8.4 L16.2 12 L10 15.6 Z"/>',
+  pomoStartStop:  '<circle cx="12" cy="12" r="8.5"/><path d="M10 8.4 L16.2 12 L10 15.6 Z"/>',
+  timerReset:     '<path d="M19.2 12a7.2 7.2 0 1 1-2.1-5.1"/><path d="M19.2 3.6 v4.2 h-4.2"/>',
+  cdLeft:         '<path d="M14.5 5.5 L8.5 12 L14.5 18.5"/>',
+  cdRight:        '<path d="M9.5 5.5 L15.5 12 L9.5 18.5"/>',
+  cdUp:           '<path d="M5.5 14.5 L12 8.5 L18.5 14.5"/>',
+  cdDown:         '<path d="M5.5 9.5 L12 15.5 L18.5 9.5"/>',
+};
+
+function oledEventIconSVG(eventName) {
+  const body = OLED_EVENT_ICONS[eventName];
+  if (!body) return null;
+  return `<svg class="key-event-icon" viewBox="0 0 24 24" aria-hidden="true"
+    fill="none" stroke="currentColor" stroke-width="2"
+    stroke-linecap="round" stroke-linejoin="round">${body}</svg>`;
+}
 
 function currentOledScreenKey() {
   const screens = getOledScreens();
@@ -1289,6 +1307,11 @@ async function removeCurrentScreen() {
     if (!ok) return;
     deleteSavedLayer(screen.layerId);
     oledScreenIdx = Math.max(0, Math.min(oledScreenIdx, getOledScreens().length - 1));
+    // Deleting the ACTIVE layer left activeProfileId null with the deleted
+    // layer's keymap and colours still in memory and on the keycaps: the OLED
+    // and the bar moved on, the board did not, and it stayed that way until
+    // something unrelated forced a render. Land on the screen we just moved to.
+    if (applyScreenLocally(getOledScreens()[oledScreenIdx])) pushActiveScreenToBoard();
     updateOledDisplay();
     renderLayerBar();
     renderOledPill();
@@ -1299,6 +1322,9 @@ async function removeCurrentScreen() {
   oledCustomScreens = oledCustomScreens.filter(s => s.id !== screen.id);
   saveOledCustomScreens();
   if (wasLast) oledScreenIdx = Math.max(0, oledScreenIdx - 1);
+  // Same as the layer branch: if the screen just deleted was the active one,
+  // the board is still showing its profile.
+  if (applyScreenLocally(getOledScreens()[oledScreenIdx])) pushActiveScreenToBoard();
   updateOledDisplay();
   renderLayerBar();
   renderOledPill();
@@ -2169,10 +2195,12 @@ const KL_SPARKLE_FREQS  = [2.3, 4.7, 3.1, 5.3, 2.7, 3.9, 4.3, 2.1, 3.7, 5.1,
 const KL_SPARKLE_PHASES = [0.10, 0.70, 0.30, 0.90, 0.50, 0.20, 0.80, 0.40, 0.60, 0.15,
                             0.85, 0.35, 0.65, 0.25, 0.75, 0.45, 0.55, 0.05, 0.95, 0.12, 0.62];
 
-function computeKeyLedColor(idx, row, col, elapsed, isSel) {
-  // Selected keys use the live panel state; deselected keys use their own stored state
+function computeKeyLedColor(idx, row, col, elapsed) {
   // One global animation for every key — this simulates what the board will
-  // actually render, since QMK has a single board-wide effect.
+  // actually render, since QMK has a single board-wide effect. Selection does
+  // not enter into it: the old `isSel` parameter was already dead (never read
+  // in this body) and the comment claiming selected keys used live panel state
+  // had not been true for some time.
   const animation = klAnimation, rate = klRate, intensity = klIntensity, palette = klPalette;
 
   const duration = rateToDuration(rate);
@@ -2315,12 +2343,11 @@ function klAnimTick(now) {
     const el = document.getElementById("key-" + pos.idx);
     if (!el) continue;
 
-    const isSel  = selectedKeys.has(pos.idx);
-    const result = computeKeyLedColor(pos.idx, pos.row, pos.col, elapsed, isSel);
+    const result = computeKeyLedColor(pos.idx, pos.row, pos.col, elapsed);
 
     if (!result) {
-      el.style.borderColor = isSel ? "transparent" : "";
-      el.style.boxShadow   = isSel ? "none" : "";
+      el.style.borderColor = "";
+      el.style.boxShadow   = "";
       el.style.color       = "";
       continue;
     }
@@ -2333,15 +2360,12 @@ function klAnimTick(now) {
     const bScale = 0.12 + (ledBrightness / 255) * 0.88;
     const { rgb } = result;
     const opacity = result.opacity * bScale;
-    if (isSel) {
-      el.style.borderColor = `rgba(${rgb},1)`;
-      el.style.boxShadow   = `0 0 14px rgba(${rgb},${Math.min(0.99, opacity * 1.5).toFixed(3)}), 0 0 28px rgba(${rgb},${(opacity * 0.8).toFixed(3)})`;
-      el.style.color       = `rgba(${rgb},1)`;
-    } else {
-      el.style.borderColor = `rgba(${rgb},${Math.min(0.99, opacity).toFixed(3)})`;
-      el.style.boxShadow   = `0 0 8px rgba(${rgb},${(opacity * 0.6).toFixed(3)})`;
-      el.style.color       = "";
-    }
+    // Every key renders its own LED the same way, selected or not. Selection is
+    // the corner dot and nothing else, so the preview shows the lighting the
+    // board will actually produce rather than a brightened editing state.
+    el.style.borderColor = `rgba(${rgb},${Math.min(0.99, opacity).toFixed(3)})`;
+    el.style.boxShadow   = `0 0 8px rgba(${rgb},${(opacity * 0.6).toFixed(3)})`;
+    el.style.color       = "";
   }
 
   klAnimFrame = requestAnimationFrame(klAnimTick);
@@ -2400,6 +2424,14 @@ async function init() {
 
   // ── Home page ─────────────────────────────────────────────────────────────
   document.getElementById("home-add")?.addEventListener("click", scanForDevices);
+  document.getElementById("devices-export")?.addEventListener("click", exportDevicesToFile);
+  document.getElementById("devices-import-btn")?.addEventListener("click", () =>
+    document.getElementById("devices-import").click());
+  document.getElementById("devices-import")?.addEventListener("change", async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = ""; // so re-picking the same file fires change again
+    if (file) await importDevicesFromFile(file);
+  });
 
   // ── Log panel ─────────────────────────────────────────────────────────────
   loadLog();
@@ -2466,6 +2498,24 @@ async function init() {
   document.getElementById("macro-save")?.addEventListener("click", saveMacroFromEditor);
   document.getElementById("macro-cancel")?.addEventListener("click", closeMacroEditor);
   document.getElementById("macro-close")?.addEventListener("click", closeMacroEditor);
+  // ── Macro recorder ────────────────────────────────────────────────────────
+  // A webview reload does not restart the Rust side, so a hook can survive one.
+  // Clear it on load: no UI is attached to it any more, and nothing should be
+  // listening to the keyboard that the user cannot see.
+  invoke("is_key_recording")
+    .then((on) => { if (on) return invoke("stop_key_recording"); })
+    .catch((e) => logError(e, "recorder cleanup"));
+
+  document.getElementById("macro-rec")?.addEventListener("click", toggleMacroRecording);
+  // Repaint at once rather than waiting for the next poll, so a changed delay
+  // shows its effect on what is already captured.
+  document.getElementById("macro-rec-ms")?.addEventListener("input", () => {
+    if (macroRecording) {
+      invoke("peek_key_recording").then(renderMacroRecPreview)
+        .catch((e) => logError(e, "peek_key_recording"));
+    }
+  });
+
   document.getElementById("macro-editor")?.addEventListener("click", (e) => {
     // Backdrop click closes; clicks inside the modal must not.
     if (e.target.id === "macro-editor") closeMacroEditor();
@@ -2645,6 +2695,16 @@ async function init() {
     e.stopPropagation();
     openScreenPicker();
   });
+  document.getElementById("layer-led-theme").addEventListener("click", (e) => {
+    e.stopPropagation();
+    toggleScreenLedPill();
+  });
+  document.getElementById("layer-copy-screen").addEventListener("click", (e) => {
+    e.stopPropagation();
+    // Snapshot BEFORE the picker opens: the source is the screen on show now.
+    saveCurrentLayerState();
+    openScreenPicker(currentScreenCopy());
+  });
   document.getElementById("layer-del-screen").addEventListener("click", (e) => {
     e.stopPropagation();
     removeCurrentScreen();
@@ -2652,6 +2712,11 @@ async function init() {
 
   // ── Underglow ring click ───────────────────────────────────────────────────
   document.getElementById("board-ring").addEventListener("click", (e) => {
+    // A sweep that starts on a key and ends on the ring fires `click` on the
+    // ring, their common ancestor — without this the drag would toggle the
+    // underglow pill. Read but not cleared: the document handler below owns
+    // resetting the flag, and it runs after this one on the way up.
+    if (wasDragging) return;
     if (e.target.closest(".key, .encoder-knob, .oled-panel, .ug-corner, .board")) return;
     const isOpen = document.getElementById("underglow-pill").classList.contains("visible");
     if (isOpen) {
@@ -2661,12 +2726,19 @@ async function init() {
     }
   });
 
+  // ── Drag multi-select ────────────────────────────────────────────────────
+  // On window, not the board: a sweep that runs off the edge of the board still
+  // has to end, or the next click would be treated as part of the drag.
+  window.addEventListener("mousemove", updateDragSelect);
+  window.addEventListener("mouseup", endDragSelect);
+
   // ── Close pills when clicking outside board-ring / pill ──────────────────
   document.addEventListener("click", (e) => {
     if (wasDragging) { wasDragging = false; return; }
     if (clickStartedInKeyPill) { clickStartedInKeyPill = false; return; }
-    if (e.target.closest("#board-ring, #underglow-pill, #key-pills, #oled-pill")) return;
+    if (e.target.closest("#board-ring, #underglow-pill, #key-pills, #oled-pill, #screen-led-pill, #layer-led-theme")) return;
     closeUnderglowPill();
+    closeScreenLedPill();
     if (document.getElementById("key-pills").classList.contains("visible")) {
       keySelectionOrder = [];
       selectedKeys.clear();
@@ -2700,17 +2772,8 @@ async function init() {
     });
   }
 
-  // ── Key LED Advanced toggle ────────────────────────────────────────────────
-  document.getElementById("kl-adv-btn").addEventListener("click", (e) => {
-    e.stopPropagation();
-    const adv     = document.getElementById("kl-advanced");
-    const arrow   = document.getElementById("kl-adv-arrow");
-    const btn     = document.getElementById("kl-adv-btn");
-    const opening = !adv.classList.contains("open");
-    adv.classList.toggle("open", opening);
-    btn.classList.toggle("open", opening);
-    arrow.textContent = opening ? "▾" : "▸";
-  });
+  // The Key LED pill's own Advanced toggle is gone — colour and keycode share
+  // one pill and one drawer now (kc-adv-btn below).
 
   document.getElementById("kl-rate").addEventListener("input", (e) => {
     klRate = Number(e.target.value); saveKlAdvancedState();
@@ -2914,7 +2977,7 @@ function renderBoard() {
         enc.style.setProperty("--oled-ev-color", `rgba(${r},${g},${b},0.75)`);
       }
       enc.textContent = "◉";
-      enc.addEventListener("mousedown", (e) => { e.preventDefault(); onKeyDown(pos.idx); });
+      enc.addEventListener("mousedown", (e) => { e.preventDefault(); beginDragSelect(e); onKeyDown(pos.idx); });
       enc.addEventListener("mouseenter", (e) => { onKeyEnter(pos.idx); showKeyTooltip(pos.idx, e.currentTarget); });
       enc.addEventListener("mouseleave", hideKeyTooltip);
       encWrap.appendChild(enc);
@@ -2942,10 +3005,12 @@ function renderBoard() {
       const isCycleActive  = oledSubMode === "keycycle" && pos.idx === (BOARD_POSITIONS[oledKeyCycleIdx]?.idx);
       const bsk            = currentOledScreenKey();
       const bScreenEvMap   = bsk ? (oledEventKeys[bsk] || {}) : {};
-      const evEntry        = Object.values(bScreenEvMap).find(v => evIdx(v) === pos.idx);
+      // entries(), not values(): the event's NAME is what selects its icon.
+      const evPair         = Object.entries(bScreenEvMap).find(([, v]) => evIdx(v) === pos.idx);
+      const evName         = evPair?.[0] ?? null;
+      const evEntry        = evPair?.[1] ?? null;
       const isEventKey     = !!evEntry;
       const isAssigning    = pendingEventAssign !== null && !isEventKey;
-      const isSpecial      = isSpecialKeyForScreen(kc, isEventKey);
       // While Present Keys is up the board owns the whole key field: every key
       // goes plain white, the focused one blinks 2 Hz and the screen's event
       // keys blink RED at 4 Hz. Mirrored here so the two views agree about
@@ -2958,15 +3023,24 @@ function renderBoard() {
         + (inPresent && isCycleActive ? " oled-present-focus" : "")
         + (isEventKey ? " oled-event-key" : "")
         + (inPresent && isEventKey && !isCycleActive ? " oled-present-event" : "")
-        + (isSpecial && !isAssigning ? " key-special-blink" : "")
         + (isAssigning ? " oled-assigning" : "");
       k.style.cssText = `grid-row:${pos.row};grid-column:${pos.col}`;
       if (isEventKey && !inPresent) {
         const { r, g, b } = hexToRgb(evColor(evEntry));
         k.style.setProperty("--oled-ev-color", `rgba(${r},${g},${b},0.75)`);
       }
-      const imgSrc = keyIconImages[pos.idx];
-      if (imgSrc) {
+      const imgSrc  = keyIconImages[pos.idx];
+      const evIconH = isEventKey && !inPresent ? oledEventIconSVG(evName) : null;
+      if (!imgSrc && evIconH) {
+        // Below an explicit user icon, above the macro name and the keycode: an
+        // uploaded icon is still a deliberate statement about this key, but a
+        // bare keycode says nothing that the screen action does not say better.
+        const wrap = document.createElement("span");
+        wrap.className = "key-event-icon-wrap";
+        wrap.innerHTML = evIconH;
+        wrap.title = OLED_EVENT_LABELS[evName] ?? evName;
+        k.appendChild(wrap);
+      } else if (imgSrc) {
         // Label priority: icon > macro name > keycode. An icon is an explicit
         // choice about how this key should read, so it outranks the macro name
         // even when a macro is bound. Same rule the board applies.
@@ -2985,7 +3059,7 @@ function renderBoard() {
         label.textContent = macroName || (isEmpty ? "·" : kc.replace(/^KC_/, ""));
         k.appendChild(label);
       }
-      k.addEventListener("mousedown", (e) => { e.preventDefault(); onKeyDown(pos.idx); });
+      k.addEventListener("mousedown", (e) => { e.preventDefault(); beginDragSelect(e); onKeyDown(pos.idx); });
       k.addEventListener("mouseenter", (e) => { onKeyEnter(pos.idx); showKeyTooltip(pos.idx, e.currentTarget); });
       k.addEventListener("mouseleave", hideKeyTooltip);
       el.appendChild(k);
@@ -3058,6 +3132,44 @@ function onKeyDown(idx) {
     triggerOledEvent(eventHit[0]);
     document.getElementById("key-" + idx)?.classList.add("sel");
   }
+}
+
+// ── Drag multi-select ───────────────────────────────────────────────────────
+// Press on a key and sweep across others to add them to the selection.
+//
+// The threshold is why this is three flags rather than one. A plain click also
+// produces mousedown/mouseup, so arming on mousedown alone would make every
+// click look like a finished drag and the trailing `click` event would be
+// swallowed by the handler in init() that closes the pills. `isDragging` is
+// therefore only armed once the pointer has actually travelled DRAG_PX from
+// where the button went down, and `wasDragging` carries that fact to the click
+// handler, which fires after mouseup.
+const DRAG_PX = 5;
+
+function beginDragSelect(e) {
+  dragFromKey  = true;
+  dragStartPos = { x: e.clientX, y: e.clientY };
+  isDragging   = false; // armed by movement, not by the press itself
+}
+
+function updateDragSelect(e) {
+  if (!dragFromKey || isDragging || !dragStartPos) return;
+  const dx = e.clientX - dragStartPos.x;
+  const dy = e.clientY - dragStartPos.y;
+  if (dx * dx + dy * dy >= DRAG_PX * DRAG_PX) {
+    isDragging = true;
+    hideKeyTooltip(); // the tooltip guard only covers keys entered from here on
+  }
+}
+
+function endDragSelect() {
+  if (!dragFromKey) return;
+  // Only claim a drag happened if one really did; otherwise a click that merely
+  // jittered would eat the next click and leave the pills open.
+  if (isDragging) wasDragging = true;
+  dragFromKey  = false;
+  isDragging   = false;
+  dragStartPos = null;
 }
 
 function onKeyEnter(idx) {
@@ -3189,9 +3301,21 @@ function saveCurrentProfile() {
 
 // Move the board onto a screen's own profile. Silent by default because this
 // runs on every navigation; the layer bar handles its own focus.
-async function switchToScreen(screen) {
+// Split deliberately. Everything the user can SEE is applied synchronously
+// here; the board push is a separate step that nothing on screen waits for.
+//
+// They used to be one `await`-ing function, which is what made switching or
+// deleting a layer feel like it updated in its own time: callers awaited the
+// whole thing, so the layer bar — the screen's name and position — only
+// repainted once `set_keymap` had made a full HID round trip, and longer still
+// when the board was slow to answer or absent. The keycaps repainted at once
+// and the title lagged behind them.
+//
+// Returns false when there is nothing to switch to, so callers can tell "already
+// here" from "switched".
+function applyScreenLocally(screen) {
   const id = screenProfileId(screen);
-  if (!id || id === activeProfileId) return;
+  if (!id || id === activeProfileId) return false;
   saveCurrentProfile();
   applyProfile(profileForScreen(screen));
   activeProfileId = id;
@@ -3203,13 +3327,21 @@ async function switchToScreen(screen) {
   // screen's animation highlighted while a different one actually ran.
   renderKlAnimChips();
   renderBoard();
-  try {
-    await invoke("set_keymap", { map: keymap });
-    scheduleLiveSync("leds");
-    scheduleLiveSync("anim");
-  } catch (e) {
-    logError(e, "switchToScreen");
-  }
+  return true;
+}
+
+// Fire-and-forget by design: the UI is already correct by the time this runs,
+// and a board that is slow, busy or unplugged must not hold it up. Errors go to
+// the log rather than surfacing, same as before.
+function pushActiveScreenToBoard() {
+  return invoke("set_keymap", { map: keymap })
+    .then(() => { scheduleLiveSync("leds"); scheduleLiveSync("anim"); })
+    .catch((e) => logError(e, "switchToScreen"));
+}
+
+async function switchToScreen(screen) {
+  if (!applyScreenLocally(screen)) return;
+  await pushActiveScreenToBoard();
 }
 
 function saveCurrentLayerState() {
@@ -3284,10 +3416,35 @@ function deleteSavedLayer(id) {
   renderBoard();
 }
 
+// ── Saving a file ───────────────────────────────────────────────────────────
+// Every export in the app goes through here.
+//
+// This is NOT a browser download. All three exporters used to build an <a
+// download> and click it, which is silently dead in a Tauri webview: WebView2
+// raises a download request, nothing is registered to handle it, and it is
+// cancelled — no file, no error, no console message. That is why Export looked
+// like a button that did nothing (2026-08-16), and why the same bug sat unseen
+// in device and layer export too.
+//
+// The native dialog picks the path and Rust writes it (`write_text_file`), so
+// the app needs no blanket filesystem permission — just the path the user chose.
+async function saveJsonFile(filename, data) {
+  const path = await save({
+    defaultPath: filename,
+    filters: [{ name: "JSON", extensions: ["json"] }],
+  });
+  if (!path) return false; // user cancelled the dialog
+  await invoke("write_text_file", {
+    path,
+    contents: JSON.stringify(data, null, 2),
+  });
+  return true;
+}
+
 // Every layer this device owns, as one document. Reading the scoped key
 // directly rather than getSavedLayers(), which is relative to whichever device
 // is active — Home can export a device whose editor was never opened.
-function exportDeviceLayers(device) {
+async function exportDeviceLayers(device) {
   const scope = deviceKey(device);
   let layers = [];
   try { layers = JSON.parse(localStorage.getItem(`${LAYERS_KEY}::${scope}`)) || []; } catch {}
@@ -3298,12 +3455,7 @@ function exportDeviceLayers(device) {
     exportedAt: new Date().toISOString(),
     layers,
   };
-  const url = URL.createObjectURL(new Blob([JSON.stringify(doc, null, 2)], { type: "application/json" }));
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `${(device.product_name || "device").replace(/\s+/g, "-")}-layers.json`;
-  a.click();
-  URL.revokeObjectURL(url);
+  await saveJsonFile(`${(device.product_name || "device").replace(/\s+/g, "-")}-layers.json`, doc);
 }
 
 // Appends rather than replaces, and re-ids on the way in so importing a file
@@ -3334,15 +3486,10 @@ async function importDeviceLayers(device, file) {
   renderDeviceList();
 }
 
-function exportLayer(layer) {
-  const data = JSON.stringify({ ...layer, exportedAt: new Date().toISOString() }, null, 2);
-  const blob = new Blob([data], { type: "application/json" });
-  const url  = URL.createObjectURL(blob);
-  const a    = document.createElement("a");
-  a.href     = url;
-  a.download = `${layer.name.replace(/\s+/g, "-").toLowerCase()}-config.json`;
-  a.click();
-  URL.revokeObjectURL(url);
+async function exportLayer(layer) {
+  await saveJsonFile(
+    `${layer.name.replace(/\s+/g, "-").toLowerCase()}-config.json`,
+    { ...layer, exportedAt: new Date().toISOString() });
 }
 
 function importLayer(file) {
@@ -3383,9 +3530,11 @@ function reorderLayers(srcId, dstId) {
 async function switchToLayer(id, { silent = false } = {}) {
   const layer = getSavedLayers().find(l => l.id === id);
   if (!layer) return;
-  await switchToScreen({ type: "layer", layerId: id });
+  // Paint first, talk to the board after. The bar is what visibly lagged.
+  const switched = applyScreenLocally({ type: "layer", layerId: id });
   flashBoard();
   renderLayerBar();
+  if (switched) pushActiveScreenToBoard();
   if (!silent) {
     // The bar's name field is always editable, so "selected for rename" is the
     // whole interaction — no row to open.
@@ -3415,12 +3564,13 @@ function switchToBlankLayer() {
   flashBoard();
 }
 
-function openKeyLedPill()  { document.getElementById("key-pills").classList.add("visible"); }
+function openKeyLedPill()  {
+  closeScreenLedPill(); // shares the slot under the board
+  document.getElementById("key-pills").classList.add("visible");
+}
 function closeKeyLedPill() {
   document.getElementById("key-pills").classList.remove("visible");
-  document.getElementById("kl-advanced").classList.remove("open");
-  document.getElementById("kl-adv-btn").classList.remove("open");
-  document.getElementById("kl-adv-arrow").textContent = "▸";
+  // One drawer to reset since the two pills merged.
   document.getElementById("kc-advanced").classList.remove("open");
   document.getElementById("kc-adv-btn").classList.remove("open");
   document.getElementById("kc-adv-arrow").textContent = "▸";
@@ -3431,7 +3581,53 @@ function closeOledPill() {
   if (pendingEventAssign !== null) { pendingEventAssign = null; renderBoard(); }
 }
 
-function openScreenPicker() {
+// The profile behind whatever screen is showing. Mirrors the live-vs-stored
+// rule in buildScreenLeds(): the screen being edited has not been captured to
+// storage yet, so reading its stored copy would hand back a stale one.
+function currentScreenProfile() {
+  const scr = getOledScreens()[oledScreenIdx];
+  if (!scr) return captureProfile();
+  if (scr.type === "layer") {
+    if (scr.layerId === activeProfileId) return captureProfile();
+    const stored = getSavedLayers().find(l => l.id === scr.layerId);
+    return stored ? structuredClone(stored) : captureProfile();
+  }
+  // A custom screen carries a profile only once something has been copied into
+  // it; before that it simply shows whatever layer is active.
+  return scr.profile ? structuredClone(scr.profile) : captureProfile();
+}
+
+// What "Copy + New Screen" carries: the LED/key profile, the source screen's
+// event-key bindings, and the source's type.
+function currentScreenCopy() {
+  const scr = getOledScreens()[oledScreenIdx];
+  const sk  = currentOledScreenKey();
+  return {
+    profile: currentScreenProfile(),
+    events:  sk ? structuredClone(oledEventKeys[sk] || {}) : {},
+    type:    scr?.type ?? null,
+  };
+}
+
+// Which event bindings survive a copy onto a screen of type `toType`.
+//
+// Present Keys is offered by every screen type, so it always travels — that is
+// the binding people actually rebuild by hand each time. The rest are specific
+// to the screen that owns them: carrying `timerStartStop` onto a pomodoro
+// screen would occupy a key with an event that screen never fires. So they come
+// along only when copying to the same type.
+function eventsForCopy(copyFrom, toType) {
+  const src = copyFrom?.events || {};
+  if (copyFrom?.type && copyFrom.type === toType) return structuredClone(src);
+  return src.presentKeys ? { presentKeys: structuredClone(src.presentKeys) } : {};
+}
+
+// `copyFrom` seeds every screen created in this session of the picker. Custom
+// screens gain a `profile` field, which buildScreenLeds() already knows how to
+// push (slot 4+); layers are duplicated outright. The screen TITLE is never
+// copied — it comes from the type that was picked, which is the whole point of
+// "Copy + New Screen" over a plain duplicate.
+function openScreenPicker(copyFrom = null) {
   if (document.getElementById("oled-screen-picker")) return;
   const existing = new Set(oledCustomScreens.map(s => s.type));
 
@@ -3553,17 +3749,33 @@ function openScreenPicker() {
       // others. Creating it has to go through the same path the old "+" used.
       if (type === "layer") {
         const name = `Layer ${String(getSavedLayers().length + 1).padStart(2, "0")}`;
-        switchToBlankLayer();
+        // Copying starts from the source profile instead of a blank one; the
+        // new layer is otherwise created down the same path.
+        if (copyFrom) applyProfile(copyFrom.profile); else switchToBlankLayer();
         saveCurrentAsLayer(name);
         newLayerId = activeProfileId;
+        if (copyFrom) {
+          const ev = eventsForCopy(copyFrom, "layer");
+          if (Object.keys(ev).length) oledEventKeys[newLayerId] = ev;
+        }
         continue;
       }
       const s = { id: `${Date.now()}-${i++}`, type };
       if (type === "custom") { s.title = ""; s.body = ""; s.imageDataUrl = null; }
       if (type === "gif")    { s.imageDataUrl = null; }
+      // Keys are not copied onto a custom screen: the board has four hardware
+      // layers and a custom screen is not one of them, so it types whatever the
+      // active layer types. LEDs, animation and underglow ARE per-screen on the
+      // board (SET_SCREEN_LEDS, slot 4+), so those carry over.
+      if (copyFrom) {
+        s.profile = structuredClone(copyFrom.profile);
+        const ev = eventsForCopy(copyFrom, type);
+        if (Object.keys(ev).length) oledEventKeys[s.id] = ev;
+      }
       oledCustomScreens.push(s);
     }
     saveOledCustomScreens();
+    if (copyFrom) saveOledEventKeys();
     close();
     // Land on what was just created. A new layer wins if both were added, since
     // that is the one with a name waiting to be typed.
@@ -3589,11 +3801,30 @@ function closeScreenPicker() {
   el.remove();
 }
 
+// The screen's LED theme. Opened from the layer bar rather than from a key,
+// because it applies to the whole screen — see the markup note in index.html.
+function openScreenLedPill() {
+  // Same slot under the board as the underglow and key pills, so only one of
+  // the three can be up at a time.
+  closeUnderglowPill();
+  closeOledPill();
+  closeKeyLedPill();
+  document.getElementById("screen-led-pill").classList.add("visible");
+}
+function closeScreenLedPill() {
+  document.getElementById("screen-led-pill")?.classList.remove("visible");
+}
+function toggleScreenLedPill() {
+  const el = document.getElementById("screen-led-pill");
+  if (el.classList.contains("visible")) closeScreenLedPill(); else openScreenLedPill();
+}
+
 function openUnderglowPill() {
   keySelectionOrder = [];
   selectedKeys.clear();
   closeKeyLedPill();
   closeOledPill();
+  closeScreenLedPill();
   renderBoard();
   document.getElementById("underglow-pill").classList.add("visible");
   document.getElementById("board-ring").classList.add("ug-active");
@@ -4084,6 +4315,127 @@ function saveDevices(list) {
 // still the same device.
 function deviceKey(d) {
   return `${d.product_id}:${d.hardware}`;
+}
+
+// ── Whole-app device backup ─────────────────────────────────────────────────
+// A device's state lives in TWO localStorage keys, and it is the second one
+// that makes this worth having:
+//
+//   kf-saved-layers::<scope>  the named profiles
+//   kf-devcfg::<scope>        the live working state — keymap, LED colours,
+//                             icons, macros, brightness, AND every OLED screen,
+//                             event key, countdown and pomodoro setting
+//
+// The per-device card export writes only the layers, so anything held in devcfg
+// — the OLED screens above all — does not survive an export/reset/import round
+// trip. Both keys are carried here, which is what makes this a real backup.
+//
+// Macro libraries are deliberately NOT included: they are global and shared
+// between devices (see the reset dialog, which keeps them for the same reason)
+// and they already have their own export on the Macro Libraries header.
+const DEVICES_FORMAT   = "keyfigurator.devices";
+const DEVICES_FORMAT_V = 1;
+
+function exportAllDevices() {
+  const devices = getSavedDevices();
+  return {
+    format: DEVICES_FORMAT,
+    version: DEVICES_FORMAT_V,
+    exportedAt: new Date().toISOString(),
+    devices: devices.map((d) => {
+      const scope = deviceKey(d);
+      const read = (k) => { try { return JSON.parse(localStorage.getItem(k)); } catch { return null; } };
+      return {
+        device: d,
+        config: read(`${DEVCFG_PREFIX}::${scope}`),
+        layers: read(`${LAYERS_KEY}::${scope}`) || [],
+      };
+    }),
+  };
+}
+
+async function exportDevicesToFile() {
+  const doc = exportAllDevices();
+  if (doc.devices.length === 0) {
+    await confirmModal({
+      title: "Nothing to export",
+      body: "There are no devices yet, so there is nothing to put in a backup file.",
+      confirmLabel: "OK",
+    });
+    return;
+  }
+  try {
+    await saveJsonFile("orbit-devices.json", doc);
+  } catch (e) {
+    logError(`device export failed: ${e?.message || e}`, "export");
+    await confirmModal({
+      title: "Export failed",
+      body: String(e?.message || e),
+      confirmLabel: "OK",
+    });
+  }
+}
+
+// Restore, not merge. The point of this file is "put it back the way it was",
+// and the round trip it exists for is export -> reset device -> import: merging
+// would leave the reset's blank seed layer sitting alongside the real ones.
+// Devices in the file that are not installed get added; devices that are
+// installed but absent from the file are left alone rather than deleted.
+async function importDevicesFromFile(file) {
+  let parsed;
+  try {
+    parsed = JSON.parse(await file.text());
+  } catch (e) {
+    await confirmModal({ title: "Import failed", body: `Not valid JSON: ${e.message}`, confirmLabel: "OK" });
+    return;
+  }
+  if (parsed?.format !== DEVICES_FORMAT) {
+    await confirmModal({
+      title: "Import failed",
+      body: "That is not an Orbit device backup. Macro library files go through Import on the Macro Libraries header instead.",
+      confirmLabel: "OK",
+    });
+    return;
+  }
+  if (parsed.version > DEVICES_FORMAT_V) {
+    await confirmModal({
+      title: "Import failed",
+      body: `That file is version ${parsed.version} and this app understands ${DEVICES_FORMAT_V}.`,
+      confirmLabel: "OK",
+    });
+    return;
+  }
+
+  const incoming = Array.isArray(parsed.devices) ? parsed.devices : [];
+  const names = incoming.map((e) => e.device?.product_name || deviceKey(e.device || {})).join(", ");
+  const ok = await confirmModal({
+    title: "Import devices",
+    body: `This replaces all settings for ${incoming.length} device(s) — ${names} — with what is in the file, `
+        + "including their layers and OLED screens. Devices not in the file are left alone. "
+        + "Macro libraries are not touched. This cannot be undone.",
+    confirmLabel: "Import",
+  });
+  if (!ok) return;
+
+  // A pending auto-save holds the state we are about to overwrite and would
+  // write it back a moment later — same trap as resetDevice().
+  clearTimeout(_autoSaveTimer);
+
+  const devices = getSavedDevices();
+  for (const entry of incoming) {
+    if (!entry?.device) continue;
+    const scope = deviceKey(entry.device);
+    if (entry.config) localStorage.setItem(`${DEVCFG_PREFIX}::${scope}`, JSON.stringify(entry.config));
+    localStorage.setItem(`${LAYERS_KEY}::${scope}`, JSON.stringify(entry.layers || []));
+    if (!devices.some((d) => deviceKey(d) === scope)) devices.push(entry.device);
+  }
+  saveDevices(devices);
+
+  // In-memory state is global and now stale for whichever device is open.
+  // Reloading is the honest way to re-enter from storage: it is the same path
+  // the app takes on a cold start, so there is no second restore path to keep
+  // in step with this one.
+  location.reload();
 }
 
 const TRANSPORT_ICON = { usb: "🔌", bluetooth: "🔵" };
@@ -4894,6 +5246,351 @@ function parseActions(text) {
   return { actions, errors };
 }
 
+// ── Recorder control ────────────────────────────────────────────────────────
+// The hook is armed only between these two calls. Stop is a mouse target
+// deliberately: any keyboard shortcut for it would be captured by the very
+// recording it is meant to end.
+let macroRecording  = false;
+let macroRecTimer   = null;
+let macroRecBaseline = "";   // editor contents before recording started
+
+// Live preview. Polled rather than pushed from the hook: the hook callback runs
+// for every key on the system and has to stay cheap, so emitting a Tauri event
+// from inside it would put IPC on the critical path of the whole desktop's
+// typing. 150 ms is well under the threshold where the preview feels laggy.
+const MACRO_REC_POLL_MS = 150;
+
+// One fixed delay between steps. The "natural" and "none" modes are gone:
+// natural recorded typing hesitation as part of the macro, which is almost never
+// wanted, and none is just this with the box set to 0.
+// Plain text input, so the value is whatever was typed. Non-numeric or empty
+// falls back to 0 rather than NaN, which would otherwise reach `DELAY NaN` and
+// fail parsing on the way back in.
+function macroRecFixedMs() {
+  const raw = document.getElementById("macro-rec-ms")?.value ?? "";
+  const n = parseInt(String(raw).replace(/[^\d]/g, ""), 10);
+  return Number.isFinite(n) ? Math.min(5000, Math.max(0, n)) : 0;
+}
+
+function setMacroRecState(text, isErr = false) {
+  const el = document.getElementById("macro-rec-state");
+  if (!el) return;
+  el.textContent = text;
+  el.classList.toggle("err", isErr);
+}
+
+// Baseline + what has been captured so far. Recording appends, so the text the
+// macro already had has to survive every repaint.
+function renderMacroRecPreview(events) {
+  const ta = document.getElementById("macro-actions");
+  if (!ta) return 0;
+  const actions = recordingToActions(events, "fixed", macroRecFixedMs());
+  const added   = actionsToText(actions);
+  ta.value = macroRecBaseline
+    ? (added ? `${macroRecBaseline}\n${added}` : macroRecBaseline)
+    : added;
+  ta.scrollTop = ta.scrollHeight; // keep the newest line in view
+  return actions.length;
+}
+
+async function toggleMacroRecording() {
+  const btn   = document.getElementById("macro-rec");
+  const state = document.getElementById("macro-rec-state");
+  const err   = document.getElementById("macro-err");
+  const ta    = document.getElementById("macro-actions");
+
+  if (!macroRecording) {
+    try {
+      await invoke("start_key_recording");
+    } catch (e) {
+      if (err) err.textContent = `Could not start recording: ${e?.message || e}`;
+      return;
+    }
+    macroRecording = true;
+    macroRecBaseline = (ta?.value ?? "").trim();
+    macroRecDomEvents = [];
+    macroRecDomStart  = performance.now();
+    // Capture phase, on window: has to run before the editor's own handlers so
+    // recording a key cannot also trigger whatever that key normally does here.
+    window.addEventListener("keydown", macroRecDomHandler, true);
+    window.addEventListener("keyup", macroRecDomHandler, true);
+    setMacroRecLabel(true);
+    if (err) err.textContent = "";
+    // Read-only while recording: the preview rewrites this box several times a
+    // second, so anything typed into it would be thrown away a moment later.
+    if (ta) ta.readOnly = true;
+
+    macroRecTimer = setInterval(async () => {
+      // Errors are shown, not swallowed. A silent catch here hid a broken
+      // preview once already: the box simply never updated and there was
+      // nothing anywhere to say why.
+      try {
+        const hook = await invoke("peek_key_recording");
+        const evs  = mergeRecordedEvents(hook, macroRecDomEvents);
+        const n = renderMacroRecPreview(evs);
+        // Raw tail, so a key that is arriving but not converting is visibly
+        // different from one that never arrived. `162↓` is a vk the mapping
+        // does not know; `KC_LCTL↓` is one it does.
+        const tail = evs.slice(-6)
+          .map(e => `${e.kc ? e.kc.replace(/^KC_/, "") : e.vk}${e.down ? "↓" : "↑"}`)
+          .join(" ");
+        setMacroRecState(`Recording · ${evs.length} keys · ${n} actions${tail ? ` · ${tail}` : ""}`);
+      } catch (e) {
+        setMacroRecState(`Preview failed: ${e?.message || e}`, true);
+        logError(e, "peek_key_recording");
+      }
+    }, MACRO_REC_POLL_MS);
+    return;
+  }
+
+  macroRecording = false;
+  clearInterval(macroRecTimer);
+  macroRecTimer = null;
+  window.removeEventListener("keydown", macroRecDomHandler, true);
+  window.removeEventListener("keyup", macroRecDomHandler, true);
+  setMacroRecLabel(false);
+  if (ta) ta.readOnly = false;
+
+  let events = [];
+  try {
+    events = mergeRecordedEvents(await invoke("stop_key_recording"), macroRecDomEvents);
+  } catch (e) {
+    setMacroRecState(`Recording failed: ${e?.message || e}`, true);
+    if (err) err.textContent = `Recording failed: ${e?.message || e}`;
+    return;
+  }
+
+  // Rendered from the same baseline the live preview used, NOT appended to the
+  // box's current contents — that already holds the preview, and appending to
+  // it would write every action twice.
+  const n = renderMacroRecPreview(events);
+  const unmapped = events.filter(e => !e.kc && e.down).length;
+
+  setMacroRecState(n
+    ? `Captured ${n} action${n === 1 ? "" : "s"} — edit below`
+      + (unmapped ? ` · ${unmapped} unmapped key(s) skipped` : "")
+    : "Nothing captured");
+  ta?.focus();
+}
+
+function setMacroRecLabel(recording) {
+  const btn   = document.getElementById("macro-rec");
+  const label = document.getElementById("macro-rec-label");
+  if (label) label.textContent = recording ? "Stop" : "Record";
+  if (btn) btn.classList.toggle("recording", recording);
+}
+
+// ── In-app capture ──────────────────────────────────────────────────────────
+// The Win32 hook does not deliver keys that land in Orbit's own window, so
+// anything pressed while the app has focus was silently missing from a
+// recording — Ctrl+C typed at the editor produced nothing, while the same keys
+// pressed in another app recorded fine.
+//
+// So the recorder listens on both: the hook for everything outside the app
+// (Alt+Tab, the Windows key), and DOM events for everything inside it. The two
+// streams are merged on a shared clock and deduplicated, so a machine where the
+// hook DOES see in-app keys does not record them twice.
+
+// event.code is the PHYSICAL key, so a recording maps to the same keycode
+// regardless of the user's layout — which matters here, where the board speaks
+// physical positions.
+const DOM_CODE_TO_KC = {
+  Backquote: "KC_GRV", Minus: "KC_MINS", Equal: "KC_EQL", BracketLeft: "KC_LBRC",
+  BracketRight: "KC_RBRC", Backslash: "KC_BSLS", Semicolon: "KC_SCLN",
+  Quote: "KC_QUOT", Comma: "KC_COMM", Period: "KC_DOT", Slash: "KC_SLSH",
+  Space: "KC_SPC", Enter: "KC_ENT", Tab: "KC_TAB", Backspace: "KC_BSPC",
+  Escape: "KC_ESC", CapsLock: "KC_CAPS", Delete: "KC_DEL", Insert: "KC_INS",
+  Home: "KC_HOME", End: "KC_END", PageUp: "KC_PGUP", PageDown: "KC_PGDN",
+  ArrowLeft: "KC_LEFT", ArrowRight: "KC_RGHT", ArrowUp: "KC_UP", ArrowDown: "KC_DOWN",
+  ControlLeft: "KC_LCTL", ControlRight: "KC_RCTL",
+  ShiftLeft: "KC_LSFT", ShiftRight: "KC_RSFT",
+  AltLeft: "KC_LALT", AltRight: "KC_RALT",
+  MetaLeft: "KC_LGUI", MetaRight: "KC_RGUI", ContextMenu: "KC_APP",
+  NumLock: "KC_NUM", ScrollLock: "KC_SCRL", Pause: "KC_PAUS", PrintScreen: "KC_PSCR",
+  NumpadEnter: "KC_KP_ENTER", NumpadAdd: "KC_PPLS", NumpadSubtract: "KC_PMNS",
+  NumpadMultiply: "KC_PAST", NumpadDivide: "KC_PSLS", NumpadDecimal: "KC_PDOT",
+};
+
+function domCodeToKc(code) {
+  if (!code) return null;
+  if (/^Key[A-Z]$/.test(code))    return `KC_${code.slice(3)}`;
+  if (/^Digit[0-9]$/.test(code))  return `KC_${code.slice(5)}`;
+  if (/^F([1-9]|1[0-2])$/.test(code)) return `KC_${code}`;
+  if (/^Numpad[0-9]$/.test(code)) return `KC_P${code.slice(6)}`;
+  return DOM_CODE_TO_KC[code] ?? null;
+}
+
+let macroRecDomEvents = [];
+let macroRecDomStart  = 0;
+
+function macroRecDomHandler(e) {
+  if (!macroRecording) return;
+  // Keep the app inert while recording: without this, Ctrl+C copies, Tab moves
+  // focus out of the editor, and Escape closes the modal mid-take.
+  e.preventDefault();
+  e.stopPropagation();
+  if (e.repeat) return; // auto-repeat is not a new press
+  const kc = domCodeToKc(e.code);
+  if (!kc) return;
+  macroRecDomEvents.push({
+    kc,
+    vk: 0,
+    down: e.type === "keydown",
+    t_ms: Math.max(0, Math.round(performance.now() - macroRecDomStart)),
+  });
+}
+
+// Merge on the shared "ms since recording started" clock. Dedupe is deliberately
+// conservative: identical keycode AND direction within DEDUPE_MS collapses to
+// one. The two clocks start a few ms apart, so an exact match is not available.
+const MACRO_REC_DEDUPE_MS = 120;
+
+function mergeRecordedEvents(hookEvents, domEvents) {
+  const all = [...(hookEvents || []), ...(domEvents || [])]
+    .sort((a, b) => a.t_ms - b.t_ms);
+  const out = [];
+  for (const e of all) {
+    const dup = out.some(p =>
+      p.kc === e.kc && p.down === e.down && Math.abs(p.t_ms - e.t_ms) <= MACRO_REC_DEDUPE_MS);
+    if (!dup) out.push(e);
+  }
+  return out;
+}
+
+// ── Recording → actions ─────────────────────────────────────────────────────
+// The recorder hands back raw key transitions ({kc, vk, down, t_ms}); this turns
+// them into the same action vocabulary the editor already speaks, so a recording
+// is indistinguishable from something typed by hand and stays editable.
+
+const REC_MODIFIERS = new Set([
+  "KC_LCTL", "KC_RCTL", "KC_LSFT", "KC_RSFT",
+  "KC_LALT", "KC_RALT", "KC_LGUI", "KC_RGUI",
+]);
+
+// Unshifted character for keys that can live inside a TEXT action.
+const REC_CHARS = {
+  KC_SPC: " ", KC_COMM: ",", KC_DOT: ".", KC_SLSH: "/", KC_SCLN: ";",
+  KC_QUOT: "'", KC_LBRC: "[", KC_RBRC: "]", KC_BSLS: "\\", KC_MINS: "-",
+  KC_EQL: "=", KC_GRV: "`",
+};
+
+// A tap only becomes text if the result is unambiguous. Letters with shift are
+// safe — shift+letter is uppercase on every Latin layout. Shifted digits and
+// punctuation are NOT: shift+2 is @ on US and " on several others, so those stay
+// as explicit key actions rather than guessing a character.
+function recCharFor(kc, shiftHeld) {
+  if (/^KC_[A-Z]$/.test(kc)) {
+    const ch = kc.slice(3);
+    return shiftHeld ? ch : ch.toLowerCase();
+  }
+  if (shiftHeld) return null;
+  if (/^KC_[0-9]$/.test(kc)) return kc.slice(3);
+  return REC_CHARS[kc] ?? null;
+}
+
+// `mode`: "none" | "fixed" | "natural". The UI only offers "fixed" — the other
+// two are kept because they are covered by tests and cost nothing, and because
+// "none" is what a fixed delay of 0 already produces.
+// Natural gaps are floored so ordinary
+// typing rhythm does not become a DELAY between every letter, and capped so a
+// pause for thought does not become a macro that appears to hang.
+const REC_NATURAL_MIN_MS = 40;
+const REC_NATURAL_MAX_MS = 2000;
+
+function recordingToActions(events, mode = "fixed", fixedMs = 30) {
+  const out  = [];
+  const held = new Set();
+  let lastT  = null;
+
+  const gapBefore = (t) => {
+    if (mode === "none") return 0;
+    if (mode === "fixed") return out.length === 0 ? 0 : fixedMs;
+    if (lastT === null) return 0;
+    const d = t - lastT;
+    return d < REC_NATURAL_MIN_MS ? 0 : Math.min(d, REC_NATURAL_MAX_MS);
+  };
+
+  const pushDelay = (t) => {
+    const ms = gapBefore(t);
+    if (ms > 0) out.push({ type: "delay", ms });
+  };
+
+  for (let i = 0; i < events.length; i++) {
+    const e = events[i];
+    if (!e.kc) continue; // unmapped key — reported separately, never guessed at
+
+    if (REC_MODIFIERS.has(e.kc)) {
+      pushDelay(e.t_ms);
+      out.push({ type: e.down ? "down" : "up", key: e.kc });
+      if (e.down) held.add(e.kc); else held.delete(e.kc);
+      lastT = e.t_ms;
+      continue;
+    }
+
+    // Non-modifiers are emitted on the DOWN edge as a tap. The matching up is
+    // skipped: TAP already means press-and-release, and emitting both would
+    // double every key.
+    if (!e.down) continue;
+
+    pushDelay(e.t_ms);
+    out.push({ type: "tap", key: e.kc });
+    lastT = e.t_ms;
+  }
+
+  return collapseTextRuns(out);
+}
+
+// Turn consecutive plain taps into one TEXT action. Twelve TAP lines for a typed
+// word is exactly the "complicated to use" the recorder exists to remove, and
+// TEXT is also cheaper in the board's macro buffer.
+//
+// Only runs with nothing held but shift are eligible, and only where every key
+// has an unambiguous character. A run of one is left as a TAP — `TEXT a` reads
+// worse than `TAP KC_A` and gains nothing.
+function collapseTextRuns(actions) {
+  const out  = [];
+  const held = new Set();
+  let   run  = [];   // ordered mix of {ch, action} and {shift: action}
+
+  const isShift = (k) => k === "KC_LSFT" || k === "KC_RSFT";
+
+  // A run collapses only if it yields two or more characters. When it does, any
+  // shift presses inside it are DROPPED — they are already expressed by the
+  // uppercase letters, and re-emitting them would shift the text twice. When it
+  // does not collapse, everything is replayed in its original order, which is
+  // why the run keeps shifts inline rather than in a side list.
+  const flush = () => {
+    const chars = run.filter(e => e.ch !== undefined);
+    if (chars.length >= 2) {
+      out.push({ type: "text", value: chars.map(e => e.ch).join("") });
+    } else {
+      for (const e of run) out.push(e.action ?? e.shift);
+    }
+    run = [];
+  };
+
+  for (const a of actions) {
+    if ((a.type === "down" || a.type === "up") && isShift(a.key)) {
+      if (a.type === "down") held.add(a.key); else held.delete(a.key);
+      run.push({ shift: a });
+      continue;
+    }
+
+    const shiftOnly = [...held].every(isShift);
+    if (a.type === "tap" && shiftOnly) {
+      const ch = recCharFor(a.key, held.has("KC_LSFT") || held.has("KC_RSFT"));
+      if (ch !== null) { run.push({ ch, action: a }); continue; }
+    }
+
+    flush();
+    if (a.type === "down") held.add(a.key);
+    if (a.type === "up")   held.delete(a.key);
+    out.push(a);
+  }
+  flush();
+  return out;
+}
+
 function actionsToText(actions) {
   return (actions || []).map(a => {
     switch (a.type) {
@@ -5174,6 +5871,23 @@ function openMacroEditor(id) {
 
 function closeMacroEditor() {
   editingMacroId = null;
+  // Closing the editor must tear the hook down. Leaving a global keyboard hook
+  // armed because a modal was dismissed is exactly the state this feature must
+  // never be in — the UI that says "recording" would be gone.
+  if (macroRecording) {
+    macroRecording = false;
+    clearInterval(macroRecTimer);
+    macroRecTimer = null;
+    window.removeEventListener("keydown", macroRecDomHandler, true);
+    window.removeEventListener("keyup", macroRecDomHandler, true);
+    const btn = document.getElementById("macro-rec");
+    if (btn) { btn.textContent = "● Record"; btn.classList.remove("recording"); }
+    const state = document.getElementById("macro-rec-state");
+    if (state) state.textContent = "";
+    const ta = document.getElementById("macro-actions");
+    if (ta) ta.readOnly = false;
+    invoke("stop_key_recording").catch((e) => logError(e, "stop_key_recording"));
+  }
   document.getElementById("macro-editor").classList.remove("open");
 }
 
@@ -5220,9 +5934,10 @@ function saveMacroFromEditor() {
 // ── Import / export ─────────────────────────────────────────────────────────
 // The library is the shareable unit, so export writes the whole thing — a
 // half-exported library would be a confusing artefact to hand someone.
-function exportActiveLibrary() {
+async function exportActiveLibrary() {
   const lib = activeLibrary();
   if (!lib) return;
+  const err = document.getElementById("macro-err");
   const payload = {
     format: MACRO_FORMAT,
     version: MACRO_FORMAT_V,
@@ -5231,12 +5946,16 @@ function exportActiveLibrary() {
     exportedAt: new Date().toISOString(),
     macros: lib.macros || [],
   };
-  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = `${(lib.name || "library").replace(/[^\w-]+/g, "_")}.macrolib.json`;
-  a.click();
-  URL.revokeObjectURL(a.href);
+  // Reported as "click Export, nothing visually happens". A silent failure is
+  // the thing to avoid here, so anything that goes wrong lands in the same
+  // error line import already uses.
+  try {
+    if (err) err.textContent = "";
+    await saveJsonFile(`${(lib.name || "library").replace(/[^\w-]+/g, "_")}.macrolib.json`, payload);
+  } catch (e) {
+    if (err) err.textContent = `Export failed: ${e?.message || e}`;
+    logError(`macro library export failed: ${e?.message || e}`, "export");
+  }
 }
 
 // Imported macros are always given fresh ids. Trusting ids from a shared file

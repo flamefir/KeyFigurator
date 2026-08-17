@@ -25,8 +25,13 @@
     <div class="home" id="home">
       <div class="home-head">
         <h1 class="home-title">Devices</h1>
-        <button class="home-add" id="home-add">+ New Device</button>
+        <div class="lib-actions">
+          <button class="home-add ghost" id="devices-export" title="Export every device and all its settings to a file">Export</button>
+          <button class="home-add ghost" id="devices-import-btn" title="Restore devices and settings from a file">Import</button>
+          <button class="home-add" id="home-add">+ New Device</button>
+        </div>
       </div>
+      <input type="file" id="devices-import" accept=".json,application/json" style="display:none" />
       <div class="scan-notice" id="scan-notice"></div>
       <div class="home-list" id="home-list"></div>
       <div class="home-empty" id="home-empty">
@@ -111,6 +116,21 @@
         </div>
 
         <div id="macro-pane-keys">
+          <!-- Recorder. Stop is a mouse target on purpose: a keyboard shortcut
+               to stop would be captured by the recording it is trying to end. -->
+          <div class="macro-rec-row">
+            <button class="macro-rec-btn" id="macro-rec">
+              <span class="macro-rec-dot"></span><span id="macro-rec-label">Record</span>
+            </button>
+            <label class="macro-rec-ms">
+              <span class="pill-label">DELAY</span>
+              <input type="text" id="macro-rec-ms" inputmode="numeric" maxlength="4" value="30" />
+              <span class="macro-rec-unit">ms</span>
+            </label>
+            <span class="macro-rec-state" id="macro-rec-state">
+              Captures everything, including Alt+Tab and the Windows key
+            </span>
+          </div>
           <div class="macro-hint">
             One action per line:
             <code>TAP KC_A</code> · <code>DOWN KC_LCTL</code> · <code>UP KC_LCTL</code> ·
@@ -185,6 +205,8 @@
       </div>
       <div class="layer-actions">
         <button class="layer-act" id="layer-add-screen" title="Add a screen or layer">+ Screen</button>
+        <button class="layer-act" id="layer-copy-screen" title="Add a screen carrying this screen's keys and LEDs">⧉ Copy + New Screen</button>
+        <button class="layer-act" id="layer-led-theme" title="LED theme for this screen: animation, rate, intensity, cycle colors">◐ LED Theme</button>
         <button class="layer-act danger" id="layer-del-screen" title="Remove this screen">✕ Screen</button>
       </div>
     </div>
@@ -240,28 +262,54 @@
           <div class="palette-row" id="ug-palette"></div>
         </div>
       </div>
+      <!-- Screen LED theme. Lives with the SCREEN, not the key: QMK's RGB matrix
+           has one effect for the whole board, so animation / rate / intensity /
+           cycle colours were never per-key even while they sat in the Key LED
+           pill. The board stores them per screen slot (SET_SCREEN_LEDS). Per-key
+           COLOUR stays in the Key LED pill, because that part really is per-key.
+           Control ids are unchanged from when this markup lived in that pill —
+           the existing wiring binds to them as-is. -->
+      <div class="underglow-pill" id="screen-led-pill">
+        <div class="ug-main-row">
+          <span class="pill-label">SCREEN LED THEME</span>
+          <span class="screen-led-hint">Applies to every key on this screen</span>
+        </div>
+        <!-- Body wrapper carries the padding/gap that .ug-advanced used to give
+             this content while it lived inside the Key LED pill's Advanced
+             section. Without it the chips, sliders and swatches sit flush
+             against the pill edges. -->
+        <div class="screen-led-body">
+          <div class="kl-anims" id="kl-anims"></div>
+          <div class="ug-sliders">
+            <label class="ug-slider-row">
+              <span class="pill-label">RATE</span>
+              <input type="range" id="kl-rate" min="0" max="255" value="128" />
+            </label>
+            <label class="ug-slider-row">
+              <span class="pill-label">INTENSITY</span>
+              <input type="range" id="kl-intensity" min="0" max="255" value="180" />
+            </label>
+          </div>
+          <span class="pill-label" style="font-size:9px;letter-spacing:0.1em;padding:4px 0 0">CYCLE COLORS</span>
+          <div class="palette-row" id="kl-palette"></div>
+        </div>
+      </div>
+      <!-- One pill for the selected key. Colour and keycode were two pills with
+           two Advanced drawers; once the LED theme moved out to the screen the
+           first drawer held nothing but the encoder row, so a second pill and a
+           second toggle were buying nothing. Both drawers are now the one below.
+           Every control id is unchanged, so the existing wiring still binds. -->
       <div class="key-pills" id="key-pills">
-        <div class="key-led-pill" id="key-led-pill">
+        <div class="keycode-pill" id="keycode-pill">
           <div class="ug-main-row">
-            <span class="pill-label">KEY LED</span>
+            <span class="pill-label">KEY</span>
             <input type="color" id="kl-color" value="#ffffff" title="Set LED color for selected keys" />
             <span class="kl-count" id="kl-count">1 key</span>
-            <button class="ug-adv-btn" id="kl-adv-btn">Advanced <span id="kl-adv-arrow">▸</span></button>
+            <input type="text" id="kl-kc" class="pill-kc" placeholder="KC_A · MO(1) · HOST(0)…" />
+            <button class="ug-adv-btn" id="kc-adv-btn">Advanced <span id="kc-adv-arrow">▸</span></button>
           </div>
-          <div class="ug-advanced" id="kl-advanced">
-            <div class="kl-anims" id="kl-anims"></div>
-            <div class="ug-sliders">
-              <label class="ug-slider-row">
-                <span class="pill-label">RATE</span>
-                <input type="range" id="kl-rate" min="0" max="255" value="128" />
-              </label>
-              <label class="ug-slider-row">
-                <span class="pill-label">INTENSITY</span>
-                <input type="range" id="kl-intensity" min="0" max="255" value="180" />
-              </label>
-            </div>
-            <span class="pill-label" style="font-size:9px;letter-spacing:0.1em;padding:4px 0 0">CYCLE COLORS</span>
-            <div class="palette-row" id="kl-palette"></div>
+          <div class="ug-advanced" id="kc-advanced">
+            <!-- Shown only when the encoder is what is selected. -->
             <div class="encoder-section" id="encoder-section">
               <span class="pill-label" style="font-size:10px;letter-spacing:0.1em">ENCODER ROTATION</span>
               <div class="enc-opts">
@@ -269,15 +317,6 @@
                 <button class="enc-opt" data-mode="scroll">Mouse Scroll</button>
               </div>
             </div>
-          </div>
-        </div>
-        <div class="keycode-pill" id="keycode-pill">
-          <div class="ug-main-row">
-            <span class="pill-label">KEYCODE</span>
-            <input type="text" id="kl-kc" class="pill-kc" placeholder="KC_A · MO(1) · HOST(0)…" />
-            <button class="ug-adv-btn" id="kc-adv-btn">Advanced <span id="kc-adv-arrow">▸</span></button>
-          </div>
-          <div class="ug-advanced" id="kc-advanced">
             <div class="kc-icon-wrap">
               <div class="kc-icon-row">
                 <span class="pill-label">ICON</span>

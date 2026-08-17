@@ -19,3 +19,5 @@ hidapi = "2"
 image = { version = "0.25", default-features = false, features = ["gif", "png", "jpeg"] }
 color_quant = "1.1"
 base64 = "0.22"
+tauri-plugin-dialog = "2.7.2"
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Threading"] }

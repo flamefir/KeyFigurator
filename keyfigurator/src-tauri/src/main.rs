@@ -20,6 +20,8 @@
 
 mod hid;
 mod kf_protocol;
+#[cfg(target_os = "windows")]
+mod keyrec;
 mod model;
 mod products;
 mod qgf;
@@ -337,6 +339,80 @@ fn simulate_board_host_cmd(state: State<AppState>, index: u8) -> Result<(), Stri
         .map_err(|e| format!("host-cmd channel closed: {e}"))
 }
 
+// ── Macro keystroke recorder ────────────────────────────────────────────────
+// Thin wrappers over keyrec. The hook lives only between start and stop; see
+// the module docs for the constraints this feature holds itself to.
+//
+// Windows-only for now: the hook is Win32. On other platforms these report that
+// rather than silently recording nothing, so the UI can say so.
+
+#[tauri::command(async)]
+fn start_key_recording() -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        keyrec::start()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err("keystroke recording is only implemented on Windows".into())
+    }
+}
+
+#[tauri::command(async)]
+fn stop_key_recording() -> Result<Vec<serde_json::Value>, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let keys = keyrec::stop()?;
+        keys.into_iter()
+            .map(|k| serde_json::to_value(k).map_err(|e| e.to_string()))
+            .collect()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err("keystroke recording is only implemented on Windows".into())
+    }
+}
+
+#[tauri::command(async)]
+fn peek_key_recording() -> Result<Vec<serde_json::Value>, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let keys = keyrec::peek()?;
+        keys.into_iter()
+            .map(|k| serde_json::to_value(k).map_err(|e| e.to_string()))
+            .collect()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(Vec::new())
+    }
+}
+
+#[tauri::command]
+fn is_key_recording() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        keyrec::is_recording()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+}
+
+/// Writes a file the user has already chosen through the native save dialog.
+///
+/// Export used to be a browser-style `<a download>` click. That is silently
+/// dead in a Tauri webview: WebView2 raises a download request, nothing is
+/// registered to handle it, and it is cancelled — no file, no error, no console
+/// message, which is exactly how it presented (2026-08-16). The path is picked
+/// by the dialog plugin on the frontend and written here, so the app needs no
+/// broad filesystem permission — only the exact path the user just pointed at.
+#[tauri::command]
+fn write_text_file(path: String, contents: String) -> Result<(), String> {
+    std::fs::write(&path, contents).map_err(|e| format!("{path}: {e}"))
+}
+
 fn main() {
     // Inbound host-command channel: RealHid's future read thread (or the
     // simulate_board_host_cmd command) sends a binding index here; the listener
@@ -368,6 +444,7 @@ fn main() {
     let listener_bindings = bindings.clone();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
             // Match native window background to the app's dark theme (#16171d) so that
             // resize events don't flash white before the WebView repaints.
@@ -417,6 +494,11 @@ fn main() {
         })
         .manage(state)
         .invoke_handler(tauri::generate_handler![
+            write_text_file,
+            start_key_recording,
+            stop_key_recording,
+            peek_key_recording,
+            is_key_recording,
             is_connected,
             board_status,
             board_ping,
