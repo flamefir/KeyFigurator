@@ -503,12 +503,17 @@ function rateToDuration(rate) {
   return 65536 / sc / 1000;
 }
 
-// Underglow. Mirrors kf_ug_period_ms(), which is a plain line and needs no
-// quantisation — that code is ours, not QMK's.
-function ugRateToDuration(rate) {
-  const r = Math.min(255, Math.max(0, Number(rate) || 0));
-  return (4000 - r * 14) / 1000;
-}
+// Underglow. Was its own line, `4000 - rate*14`, mirroring a firmware
+// kf_ug_period_ms() that was also its own line. Both now use the KEY mapping.
+//
+// At rate 128 the corners ran 2.21 s against the keys' 1.99 s — close enough to
+// look deliberate, wrong enough to drift a full cycle out of step every twenty
+// breaths and back. Setting both pickers to breathe never gave a board that
+// breathed as one thing.
+//
+// Kept as a separate name rather than replacing the call sites, so the underglow
+// is still addressable if it ever needs its own mapping again.
+const ugRateToDuration = rateToDuration;
 
 // noCycle: disables Cycle Colors palette when active
 // keyOnly: excluded from underglow chip list (selection-order anim)
@@ -2261,8 +2266,11 @@ function applyCornerGlow(tl, tr, bl, br) {
 }
 
 function computeCornerStates(elapsed) {
-  // The underglow's own mapping, not the keys' — different renderer, different
-  // period. Sharing one helper is what let this preview drift from the board.
+  // The same mapping the keys use. The underglow renderer is still separate on
+  // the board (QMK has one effect for all 25 LEDs, so the corners have to be
+  // drawn by hand), but it now derives its period from the same rate chain —
+  // so at equal rates the corners and the keys are in lockstep, not merely
+  // near each other.
   const duration = ugRateToDuration(ugRate);
   const t        = (elapsed % duration) / duration;
   const maxOp    = (0.15 + (ugIntensity / 255) * 0.85) * (0.12 + (ledBrightness / 255) * 0.88);
@@ -2278,6 +2286,9 @@ function computeCornerStates(elapsed) {
       });
 
     case "breathe": {
+      // Same sin^2 as the keys, and the firmware's ug_breathe() now matches it
+      // too — it was a triangle before, which has no dwell at either end, so
+      // the corners crossed straight through the dark instant the keys sat in.
       const op = maxOp * (0.5 - 0.5 * Math.cos(t * Math.PI * 2));
       return bases.map(hex => {
         const {r,g,b} = hexToRgb(hex); return { rgb:`${r},${g},${b}`, opacity: op };
@@ -2403,6 +2414,13 @@ function computeKeyLedColor(idx, row, col, elapsed) {
 
     case "breathe": {
       if (!hasColor) return null;
+      // `0.5 - 0.5*cos(2*pi*t)` is sin^2(pi*t), and this is the REFERENCE the
+      // firmware was changed to match, not the other way round. QMK's stock
+      // BREATHING draws sin(pi*t), which spends 0.8% of the cycle below 2%
+      // brightness against this curve's 9% — so the palette swap, which lands
+      // at t=0 on both, arrived while the board was still visibly lit. The
+      // board now runs KF_BREATHING (rgb_matrix_kb.inc), which squares it.
+      // Changing this line means changing that file too.
       const op = maxOp * (0.5 - 0.5 * Math.cos(t * Math.PI * 2));
       const { r, g, b } = hexToRgb(baseHex);
       return { rgb: `${r},${g},${b}`, opacity: op };
