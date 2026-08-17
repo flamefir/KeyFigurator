@@ -21,6 +21,8 @@
 mod hid;
 mod kf_protocol;
 #[cfg(target_os = "windows")]
+mod keyplay;
+#[cfg(target_os = "windows")]
 mod keyrec;
 mod model;
 mod products;
@@ -212,6 +214,20 @@ fn set_overlay(state: State<AppState>, on: bool) -> Result<(), String> {
         .lock()
         .unwrap()
         .set_overlay(on)
+        .map_err(|e| e.to_string())
+}
+
+/// Show or clear the board's "Saving ..." splash around a Save to Board.
+///
+/// Never fails: the transport turns an unsupported command into `Ok`, because a
+/// board too old to draw a splash must still be savable.
+#[tauri::command(async)]
+fn set_oled_busy(state: State<AppState>, on: bool) -> Result<(), String> {
+    state
+        .transport
+        .lock()
+        .unwrap()
+        .set_oled_busy(on)
         .map_err(|e| e.to_string())
 }
 
@@ -510,6 +526,7 @@ fn main() {
             set_ug_anim,
             set_palette,
             set_overlay,
+            set_oled_busy,
             oled_push,
             oled_push_image,
             sync_time,

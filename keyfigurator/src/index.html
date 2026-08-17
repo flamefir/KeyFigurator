@@ -280,14 +280,14 @@
              against the pill edges. -->
         <div class="screen-led-body">
           <div class="kl-anims" id="kl-anims"></div>
+          <!-- RATE only. There was an INTENSITY slider here; it had no field in
+               the key animation payload, so it scaled the preview's opacity and
+               the board never saw it. Brightness in the top bar is the control
+               that actually reaches the LEDs. -->
           <div class="ug-sliders">
             <label class="ug-slider-row">
               <span class="pill-label">RATE</span>
               <input type="range" id="kl-rate" min="0" max="255" value="128" />
-            </label>
-            <label class="ug-slider-row">
-              <span class="pill-label">INTENSITY</span>
-              <input type="range" id="kl-intensity" min="0" max="255" value="180" />
             </label>
           </div>
           <span class="pill-label" style="font-size:9px;letter-spacing:0.1em;padding:4px 0 0">CYCLE COLORS</span>
@@ -332,7 +332,9 @@
               </div>
             </div>
             <!-- Bind one macro from the Home page libraries to this key. Sets
-                 the key's keycode to MACRO(n) and reserves a board slot. -->
+                 the key's keycode to HOST(n) and reserves a board slot, for
+                 keystroke and shell macros alike — the board reports the index
+                 and Orbit performs it. -->
             <div class="kc-macro-row" id="kc-macro-row">
               <span class="pill-label">MACRO</span>
               <select id="kc-macro-select" class="kc-macro-select"></select>

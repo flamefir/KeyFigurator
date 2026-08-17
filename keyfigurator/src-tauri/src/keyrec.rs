@@ -192,7 +192,10 @@ pub fn is_recording() -> bool {
 /// Keyed on the VK rather than the scan code because the VK is what identifies
 /// the key's role; the extended-key flag disambiguates the pairs that share a
 /// VK (right-hand modifiers, the navigation cluster vs the numpad).
-fn vk_to_kc(vk: u32, flags: u32) -> Option<&'static str> {
+///
+/// `pub(crate)` for `keyplay`'s cross-check test, which walks every VK through
+/// this and asserts playback can perform whatever recording can capture.
+pub(crate) fn vk_to_kc(vk: u32, flags: u32) -> Option<&'static str> {
     const EXT: u32 = 0x01; // LLKHF_EXTENDED
     let ext = flags & EXT != 0;
 

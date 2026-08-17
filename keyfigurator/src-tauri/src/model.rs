@@ -370,6 +370,37 @@ mod payload_tests {
         assert_eq!(cfg.font_scale, 3);
     }
 
+    /// A binding as the frontend actually sends it. The macro-library action
+    /// shape is a shared format between the two halves of the app, so a change
+    /// on either side that breaks the tagging has to fail here rather than at a
+    /// keypress.
+    #[test]
+    fn a_keystroke_binding_deserializes_from_the_frontend_shape() {
+        let b: HostBinding = serde_json::from_str(
+            r#"{"index":2,"label":"Copy","command":[],"script":"","cwd":null,
+                "keys":[{"type":"down","key":"KC_LCTL"},
+                        {"type":"tap","key":"KC_C"},
+                        {"type":"up","key":"KC_LCTL"},
+                        {"type":"delay","ms":30},
+                        {"type":"text","value":"hi"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(b.keys.len(), 5);
+        assert_eq!(b.keys[1], MacroAction::Tap { key: "KC_C".into() });
+        assert_eq!(b.keys[3], MacroAction::Delay { ms: 30 });
+        assert_eq!(b.keys[4], MacroAction::Text { value: "hi".into() });
+    }
+
+    /// Bindings written before keystroke macros existed carry no `keys` field
+    /// at all, and must still load as the shell bindings they are.
+    #[test]
+    fn a_binding_without_keys_still_deserializes() {
+        let b: HostBinding =
+            serde_json::from_str(r#"{"index":0,"label":"x","script":"echo hi","cwd":null}"#)
+                .unwrap();
+        assert!(b.keys.is_empty());
+    }
+
     /// The other two payloads the frontend sends that carry named fields.
     #[test]
     fn frontend_anim_and_palette_payloads_deserialize() {
@@ -390,8 +421,34 @@ mod payload_tests {
     }
 }
 
-/// A host-side command bound to a HOST(n) key. When the board sends a
-/// RunHostCmd Raw HID packet with index n, the app runs this.
+/// One step of a keystroke macro, in the same shape the macro library stores
+/// and the `keyfigurator.macro-library` v1 export format carries — so a macro
+/// recorded in the editor reaches the runner without a translation layer.
+///
+/// `key` holds a QMK keycode NAME (`KC_LCTL`), not a keycode number: that is
+/// what the recorder produces and what the editor's text form reads back.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum MacroAction {
+    /// Press and release.
+    Tap { key: String },
+    /// Hold, without releasing.
+    Down { key: String },
+    Up { key: String },
+    Delay { ms: u32 },
+    /// Type a literal string. Sent as text rather than as keycodes, so it does
+    /// not depend on the host's keyboard layout.
+    Text { value: String },
+}
+
+/// A host-side action bound to a HOST(n) key. When the board sends a
+/// RunHostCmd Raw HID packet with index n, the app performs this.
+///
+/// Three shapes, checked in this order: recorded `keys`, a shell `script`, or a
+/// `command` list. The frontend only ever writes one of them for a given
+/// binding — a macro is either keystrokes or a script, never both — but the
+/// order is fixed here so a binding edited from one kind to the other cannot
+/// keep silently doing the old thing.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HostBinding {
     pub index: u8,
@@ -405,6 +462,16 @@ pub struct HostBinding {
     /// a script needs pipes, redirects and multiple lines to mean anything.
     #[serde(default)]
     pub script: Option<String>,
+    /// A recorded keystroke macro, replayed on the HOST rather than by the
+    /// board's macro engine. Takes precedence over both fields above.
+    ///
+    /// The board cannot be given macro content over this protocol (that needs
+    /// VIA's un-magicked `dynamic_keymap_macro_*` buffer), so keystroke macros
+    /// ride the same index-only channel shell macros already do: the board
+    /// sends n, the host performs the keys. The security property is unchanged
+    /// — content never crosses the wire in either direction.
+    #[serde(default)]
+    pub keys: Vec<MacroAction>,
     /// Working directory to run it in (so git knows which repo).
     pub cwd: Option<String>,
 }

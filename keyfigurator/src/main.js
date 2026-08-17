@@ -107,6 +107,7 @@ function browserMock(cmd, args) {
     case "set_ug_anim":  return;
     case "set_palette":  return;
     case "oled_push":    return;
+    case "set_oled_busy":return;
     case "sync_time":    return;
     case "eeprom_commit":return;
     case "board_ping":   return { protocol: 1, fw_major: 0, fw_minor: 1 };
@@ -181,7 +182,6 @@ let ugIntensity   = 180;
 
 let klAnimation   = "solid";
 let klRate        = 128;
-let klIntensity   = 180;
 
 let klPalette     = [];
 let ugPalette     = [];
@@ -201,15 +201,22 @@ function animFromStored(stored) {
   return mkKeyAnim();
 }
 
+// Reassigns the theme variables AND re-syncs the controls bound to them, the
+// same contract applyUnderglowSnapshot() has always had. Splitting those two
+// apart is what let a layer switch, a device load or a reset leave the pill
+// drawing the previous screen's theme over the new state.
+//
+// Safe before the DOM is wired: syncKeyLedThemeUI() null-checks every element
+// it touches, and init() calls it again once the controls exist.
 function applyAnimState(a) {
   klAnimation = a.animation ?? "solid";
   klRate      = a.rate ?? 128;
-  klIntensity = a.intensity ?? 180;
   klPalette   = Array.isArray(a.palette) ? [...a.palette] : [];
+  syncKeyLedThemeUI();
 }
 
 function currentAnimState() {
-  return { animation: klAnimation, rate: klRate, intensity: klIntensity, palette: [...klPalette] };
+  return { animation: klAnimation, rate: klRate, palette: [...klPalette] };
 }
 
 // Who drives the LEDs, derived rather than stored. "solid" means the board
@@ -271,14 +278,80 @@ let oledCdDone       = false;
 // These are the FIRMWARE's power-on defaults, so an unconfigured board and a
 // fresh editor agree before anything is sent.
 const POMO_DEFAULTS = { workMin: 25, pauseMin: 5, cycles: 4 };
-// Same bounds the firmware clamps to (KF_POMO_MIN/MAX_* in kf_hid.h). Applied
-// here too, so a value cannot be shown that the board would silently change.
+// Same bounds the firmware clamps to (KF_POMO_MIN/MAX_* in kf_hid.h).
 const POMO_MIN_MINUTES = 1;
 const POMO_MAX_MINUTES = 240;
 const POMO_MIN_CYCLES  = 1;
 const POMO_MAX_CYCLES  = 16;
 
 let oledPomo = { ...POMO_DEFAULTS };
+
+// ── 0 is an editing state, not a duration ───────────────────────────────────
+//
+// These fields used to clamp UP to the minimum on every keystroke, which made
+// them hostile to edit: clearing one to type a new number refilled it with `1`
+// instantly, and the next digit landed after that 1 (typing 25 into a cleared
+// WORK gave 125). So 0 is now allowed to sit in the field and in `oledPomo`,
+// meaning "not set yet".
+//
+// It is NOT allowed to reach the board as a duration. The firmware clamps
+// anything under KF_POMO_MIN up to it, so a 0 does not break the pomodoro — it
+// does something worse, which is run 1 while the app displays 0, with nothing
+// saying so. Two things close that gap: everything downstream reads
+// `effectivePomo()` rather than the raw values, so the preview shows what the
+// board will really do; and Save to Board asks first, since that is the point
+// where a half-finished config stops being a draft.
+function effectivePomo() {
+  return {
+    workMin:  Math.max(POMO_MIN_MINUTES, oledPomo.workMin),
+    pauseMin: Math.max(POMO_MIN_MINUTES, oledPomo.pauseMin),
+    cycles:   Math.max(POMO_MIN_CYCLES,  oledPomo.cycles),
+  };
+}
+
+// Which fields are still unset, as labels. One source for both the inline hint
+// in the pill and the Save to Board dialog, so the two cannot describe
+// different states.
+function pomoUnsetFields() {
+  const unset = [];
+  if (oledPomo.workMin  < POMO_MIN_MINUTES) unset.push("WORK");
+  if (oledPomo.pauseMin < POMO_MIN_MINUTES) unset.push("PAUSE");
+  if (oledPomo.cycles   < POMO_MIN_CYCLES)  unset.push("CYCLES");
+  return unset;
+}
+
+// Updates the pomodoro pill's warning line and the amber outline on the fields
+// that are at 0, without touching the rest of the pill. In place because the
+// pill is built as one innerHTML assignment: re-rendering it to refresh a hint
+// destroys the input the user is typing into, which is exactly the kind of
+// interruption this whole change is meant to remove.
+//
+// Says what the board WOULD do rather than only that something is wrong. The
+// firmware clamps silently, so "the board would use 25/5 x 4 instead" is the
+// fact worth surfacing.
+function renderPomoUnsetHint() {
+  const el = document.getElementById("oled-pomo-unset");
+  document.getElementById("oled-pomo-work")
+    ?.classList.toggle("oled-num-unset", oledPomo.workMin  < POMO_MIN_MINUTES);
+  document.getElementById("oled-pomo-pause")
+    ?.classList.toggle("oled-num-unset", oledPomo.pauseMin < POMO_MIN_MINUTES);
+  document.getElementById("oled-pomo-cycles")
+    ?.classList.toggle("oled-num-unset", oledPomo.cycles   < POMO_MIN_CYCLES);
+  if (!el) return;
+
+  const unset = pomoUnsetFields();
+  if (!unset.length) { el.style.display = "none"; el.textContent = ""; return; }
+
+  const eff  = effectivePomo();
+  const many = unset.length > 1;
+  // Explicit "block", not "": clearing the inline style would fall back to the
+  // stylesheet, which hides this by default so it cannot flash on first render.
+  el.style.display = "block";
+  el.textContent =
+    `${unset.join(" and ")} ${many ? "are" : "is"} 0. A pomodoro cannot run on `
+    + `that, so the board would use ${eff.workMin}/${eff.pauseMin} x ${eff.cycles} `
+    + `instead. Set ${many ? "them" : "it"} before saving to the board.`;
+}
 // null = not asked yet. False means the board answered but rejected
 // OLED_SET_POMODORO, i.e. firmware predating the command.
 let oledPomoSupported = null;
@@ -291,7 +364,8 @@ let oledPomoAcc       = 0;          // seconds accumulated before current start
 let oledPomoCompleted = 0;
 
 function pomoPhaseSeconds() {
-  return (oledPomoPhase === "pause" ? oledPomo.pauseMin : oledPomo.workMin) * 60;
+  const p = effectivePomo();
+  return (oledPomoPhase === "pause" ? p.pauseMin : p.workMin) * 60;
 }
 
 function getPomoElapsed() {
@@ -307,12 +381,16 @@ function getPomoRemaining() {
 // than starting another round.
 function pomoTick() {
   if (!oledPomoRunning || oledPomoDone) return;
+  // Effective, not raw: with cycles at 0 the guard bound would be 0 and the
+  // session could never advance past its first phase, which is not what the
+  // board would do with the same config.
+  const cycles = effectivePomo().cycles;
   let guard = 0;
-  while (getPomoElapsed() >= pomoPhaseSeconds() && guard++ < oledPomo.cycles * 2) {
+  while (getPomoElapsed() >= pomoPhaseSeconds() && guard++ < cycles * 2) {
     if (oledPomoPhase === "work") {
       oledPomoCompleted++;
       oledPomoPhase = "pause";
-    } else if (oledPomoCompleted >= oledPomo.cycles) {
+    } else if (oledPomoCompleted >= cycles) {
       oledPomoDone    = true;
       oledPomoRunning = false;
       // The last phase ending is a phase change too, and the one most worth
@@ -394,22 +472,42 @@ const KC_CATEGORIES = [
 ];
 const KC_ALL_FLAT = KC_CATEGORIES.flatMap(c => c.keys);
 
-// RATE is a SPEED: 0 = slowest, 255 = fastest. That is what the wire carries and
-// what QMK's rgb_matrix speed means, so the preview has to agree.
+// RATE is a SPEED: 0 = slowest, 255 = fastest. That is what the wire carries.
 //
-// The preview needs a DURATION, which is the inverse of speed — a high rate must
-// produce a SHORT cycle. The original formula had it the right way round for
-// duration but the wrong way round for the label, so the app previewed fast
-// while the board ran slow at the same slider value.
+// The preview needs a DURATION, and there are TWO hardware answers, because the
+// keys and the underglow are rendered by different code. One shared helper
+// meant the preview could not match both, and in fact matched neither:
 //
-// One helper rather than the four copies of this expression that let the two
-// sides drift apart in the first place.
-const ANIM_MIN_DUR = 0.3; // seconds, at rate 255
-const ANIM_MAX_DUR = 8.0; // seconds, at rate 0
+//   keys       QMK's effect_runner_i, period 65536/(speed/4 + 1) ms
+//   underglow  kf_led_underglow_render(), period 4000 - speed*14 ms
+//
+// The old single formula was a straight 8.0s..0.3s line, which at rate 128
+// previewed a 4.1 s breath while the board ran 2.0 s, and at rate 0 previewed
+// 8 s against the board's 65 s. That is the "breathe changes colour at the
+// wrong time" report: the palette step was landing exactly on the trough all
+// along, but the breath underneath it ran at a speed the app never showed.
+//
+// The fix is on the firmware side — kf_rate_to_qmk_speed() converts a rate into
+// the QMK speed that produces the requested period. These mirror that chain,
+// quantisation included, so the preview shows the period the board will really
+// run rather than one it rounds away from.
+const ANIM_MIN_MS = 1050;  // at rate 255; the board's floor is 65536/64 = 1024
+const ANIM_MAX_MS = 8000;  // at rate 0
 
+// Keys. Mirrors kf_rate_to_qmk_speed() + effect_runner_i, in that order:
+// rate -> requested period -> quantised sc -> the period sc actually gives.
 function rateToDuration(rate) {
   const r = Math.min(255, Math.max(0, Number(rate) || 0));
-  return ANIM_MIN_DUR + ((255 - r) / 255) * (ANIM_MAX_DUR - ANIM_MIN_DUR);
+  const requested = ANIM_MIN_MS + Math.floor((255 - r) * (ANIM_MAX_MS - ANIM_MIN_MS) / 255);
+  const sc = Math.min(64, Math.max(1, Math.floor(65536 / requested)));
+  return 65536 / sc / 1000;
+}
+
+// Underglow. Mirrors kf_ug_period_ms(), which is a plain line and needs no
+// quantisation — that code is ours, not QMK's.
+function ugRateToDuration(rate) {
+  const r = Math.min(255, Math.max(0, Number(rate) || 0));
+  return (4000 - r * 14) / 1000;
 }
 
 // noCycle: disables Cycle Colors palette when active
@@ -528,7 +626,31 @@ function iconMaskBytes(b64) {
 
 function renderOledScreenContent(screenEl) {
   const screens = getOledScreens();
-  if (!screens.length) { screenEl.innerHTML = ""; return; }
+  // No screens is a legitimate state, not an error: deleting the last one
+  // leaves a board whose keys and LEDs still work perfectly, and the firmware
+  // reaches the same place whenever the layer count is zero. A blank rectangle
+  // read as a fault, so both sides show the mark instead. No caption — naming
+  // it would make it sound like something to fix.
+  // A masked div, not an <img src="logo.svg">. Vite INLINES that file as a data
+  // URI into index.html at build time and never emits it as an asset, so a
+  // runtime src would resolve in `npm run dev` and 404 in the packaged app —
+  // the same shape as the export bug. Referencing it from CSS makes Vite
+  // resolve it at build time, and masking paints it the panel's amber rather
+  // than approximating the board's colour through a filter chain.
+  if (!screens.length) {
+    // Only if it is not already up. This function replaces innerHTML wholesale
+    // and is called from every mutation point, so a Save to Board rebuilt the
+    // logo many times in a second — and each rebuild makes the browser
+    // re-decode the inline SVG mask, which is visible as a flicker. Nothing
+    // about this screen changes, so there is nothing to redraw.
+    //
+    // Same defect the board's saving splash had, arrived at independently on
+    // the other side: a static image redrawn because something else was busy.
+    if (!screenEl.firstElementChild?.classList.contains("oled-logo-screen")) {
+      screenEl.innerHTML = `<div class="oled-logo-screen"></div>`;
+    }
+    return;
+  }
   if (oledScreenIdx >= screens.length) oledScreenIdx = screens.length - 1;
   const screen = screens[oledScreenIdx];
 
@@ -1249,6 +1371,10 @@ function renderLayerBar() {
   } else {
     nameInp.value = screenDisplayName(screen);
     nameInp.disabled = true;   // only a layer has a name you can change
+    // With no screens at all the field would be blank, disabled and unexplained
+    // beside a panel showing just the logo. Say what the state is — the keys
+    // and LEDs still work here, so it is not an error, just empty.
+    nameInp.placeholder = screens.length ? "" : "No screens — add one with + Screen";
   }
   posEl.textContent = screens.length ? `${oledScreenIdx + 1} / ${screens.length}` : "";
 
@@ -1448,19 +1574,27 @@ function renderOledPillContent() {
              Values set here apply to the preview above; flash the current firmware to use them on the board.
            </div>`
         : "";
+      // min="0" on purpose: 0 means "not set yet" while editing. The spinner
+      // and the field have to agree with what the input handler allows, or the
+      // arrows would refuse to go somewhere typing can reach.
+      //
+      // The unset warning renders empty and is filled in by
+      // renderPomoUnsetHint(), which is called from the input handler. It has
+      // to update IN PLACE: this whole pill is one innerHTML assignment, so
+      // rebuilding it to refresh a hint destroys the field being typed into.
       container.innerHTML = `
         <div class="oled-pill-section oled-pomo-setrow">
           <label class="oled-cd-field-lbl">WORK
             <input class="oled-cd-num" id="oled-pomo-work" type="number"
-              min="${POMO_MIN_MINUTES}" max="${POMO_MAX_MINUTES}" step="1" value="${oledPomo.workMin}" />
+              min="0" max="${POMO_MAX_MINUTES}" step="1" value="${oledPomo.workMin}" />
           </label>
           <label class="oled-cd-field-lbl">PAUSE
             <input class="oled-cd-num" id="oled-pomo-pause" type="number"
-              min="${POMO_MIN_MINUTES}" max="${POMO_MAX_MINUTES}" step="1" value="${oledPomo.pauseMin}" />
+              min="0" max="${POMO_MAX_MINUTES}" step="1" value="${oledPomo.pauseMin}" />
           </label>
           <label class="oled-cd-field-lbl">CYCLES
             <input class="oled-cd-num" id="oled-pomo-cycles" type="number"
-              min="${POMO_MIN_CYCLES}" max="${POMO_MAX_CYCLES}" step="1" value="${oledPomo.cycles}" />
+              min="0" max="${POMO_MAX_CYCLES}" step="1" value="${oledPomo.cycles}" />
           </label>
         </div>
         <div class="oled-pill-hint">
@@ -1468,6 +1602,7 @@ function renderOledPillContent() {
           last one the board stops rather than looping. Changing a duration does
           not restart a running phase.
         </div>
+        <div class="oled-pill-hint oled-pomo-unset" id="oled-pomo-unset"></div>
         ${unsupported}
         <div class="oled-pill-section" style="padding-bottom:6px">
           <span class="pill-label">SCREEN EVENTS</span>
@@ -1476,21 +1611,34 @@ function renderOledPillContent() {
         ${eventRowHTML("presentKeys", "Present Keys")}
         ${sleepRowHTML()}`;
 
-      const wirePomo = (id, key, min, max) => {
+      // Only the UPPER bound is enforced while typing. Clamping up to the
+      // minimum on every keystroke is what made these fields unusable: an
+      // emptied field refilled itself with 1 before the next digit arrived.
+      // The lower bound is checked at Save to Board, where it can explain
+      // itself instead of silently rewriting what was typed.
+      const wirePomo = (id, key, max) => {
         document.getElementById(id)?.addEventListener("input", (e) => {
-          const v = Math.max(min, Math.min(max, parseInt(e.target.value, 10) || min));
-          e.target.value = v;
+          const raw = e.target.value.trim();
+          const v = Math.min(max, Math.max(0, parseInt(raw, 10) || 0));
+          // Written back only when the text really was out of range or empty.
+          // Assigning on every keystroke drags the caret to the end of the
+          // field, which was the other half of the problem.
+          if (raw !== String(v)) e.target.value = v;
           oledPomo[key] = v;
           savePomodoro();
-          // The hint quotes the cycle count, so it has to be re-rendered with it.
-          if (key === "cycles") renderOledPillContent();
+          // In place, never renderOledPillContent(): that rebuilds the pill and
+          // would blow away the field being typed into. It used to be called
+          // here for the cycle count, which the hint stopped quoting at some
+          // point, so it was costing focus for nothing.
+          renderPomoUnsetHint();
           updateOledDisplay();
           scheduleLiveSync("oled");
         });
       };
-      wirePomo("oled-pomo-work",   "workMin",  POMO_MIN_MINUTES, POMO_MAX_MINUTES);
-      wirePomo("oled-pomo-pause",  "pauseMin", POMO_MIN_MINUTES, POMO_MAX_MINUTES);
-      wirePomo("oled-pomo-cycles", "cycles",   POMO_MIN_CYCLES,  POMO_MAX_CYCLES);
+      wirePomo("oled-pomo-work",   "workMin",  POMO_MAX_MINUTES);
+      wirePomo("oled-pomo-pause",  "pauseMin", POMO_MAX_MINUTES);
+      wirePomo("oled-pomo-cycles", "cycles",   POMO_MAX_CYCLES);
+      renderPomoUnsetHint();
       wireEventRows(container);
       wireSleepRow(container);
       break;
@@ -1832,7 +1980,7 @@ function syncUnderglowUI() {
   document.getElementById("ug-intensity").value = ugIntensity;
   applyCornerColors();
   renderAnimChips();
-  renderPalette("ug-palette", ugPalette, UG_PALETTE_KEY, () => {});
+  renderPalette("ug-palette", () => ugPalette, (v) => { ugPalette = v; }, UG_PALETTE_KEY, () => {});
   updateUgPaletteDisabled();
 }
 
@@ -1847,7 +1995,7 @@ function applyUnderglowSnapshot(ug) {
 
 function saveKlAdvancedState() {
   localStorage.setItem(KL_ADVANCED_KEY, JSON.stringify({
-    animation: klAnimation, rate: klRate, intensity: klIntensity,
+    animation: klAnimation, rate: klRate,
   }));
   saveCurrentKeyAnimState();
 }
@@ -1859,7 +2007,7 @@ function saveKlAdvancedState() {
 // unaffected and still exact.
 function saveCurrentKeyAnimState() {
   localStorage.setItem(KL_PER_KEY, JSON.stringify({
-    animation: klAnimation, rate: klRate, intensity: klIntensity, palette: [...klPalette],
+    animation: klAnimation, rate: klRate, palette: [...klPalette],
   }));
   updateKlColorVars();
   scheduleLiveSync("anim");
@@ -1874,16 +2022,24 @@ function updateKlColorVars() {
   document.documentElement.style.setProperty("--kl-anim-dur", dur + "s");
 }
 
-// Animation is global, so selecting a key no longer swaps the panel's animation
-// state — it just re-syncs the controls to the one global setting.
-function loadKeyAnimState(_idx) {
+// Put every control in the SCREEN LED THEME pill back in step with the state.
+//
+// Must be called by anything that reassigns the theme variables —
+// `applyAnimState()` is the one that does, on layer switch, screen switch,
+// device load and reset. Missing it is what made a reset look like it had not
+// happened: the variables really were back to solid with no cycle colours, but
+// the chips, the rate slider and the swatches were still drawing the old ones,
+// and the swatches were still wired to the old palette array.
+//
+// The underglow pill has had this all along as syncUnderglowUI(); the key side
+// only had the chips, which is why exactly the parts it missed are the parts
+// that went stale.
+function syncKeyLedThemeUI() {
   const rateEl = document.getElementById("kl-rate");
-  const intEl  = document.getElementById("kl-intensity");
   if (rateEl) rateEl.value = klRate;
-  if (intEl)  intEl.value  = klIntensity;
   renderKlAnimChips();
   updatePaletteDisabled();
-  renderPalette("kl-palette", klPalette, KL_PALETTE_KEY, saveCurrentKeyAnimState);
+  renderPalette("kl-palette", () => klPalette, (v) => { klPalette = v; }, KL_PALETTE_KEY, saveCurrentKeyAnimState);
   updateKlColorVars();
 }
 
@@ -1934,10 +2090,35 @@ function renderEncoderOpts() {
   });
 }
 
-function renderPalette(containerId, palette, storageKey, onChange) {
+// Cycle Colors swatches.
+//
+// `get`/`set` rather than the array itself, and this is load-bearing. The
+// palette variables are REASSIGNED, not mutated — `applyAnimState()` does
+// `klPalette = [...]` on every layer switch, screen switch, device load and
+// reset. A render that captured the array kept editing the copy that was live
+// when it drew, so after any of those the swatches were wired to an orphan:
+// clicking one mutated a detached array and wrote it to localStorage, while
+// `onChange()` serialised the CURRENT klPalette (unchanged) and pushed that to
+// the board. That is the "sometimes setting Cycle Colors does nothing" bug —
+// "sometimes" being "after anything that reloaded the theme".
+//
+// Every edit now reads through `get()` and writes a NEW array through `set()`,
+// so there is no aliasing to go stale in the first place.
+function renderPalette(containerId, get, set, storageKey, onChange) {
   const container = document.getElementById(containerId);
   if (!container) return;
   container.innerHTML = "";
+
+  const palette = get();
+
+  // One commit path for add / edit / delete, so none of them can forget a step.
+  const commit = (next) => {
+    set(next);
+    localStorage.setItem(storageKey, JSON.stringify(next));
+    renderPalette(containerId, get, set, storageKey, onChange);
+    onChange();
+    scheduleLiveSync("anim");
+  };
 
   const addEl = document.createElement("label");
   addEl.className = "palette-add" + (palette.length >= 20 ? " at-max" : "");
@@ -1950,11 +2131,7 @@ function renderPalette(containerId, palette, storageKey, onChange) {
     addInp.style.cssText = "position:absolute;opacity:0;width:0;height:0;pointer-events:none";
     addInp.addEventListener("change", (e) => {
       e.stopPropagation();
-      palette.push(e.target.value);
-      localStorage.setItem(storageKey, JSON.stringify(palette));
-      renderPalette(containerId, palette, storageKey, onChange);
-      onChange();
-      scheduleLiveSync("anim");
+      commit([...get(), e.target.value]);
     });
     addEl.appendChild(addInp);
   }
@@ -1966,23 +2143,24 @@ function renderPalette(containerId, palette, storageKey, onChange) {
     swatch.style.background = color;
     swatch.title = color;
 
+    const withColorAt = (v) => get().map((c, j) => (j === i ? v : c));
+
     const inp = document.createElement("input");
     inp.type = "color";
     inp.value = color;
     inp.style.cssText = "position:absolute;opacity:0;width:0;height:0;pointer-events:none";
+    // Dragging the picker: update live but do not re-render, or the element
+    // being dragged is destroyed mid-gesture. No storage write either — the
+    // `change` below lands once when the picker closes.
     inp.addEventListener("input", (e) => {
       e.stopPropagation();
-      palette[i] = e.target.value;
+      set(withColorAt(e.target.value));
       swatch.style.background = e.target.value;
       onChange();
     });
     inp.addEventListener("change", (e) => {
       e.stopPropagation();
-      palette[i] = e.target.value;
-      localStorage.setItem(storageKey, JSON.stringify(palette));
-      renderPalette(containerId, palette, storageKey, onChange);
-      onChange();
-      scheduleLiveSync("anim");
+      commit(withColorAt(e.target.value));
     });
     swatch.appendChild(inp);
 
@@ -1992,11 +2170,7 @@ function renderPalette(containerId, palette, storageKey, onChange) {
     del.addEventListener("click", (e) => {
       e.stopPropagation();
       e.preventDefault();
-      palette.splice(i, 1);
-      localStorage.setItem(storageKey, JSON.stringify(palette));
-      renderPalette(containerId, palette, storageKey, onChange);
-      onChange();
-      scheduleLiveSync("anim");
+      commit(get().filter((_, j) => j !== i));
     });
     swatch.appendChild(del);
 
@@ -2087,7 +2261,9 @@ function applyCornerGlow(tl, tr, bl, br) {
 }
 
 function computeCornerStates(elapsed) {
-  const duration = rateToDuration(ugRate);
+  // The underglow's own mapping, not the keys' — different renderer, different
+  // period. Sharing one helper is what let this preview drift from the board.
+  const duration = ugRateToDuration(ugRate);
   const t        = (elapsed % duration) / duration;
   const maxOp    = (0.15 + (ugIntensity / 255) * 0.85) * (0.12 + (ledBrightness / 255) * 0.88);
   // Palette: time-based — all corners advance through colors together each cycle
@@ -2201,11 +2377,16 @@ function computeKeyLedColor(idx, row, col, elapsed) {
   // not enter into it: the old `isSel` parameter was already dead (never read
   // in this body) and the comment claiming selected keys used live panel state
   // had not been true for some time.
-  const animation = klAnimation, rate = klRate, intensity = klIntensity, palette = klPalette;
+  const animation = klAnimation, rate = klRate, palette = klPalette;
 
   const duration = rateToDuration(rate);
   const t        = (elapsed % duration) / duration;
-  const maxOp    = 0.15 + (intensity / 255) * 0.85;
+  // Was scaled by a per-theme INTENSITY slider. That slider had no wire
+  // representation at all — `buildAnimState()` sends name/speed/colour and
+  // nothing else — so it dimmed the PREVIEW only, and the board ignored it.
+  // A control that makes the app disagree with the hardware is worse than no
+  // control. Brightness, which does reach the board, is the real one.
+  const maxOp    = 1;
   const ownColor = keyLedColors[idx] || "#ffffff";
   // Palette cycling is a group effect — only active while the key is selected
   const usePalette = palette.length > 0 && animation !== "solid" && animation !== "rainbow";
@@ -2402,11 +2583,19 @@ async function init() {
   document.getElementById("btn-save-board").addEventListener("click", async () => {
     const btn = document.getElementById("btn-save-board");
     // Checked before the button changes state, so backing out leaves no trace.
-    // This is the only commit that can strand the board in a state it cannot
-    // get itself out of, so it is the only one that asks.
+    // Save to Board is where a draft stops being a draft, which is why the
+    // checks that would nag on every edit live here instead.
     if (committedFrameIsDark() && !(await confirmDarkSave())) return;
+    const pomoUnset = pomoSaveWarning();
+    if (pomoUnset && !(await confirmPomoUnset(pomoUnset))) return;
     btn.textContent = "Saving…";
     btn.disabled = true;
+    // The board shows the Orbit mark and "Saving ..." for the duration. Not
+    // decoration: a save is a dozen commands and every OLED one dirtied the
+    // panel, so it cleared and fully redrew each time — which is what read as
+    // flickering, or as a dead screen while a large image upload starved the
+    // display task. The splash suppresses those redraws.
+    await invoke("set_oled_busy", { on: true }).catch(() => {});
     try {
       // Push first, THEN commit. eeprom_commit only persists the LED block the
       // board already holds in RAM, so committing without pushing just re-saves
@@ -2418,6 +2607,10 @@ async function init() {
       logError(e, "saveToBoard");
       btn.textContent = _wasConnected ? "Failed" : "No Board";
     } finally {
+      // In the finally, so a failed save does not leave the panel stuck on the
+      // splash. The board also times out on its own after 15 s, for the case
+      // where this never runs at all — a crash, or the cable pulled mid-save.
+      await invoke("set_oled_busy", { on: false }).catch(() => {});
       setTimeout(() => { btn.textContent = "Save to Board"; btn.disabled = false; }, 1500);
     }
   });
@@ -2555,9 +2748,16 @@ async function init() {
   if (hasTauri) {
     try {
       const { listen } = await import("@tauri-apps/api/event");
+      // Into the app log, not just the console. A HOST(n) press is the one
+      // action with no on-screen result of its own, so a macro that half-worked
+      // — a keystroke step with no host mapping, a script that exited non-zero —
+      // would otherwise be indistinguishable from one that did nothing.
       await listen("host-cmd", (e) => {
         const p = e.payload || {};
-        console.log("host-cmd", p.ok ? `HOST(${p.index}) exit ${p.status}` : `HOST(${p.index}) failed: ${p.error || ""}`);
+        if (!p.ok) { logError(`HOST(${p.index}) failed: ${p.error || "unknown error"}`, "host-cmd"); return; }
+        const warn = (p.stderr || "").trim();
+        if (warn) logWarn(`HOST(${p.index}): ${warn}`, "host-cmd");
+        else logInfo(`HOST(${p.index}) ok — ${(p.stdout || "").trim().split("\n")[0]}`, "host-cmd");
       });
       await listen("board-connection", (e) => {
         const connected = !!e.payload?.connected;
@@ -2593,15 +2793,13 @@ async function init() {
     const a = JSON.parse(savedKlAdv);
     klAnimation = a.animation ?? klAnimation;
     klRate      = a.rate      ?? klRate;
-    klIntensity = a.intensity ?? klIntensity;
   } catch {}
   renderKlAnimChips();
   document.getElementById("kl-rate").value      = klRate;
-  document.getElementById("kl-intensity").value = klIntensity;
 
   const savedKlPalette = localStorage.getItem(KL_PALETTE_KEY);
   if (savedKlPalette) try { klPalette = JSON.parse(savedKlPalette); } catch {}
-  renderPalette("kl-palette", klPalette, KL_PALETTE_KEY, saveCurrentKeyAnimState);
+  renderPalette("kl-palette", () => klPalette, (v) => { klPalette = v; }, KL_PALETTE_KEY, saveCurrentKeyAnimState);
 
   const savedPerKey = localStorage.getItem(KL_PER_KEY);
   if (savedPerKey) try {
@@ -2611,7 +2809,7 @@ async function init() {
 
   const savedUgPalette = localStorage.getItem(UG_PALETTE_KEY);
   if (savedUgPalette) try { ugPalette = JSON.parse(savedUgPalette); } catch {}
-  renderPalette("ug-palette", ugPalette, UG_PALETTE_KEY, () => {});
+  renderPalette("ug-palette", () => ugPalette, (v) => { ugPalette = v; }, UG_PALETTE_KEY, () => {});
 
   const savedEnc = localStorage.getItem(ENC_KEY);
   if (savedEnc) try { const e = JSON.parse(savedEnc); encoderMode = e.mode ?? encoderMode; } catch {}
@@ -2778,9 +2976,9 @@ async function init() {
   document.getElementById("kl-rate").addEventListener("input", (e) => {
     klRate = Number(e.target.value); saveKlAdvancedState();
   });
-  document.getElementById("kl-intensity").addEventListener("input", (e) => {
-    klIntensity = Number(e.target.value); saveKlAdvancedState();
-  });
+  // No kl-intensity handler: the slider is gone. It scaled the preview's
+  // opacity and nothing else — there is no intensity field in the key
+  // animation payload, so the board never saw it.
 
   // ── Keycode Advanced toggle ────────────────────────────────────────────────
   document.getElementById("kc-adv-btn").addEventListener("click", async (e) => {
@@ -2915,7 +3113,7 @@ function openLedSettingsForKey(keyIdx) {
   selectedKeys.add(keyIdx);
   const el = document.getElementById("key-" + keyIdx);
   if (el) el.classList.add("sel");
-  loadKeyAnimState(keyIdx);
+  syncKeyLedThemeUI();
   closeUnderglowPill();
   closeOledPill();
   syncKeyLedPill();
@@ -3115,7 +3313,7 @@ function onKeyDown(idx) {
   const el = document.getElementById("key-" + idx);
   if (el) el.classList.add("sel");
 
-  loadKeyAnimState(idx);
+  syncKeyLedThemeUI();
   closeUnderglowPill();
   closeOledPill();
   syncKeyLedPill();
@@ -3246,7 +3444,7 @@ function captureProfile() {
     leds:       [...keyLedColors],
     iconImages: [...keyIconImages],
     iconBits:   [...keyIconBits],
-    // Kept with the profile: it owns the keymap, and MACRO(n) keycodes are
+    // Kept with the profile: it owns the keymap, and HOST(n) keycodes are
     // meaningless without the bindings that produced them.
     keyMacros:  [...keyMacros],
     animStates: currentAnimState(),
@@ -4078,6 +4276,35 @@ function promptModal({ title, label, value = "", placeholder = "", confirmLabel 
   });
 }
 
+// Is there a pomodoro screen with a value still at 0?
+//
+// Scoped to boards that actually have one: warning about pomodoro durations on
+// a config with no pomodoro screen is noise, and noise on a confirm dialog is
+// how a user learns to click through the one that matters.
+function pomoSaveWarning() {
+  const hasPomodoro = getOledScreens().some(s => s.type === "pomodoro");
+  if (!hasPomodoro) return null;
+  const unset = pomoUnsetFields();
+  return unset.length ? unset : null;
+}
+
+// Resolves true if the user still wants to commit with an unset duration.
+// Unlike the dark-save guard this one is recoverable on the board, so it is
+// phrased as a mismatch to fix rather than a trap to avoid.
+function confirmPomoUnset(unset) {
+  const eff  = effectivePomo();
+  const many = unset.length > 1;
+  return confirmModal({
+    title: many ? "Save with unset pomodoro values?" : "Save with an unset pomodoro value?",
+    body: `${unset.join(" and ")} ${many ? "are" : "is"} still 0, and a pomodoro `
+        + `cannot run on that. The board clamps anything below 1 up to it, so it `
+        + `would run ${eff.workMin}/${eff.pauseMin} x ${eff.cycles} while this app `
+        + `shows 0. Nothing breaks, but the two stop agreeing until `
+        + `${many ? "those fields are" : "that field is"} set.`,
+    confirmLabel: "Save anyway",
+  });
+}
+
 function confirmDarkSave() {
   const tail = ledBrightness === 0
     ? "Raise the brightness, or pick an animation, or save anyway."
@@ -4136,11 +4363,13 @@ function buildOledConfig() {
     screen_leds: buildScreenLeds(),
     sleep_mask: buildSleepMask(),
     sleep_timeout_s: OLED_SLEEP_TIMEOUT_S,
-    pomodoro: {
-      work_min:  oledPomo.workMin,
-      pause_min: oledPomo.pauseMin,
-      cycles:    oledPomo.cycles,
-    },
+    // Effective, not raw. A 0 here means "not set yet" in the editor, and the
+    // firmware would clamp it to its minimum anyway — sending the clamped value
+    // means the app knows what the board is running rather than inferring it.
+    pomodoro: (() => {
+      const p = effectivePomo();
+      return { work_min: p.workMin, pause_min: p.pauseMin, cycles: p.cycles };
+    })(),
   };
 }
 
@@ -4551,6 +4780,20 @@ async function resetDevice(device) {
   clearTimeout(_autoSaveTimer);
   localStorage.removeItem(`${DEVCFG_PREFIX}::${scope}`);
 
+  // The LED theme also lives in these, which are NOT device-scoped — they
+  // predate the per-device config and are read straight into the theme
+  // variables at startup. Removing only the scoped config left them behind, so
+  // a reset device came back up on the last theme that had been set on ANY
+  // device: reported as "reset, but it was still Breathe with the cycle
+  // colours remembered".
+  //
+  // They are cleared rather than rewritten with defaults, because absent is
+  // what the load path already treats as "use the defaults".
+  for (const k of [KL_ADVANCED_KEY, KL_PER_KEY, KL_PALETTE_KEY,
+                   UG_ADVANCED_KEY, UG_PALETTE_KEY, UG_CORNERS_KEY, UG_SELECTED_KEY]) {
+    localStorage.removeItem(k);
+  }
+
   // One default layer rather than none. Zero layers is a state nothing else in
   // the app produces: the OLED has no layer screen to show, and the Saved
   // Layers list reads "No saved layers yet" as if the device were brand new but
@@ -4566,6 +4809,18 @@ async function resetDevice(device) {
   activeProfileId = seed.id;
 
   if (activeDevice && deviceKey(activeDevice) === scope) {
+    // The theme pills too, not just the board and the layer bar. resetInMemoryState()
+    // puts the variables back to solid/no-palette/default-rate, but the chips,
+    // sliders and swatches are separate DOM that only these calls redraw —
+    // without them the reset was invisible in the one panel the user was
+    // looking at. applyAnimState() now syncs the key side itself; the
+    // underglow's brightness control is the piece neither covers.
+    syncKeyLedThemeUI();
+    syncUnderglowUI();
+    renderOverlayBtn();
+    renderBrightness();
+    const brightInp = document.getElementById("led-brightness");
+    if (brightInp) brightInp.value = String(ledBrightness);
     renderLayerBar();
     renderOledPill();
     renderBoard();
@@ -4792,11 +5047,20 @@ function enterEditor(device) {
   applyDeviceCapabilities(device);
   renderActiveDeviceInfo();
   syncUnderglowUI();
-  renderKlAnimChips();
+  // The whole theme pill, not just the chips. applyAnimState() syncs it too,
+  // but loadDeviceState() only calls that when the stored blob HAS an `anim`
+  // field — an older one without it would have left the previous device's
+  // swatches and rate on screen.
+  syncKeyLedThemeUI();
   renderOverlayBtn();
   renderBrightness();
   const brightInp = document.getElementById("led-brightness");
   if (brightInp) brightInp.value = String(ledBrightness);
+  // Before the first render, so the keycaps never show a stale slot. This also
+  // heals a config saved while keystroke macros were still bound as MACRO(n) —
+  // the board runs an empty body for those, which is the whole bug they moved
+  // to HOST(n) to escape. Only syncs when something actually changed.
+  if (applyMacroKeycodes()) scheduleLiveSync("keymap");
   renderLayerBar();
   renderOledPill();
   renderBoard();
@@ -4857,18 +5121,22 @@ function applyDeviceCapabilities(device) {
 
 // ── Per-key macro binding ───────────────────────────────────────────────────
 // A key can carry one macro from the Home page libraries. Binding does two
-// things: it reserves one of the board's 16 dynamic macro slots for that macro,
-// and it sets the key's keycode to MACRO(slot).
+// things: it reserves one of the board's 16 HOST(n) slots for that macro, and
+// it sets the key's keycode to HOST(slot).
 //
 // Slots are DERIVED from the current bindings rather than stored, so they can
 // never drift out of step with what is actually assigned. The cost is that
 // slot numbers can shift when a binding is removed — which is fine, because the
 // keycodes are recomputed in the same pass.
 //
-// Note the board's macro CONTENT still cannot be written over the wire (that
-// needs VIA's dynamic_keymap_macro buffer commands). So this assigns the
-// keycode and reserves the slot; the macro body is authored in Vial for now.
-// The UI says so rather than implying the whole round trip works.
+// BOTH macro kinds ride HOST(n). Keystroke macros used to be bound as MACRO(n)
+// and driven by the board's own macro engine, but the CONTENT never reached the
+// board — writing it needs VIA's dynamic_keymap_macro buffer commands
+// (0x0B/0x0C), which are plain VIA ids with no 0xC0 magic and have no route
+// through this channel. So a MACRO(n) key was bound to an empty body and did
+// nothing. Inverted instead: the board sends an index for either kind, and the
+// app performs it — keystrokes through SendInput (`keyplay.rs`), scripts
+// through a shell (`runner.rs`). One slot space, because one keycode.
 const MACRO_SLOT_COUNT = 16;
 
 let keyMacros = Array(21).fill(null); // macro id per key index, null = none
@@ -4885,56 +5153,70 @@ function findMacroById(id) {
 
 // macro id -> slot, in first-assigned order across the key indices.
 //
-// Keystroke and shell macros use SEPARATE slot spaces because they ride
-// different keycodes: keystrokes are MACRO(n), driven by the board's dynamic
-// macros, while shell scripts are HOST(n), which the board reports to the app
-// so `runner.rs` can execute them here. Sharing one counter would waste slots
-// in both spaces and mismatch the indices the runner expects.
+// ONE slot space for both kinds, because both are bound as HOST(n) and the
+// board reports the same index for either. They used to be counted separately
+// (keystrokes as MACRO(n), scripts as HOST(n)); with keystrokes moved onto
+// HOST(n) two counters would hand out the same index twice, and the second
+// binding would silently replace the first in the runner's table.
+//
+// The kind is still carried, because the backend needs to know which field of
+// the binding to fill and the UI still describes them differently.
 function macroSlotMap() {
   const map = new Map();
-  let nKeys = 0, nShell = 0;
+  let next = 0;
   for (const id of keyMacros) {
     if (!id || map.has(id)) continue;
     const m = findMacroById(id);
     if (!m) continue;
-    if (macroKind(m) === "shell") {
-      if (nShell < MACRO_SLOT_COUNT) map.set(id, { kind: "shell", slot: nShell++ });
-    } else if (nKeys < MACRO_SLOT_COUNT) {
-      map.set(id, { kind: "keys", slot: nKeys++ });
-    }
+    if (next >= MACRO_SLOT_COUNT) continue;
+    map.set(id, { kind: macroKind(m), slot: next++ });
   }
   return map;
 }
 
 // Push the derived slots back into the keymap. Called after any binding change
 // so the keycodes and the slot allocation are always consistent.
+//
+// Returns whether it changed anything, which is how a config saved before
+// keystroke macros moved to HOST(n) gets healed: those keys are still stored as
+// MACRO(n), and a MACRO(n) pushed to the board runs an empty body.
 function applyMacroKeycodes() {
-  if (!keymap) return;
+  if (!keymap) return false;
   const slots = macroSlotMap();
+  let changed = false;
   keyMacros.forEach((id, idx) => {
     if (!id) return;
     const s = slots.get(id);
     if (!s) return; // over the slot limit, or the macro is gone; left unbound
-    keymap.layers[0].keys[idx] = s.kind === "shell" ? `HOST(${s.slot})` : `MACRO(${s.slot})`;
+    const kc = `HOST(${s.slot})`;
+    if (keymap.layers[0].keys[idx] === kc) return;
+    keymap.layers[0].keys[idx] = kc;
+    changed = true;
   });
+  return changed;
 }
 
-// Hand the shell macros bound to keys to the backend, so a physical HOST(n)
-// press has something to run. The board only ever sends an index — this is what
+// Hand every macro bound to a key to the backend, so a physical HOST(n) press
+// has something to perform. The board only ever sends an index — this is what
 // gives that index meaning.
+//
+// A binding carries exactly one of `keys` or `script`; the other is left empty
+// so a macro changed from one kind to the other cannot leave the old content
+// behind as something still executable.
 async function syncHostBindings() {
   const slots = macroSlotMap();
   const bindings = [];
   for (const [id, s] of slots) {
-    if (s.kind !== "shell") continue;
     const m = findMacroById(id);
     if (!m) continue;
+    const shell = s.kind === "shell";
     bindings.push({
       index: s.slot,
       label: m.name || "Macro",
       command: [],
-      script: m.script || "",
-      cwd: m.cwd || null,
+      script: shell ? (m.script || "") : "",
+      keys:   shell ? [] : (m.actions || []),
+      cwd:    shell ? (m.cwd || null) : null,
     });
   }
   try { await invoke("set_bindings", { bindings }); }
@@ -4947,9 +5229,11 @@ function bindMacroToKey(idx, macroId) {
 
   if (!macroId) {
     // Clearing the macro should clear the keycode it owned, but must not stomp
-    // a keycode the user set by hand afterwards.
+    // a keycode the user set by hand afterwards. MACRO(n) is still matched:
+    // keystroke macros were bound that way before they moved onto HOST(n), and
+    // a key bound back then must still unbind cleanly.
     const kc = keymap?.layers[0]?.keys[idx] ?? "";
-    if (previous && /^MACRO\(\d+\)$/.test(kc)) keymap.layers[0].keys[idx] = "KC_NO";
+    if (previous && /^(MACRO|HOST)\(\d+\)$/.test(kc)) keymap.layers[0].keys[idx] = "KC_NO";
   }
   applyMacroKeycodes();
   renderKeyMacroRow();
@@ -4988,9 +5272,7 @@ function renderKeyMacroRow() {
   const slots = macroSlotMap();
   const s = bound ? slots.get(bound) : undefined;
   const boundMacro = bound ? findMacroById(bound) : null;
-  if (slotEl) {
-    slotEl.textContent = !s ? "" : (s.kind === "shell" ? `HOST(${s.slot})` : `MACRO(${s.slot})`);
-  }
+  if (slotEl) slotEl.textContent = s ? `HOST(${s.slot})` : "";
 
   if (note) {
     note.className = "kc-macro-note";
@@ -5000,10 +5282,9 @@ function renderKeyMacroRow() {
       note.className = "kc-macro-note warn";
       note.textContent = `Over the ${MACRO_SLOT_COUNT}-slot limit, so this one is not assigned.`;
     } else if (bound && macroKind(boundMacro) === "shell") {
-      note.textContent = "Runs its script on this computer when pressed. Works fully — the board sends the binding index and the app executes it.";
+      note.textContent = "Runs its script on this computer when pressed. The board sends the binding index and Orbit executes it.";
     } else if (bound) {
-      note.className = "kc-macro-note warn";
-      note.textContent = "Keystroke macros need their steps authored in Vial — the app cannot write macro content to the board yet. Shell macros do not have this limitation.";
+      note.textContent = "Orbit types the keys when pressed. The board sends the binding index, so this needs Orbit running.";
     } else {
       note.textContent = "";
     }
@@ -5111,8 +5392,11 @@ function loadDeviceState() {
     // opens at 00:00:00. Older blobs still carry the field; it is ignored
     // rather than migrated, since there is nothing to preserve.
     resetCountdown();
-    // Clamped on the way in, not just on input: a hand-edited or older blob
-    // must not hand the board a 0-minute phase.
+    // Bounded on the way in, not just on input, so a hand-edited or older blob
+    // cannot carry a nonsense duration. The LOWER bound is 0, not 1: a value
+    // left unset is restored as it was left rather than quietly healing to 1
+    // behind the user's back. Nothing downstream reads these raw — the preview
+    // and the push both go through effectivePomo().
     if (s.oled.pomodoro) {
       const p = s.oled.pomodoro;
       const min = (v, d, lo, hi) =>
@@ -5121,9 +5405,9 @@ function loadDeviceState() {
       // back to the old short break, which is what it replaced; the long break
       // has no successor and is simply dropped.
       oledPomo = {
-        workMin:  min(p.workMin,  POMO_DEFAULTS.workMin,  POMO_MIN_MINUTES, POMO_MAX_MINUTES),
-        pauseMin: min(p.pauseMin ?? p.shortBreakMin, POMO_DEFAULTS.pauseMin, POMO_MIN_MINUTES, POMO_MAX_MINUTES),
-        cycles:   min(p.cycles   ?? p.longEvery,     POMO_DEFAULTS.cycles,   POMO_MIN_CYCLES,  POMO_MAX_CYCLES),
+        workMin:  min(p.workMin,  POMO_DEFAULTS.workMin,  0, POMO_MAX_MINUTES),
+        pauseMin: min(p.pauseMin ?? p.shortBreakMin, POMO_DEFAULTS.pauseMin, 0, POMO_MAX_MINUTES),
+        cycles:   min(p.cycles   ?? p.longEvery,     POMO_DEFAULTS.cycles,   0, POMO_MAX_CYCLES),
       };
     } else {
       oledPomo = { ...POMO_DEFAULTS };
@@ -5149,9 +5433,10 @@ function loadDeviceState() {
 //   { "type": "delay", "ms": 100       }   pause
 //   { "type": "text" , "value": "hi"   }   type a literal string
 //
-// These map onto QMK's own macro primitives (SS_TAP / SS_DOWN / SS_UP / delay /
-// string), so the format stays translatable to what the board can execute once
-// macro content can be written over the wire.
+// This is the shape `model.rs::MacroAction` deserializes, so a macro goes from
+// the editor to playback without a translation layer. It also still maps onto
+// QMK's own primitives (SS_TAP / SS_DOWN / SS_UP / delay / string), which keeps
+// the format translatable if macro content ever does reach the board.
 // Libraries are browsed like folders: tiles at the top level, macros inside.
 // The LIBRARY is the shareable unit — it is what export writes and import reads.
 const MACROS_KEY     = "kf-macro-libraries";
@@ -5206,6 +5491,8 @@ function saveMacros(macros) {
 }
 
 // ── Action text <-> structured actions ──────────────────────────────────────
+const DELAY_MAX_MS = 600000;
+
 // The editor is line-based because a drag-and-drop action builder is a lot of
 // UI for something that reads perfectly well as text. Storage stays structured
 // either way, which is what makes the format shareable.
@@ -5229,6 +5516,11 @@ function parseActions(text) {
       case "DELAY": {
         const ms = parseInt(rest, 10);
         if (!Number.isFinite(ms) || ms < 0) { errors.push(`line ${ln}: DELAY needs milliseconds`); return; }
+        // Bounded because the backend takes this as a u32: a value past that
+        // fails to deserialize, and set_bindings is all-or-nothing, so one
+        // mistyped delay would leave EVERY key bound to nothing. Playback
+        // clamps to 10 s anyway, so nothing usable is being refused here.
+        if (ms > DELAY_MAX_MS) { errors.push(`line ${ln}: DELAY is capped at ${DELAY_MAX_MS} ms`); return; }
         actions.push({ type: "delay", ms });
         break;
       }
@@ -6142,14 +6434,15 @@ function deleteSelectedMacros() {
 }
 
 // Deleting a macro must release any key bound to it, or those keys keep a
-// MACRO(n) keycode pointing at a slot that no longer means anything.
+// HOST(n) keycode pointing at a slot that no longer means anything. MACRO(n)
+// is matched too, for keys bound before keystroke macros moved onto HOST(n).
 function releaseDeletedMacroBindings(removedIds) {
   let touched = false;
   keyMacros = keyMacros.map((id, idx) => {
     if (!id || !removedIds.has(id)) return id;
     touched = true;
     const kc = keymap?.layers[0]?.keys[idx] ?? "";
-    if (/^MACRO\(\d+\)$/.test(kc)) keymap.layers[0].keys[idx] = "KC_NO";
+    if (/^(MACRO|HOST)\(\d+\)$/.test(kc)) keymap.layers[0].keys[idx] = "KC_NO";
     return null;
   });
   if (!touched) return;

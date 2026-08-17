@@ -1791,6 +1791,23 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 50%; }
   padding-left: 8px;
   color: #d1a05a;
 }
+/* A duration left at 0. Hidden by default and shown by renderPomoUnsetHint(),
+   which sets display:block explicitly — clearing the inline style would land
+   back on this rule. Same amber as the unsupported-firmware note: both say
+   "the board will not do what this panel shows". */
+.oled-pomo-unset {
+  display: none;
+  border-left: 2px solid #d1a05a;
+  padding-left: 8px;
+  color: #d1a05a;
+}
+/* The field itself, so the warning has something to point at. Deliberately an
+   outline rather than a red error state: 0 is a legal thing to be mid-edit,
+   not a mistake, until Save to Board. */
+.oled-cd-num.oled-num-unset {
+  border-color: #d1a05a;
+  color: #d1a05a;
+}
 
 /* Image upload area */
 .oled-img-row { flex-wrap: wrap; gap: 8px; align-items: center; }
@@ -2081,6 +2098,22 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 50%; }
   width: 30px; height: 30px; vertical-align: middle;
   /* The source art is solid black; the title bar is dark. */
   filter: invert(1) brightness(1.6);
+}
+
+/* The OLED preview with no screens configured. Mirrors the board, which draws
+   the same mark centred when total_screens() is 0.
+   Masked rather than an <img> with a filter: the art is solid black, and a
+   mask paints it the panel's exact amber instead of approximating it through
+   invert/sepia/hue-rotate. It also makes Vite resolve the file at build time —
+   referenced from markup it gets inlined into index.html and is not emitted as
+   an asset at all, so a runtime src would 404 in the packaged app.
+   Width matched to the firmware's 116 of 128 px. */
+.oled-logo-screen {
+  width: 91%;
+  aspect-ratio: 1;
+  background-color: #ffb454;
+  -webkit-mask: url("logo.svg") center / contain no-repeat;
+  mask: url("logo.svg") center / contain no-repeat;
 }
 
 .prompt-field { display: flex; flex-direction: column; gap: 6px; }

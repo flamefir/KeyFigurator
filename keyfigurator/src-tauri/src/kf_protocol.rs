@@ -87,6 +87,7 @@ pub const CMD_OLED_SET_KEY_INFO: u8 = 0x5D;
 pub const CMD_SET_SCREEN_LEDS: u8 = 0x5E;
 pub const CMD_OLED_SET_KEY_ICON: u8 = 0x5F;
 pub const CMD_OLED_SET_FONT: u8 = 0x60;
+pub const CMD_OLED_SET_BUSY: u8 = 0x61;
 /// Title text scale. The board has one font drawn at integer multiples, so
 /// this is the whole of what a "font size" can be there.
 pub const FONT_SCALE_MIN: u8 = 1;
@@ -523,6 +524,48 @@ pub fn oled_set_key_icon_frames(key_idx: u8, mask: Option<&[u8]>) -> Vec<[u8; RE
 /// Title scale, clamped to what the panel can draw.
 pub fn oled_set_font_frame(scale: u8) -> [u8; REPORT_LEN] {
     frame(CMD_OLED_SET_FONT, &[scale.clamp(FONT_SCALE_MIN, FONT_SCALE_MAX)])
+}
+
+/// Put the board's panel on the "Saving ..." splash, or take it off.
+///
+/// A save is a dozen commands back to back and every OLED one dirties the
+/// panel, so it cleared and redrew a dozen times — the flicker. While the
+/// splash is up the board suppresses those redraws entirely.
+pub fn oled_set_busy_frame(on: bool) -> [u8; REPORT_LEN] {
+    frame(CMD_OLED_SET_BUSY, &[u8::from(on)])
+}
+
+#[cfg(test)]
+mod busy_tests {
+    use super::*;
+
+    /// The splash is one byte behind the magic, and the two states have to be
+    /// distinguishable — a frame that said "busy" for both would leave the
+    /// panel stuck on the splash after every save.
+    #[test]
+    fn busy_frame_carries_the_flag() {
+        let on = oled_set_busy_frame(true);
+        let off = oled_set_busy_frame(false);
+        assert_eq!(on[0], KF_MAGIC, "framed like every other command");
+        assert_eq!(on[1], CMD_OLED_SET_BUSY);
+        assert_eq!(on[2], 1);
+        assert_eq!(off[2], 0);
+    }
+
+    /// 0x61 has to stay clear of the commands around it. Reusing an id would
+    /// silently turn a save into a font change on older firmware.
+    #[test]
+    fn busy_command_id_is_unique() {
+        for other in [
+            CMD_OLED_SET_FONT,
+            CMD_OLED_SET_KEY_ICON,
+            CMD_OLED_SET_SLEEP,
+            CMD_SET_SCREEN_LEDS,
+            CMD_OLED_SET_LAYER_COUNT,
+        ] {
+            assert_ne!(CMD_OLED_SET_BUSY, other);
+        }
+    }
 }
 
 pub fn oled_set_sleep_frame(timeout_s: u8, mask: u16) -> [u8; REPORT_LEN] {

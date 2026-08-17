@@ -218,6 +218,24 @@ pub trait HidTransport: Send + Sync {
         expect_ok(&resp)
     }
 
+    /// Show or clear the board's "Saving ..." splash.
+    ///
+    /// Deliberately swallows a failure into `Ok`. Firmware older than this
+    /// command answers `STATUS_ERROR` to it, and a board that cannot draw a
+    /// splash must still be able to accept a save — refusing to save because
+    /// the decoration failed would be a far worse bug than the flicker this
+    /// fixes. Support is detected by asking, per the 2026-07-28 decision not to
+    /// gate new commands behind a version bump.
+    fn set_oled_busy(&mut self, on: bool) -> Result<(), HidError> {
+        match self.transceive(&kf::oled_set_busy_frame(on)) {
+            Ok(resp) => {
+                let _ = expect_ok(&resp);
+                Ok(())
+            }
+            Err(_) => Ok(()),
+        }
+    }
+
     /// Push the full OLED config (RAM-only on the board, so re-push on reconnect).
     /// Push a "Cycle Colors" palette for one target (keys or underglow).
     ///
