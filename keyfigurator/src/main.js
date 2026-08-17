@@ -540,7 +540,27 @@ const ANIMATIONS = [
 ];
 
 // ── OLED helpers ──────────────────────────────────────────────────────────
+// The permanent home screen. Always present, never deletable, and otherwise an
+// ordinary screen: its own LED profile, event keys and sleep setting, and its
+// own slot on the board.
+//
+// It is the FIRST CUSTOM screen rather than the first screen overall, because
+// the board's nav order is layers-then-customs and the two lists have to agree.
+// Putting it ahead of the layers here would show a different order on the panel
+// than in the app.
+const LOGO_SCREEN_ID = "__logo__";
+
+// Called from every path that loads or resets the screen list, so the home
+// screen cannot be lost by an import, a reset, or a config saved before it
+// existed.
+function ensureLogoScreen() {
+  if (!Array.isArray(oledCustomScreens)) oledCustomScreens = [];
+  if (oledCustomScreens.some(s => s.type === "logo")) return;
+  oledCustomScreens.unshift({ id: LOGO_SCREEN_ID, type: "logo" });
+}
+
 function getOledScreens() {
+  ensureLogoScreen();
   return [
     ...getSavedLayers().map(l => ({ type: "layer", layerId: l.id })),
     ...oledCustomScreens,
@@ -654,6 +674,12 @@ function renderOledScreenContent(screenEl) {
   // the same shape as the export bug. Referencing it from CSS makes Vite
   // resolve it at build time, and masking paints it the panel's amber rather
   // than approximating the board's colour through a filter chain.
+  if (screens[oledScreenIdx]?.type === "logo") {
+    if (!screenEl.firstElementChild?.classList.contains("oled-logo-screen")) {
+      screenEl.innerHTML = `<div class="oled-logo-screen"></div>`;
+    }
+    return;
+  }
   if (!screens.length) {
     // Only if it is not already up. This function replaces innerHTML wholesale
     // and is called from every mutation point, so a Save to Board rebuilt the
@@ -1398,14 +1424,18 @@ function renderLayerBar() {
   // Removing a layer is part of "Screen" now, and the last one cannot go:
   // zero layers is the state device reset exists to avoid.
   const delBtn = document.getElementById("layer-del-screen");
-  delBtn.title = onLayer ? "Remove this layer" : "Remove this screen";
-  delBtn.disabled = onLayer
-    ? layers.length <= 1
-    : !["timer", "countdown", "datetime", "pomodoro", "gif", "custom"].includes(screen.type);
+  delBtn.title = screen.type === "logo"
+    ? "The home screen always stays"
+    : (onLayer ? "Remove this layer" : "Remove this screen");
+  // Everything is deletable except the home screen. The last layer used to be
+  // pinned too, because zero screens was a state the board could not show —
+  // it can now, and the home screen is what it shows.
+  delBtn.disabled = screen.type === "logo";
 }
 
 function screenDisplayName(screen) {
   switch (screen?.type) {
+    case "logo":      return "Home";
     case "timer":     return "Timer";
     case "countdown": return "Countdown";
     case "datetime":  return "Date & Time";
@@ -1432,13 +1462,15 @@ async function removeCurrentScreen() {
   const screens = getOledScreens();
   const screen  = screens[oledScreenIdx];
   if (!screen) return;
+  // The home screen is the one thing that always exists. Everything else,
+  // layers included, can go.
+  if (screen.type === "logo") return;
 
   // A layer is a screen in this model, so "remove this screen" removes it —
   // there is no separate delete button any more. Confirmed, because unlike a
   // timer screen a layer carries a whole keymap and LED profile.
   if (screen.type === "layer") {
     const layers = getSavedLayers();
-    if (layers.length <= 1) return;
     const layer = layers.find(l => l.id === screen.layerId);
     const ok = await confirmModal({
       title: `Delete ${layer?.name || "this layer"}?`,
@@ -1660,6 +1692,26 @@ function renderOledPillContent() {
       wireSleepRow(container);
       break;
     }
+    case "logo": {
+      // Settings like any other screen — its own LED profile (via the layer
+      // bar's LED Theme button), its own event keys, its own sleep setting.
+      // What it does not have is a title or a delete button: it is the one
+      // screen that always exists.
+      container.innerHTML = `
+        <div class="oled-pill-section oled-pill-hint">
+          The home screen. Always here and cannot be removed, so the board has
+          something to show when nothing else is set up. Its LEDs, screen
+          events and sleep work like any other screen's.
+        </div>
+        <div class="oled-pill-section" style="padding-bottom:6px">
+          <span class="pill-label">SCREEN EVENTS</span>
+        </div>
+        ${eventRowHTML("presentKeys", "Present Keys")}
+        ${sleepRowHTML()}`;
+      wireEventRows(container);
+      wireSleepRow(container);
+      break;
+    }
     case "datetime": {
       container.innerHTML = `
         <div class="oled-pill-section oled-pill-hint">
@@ -1781,7 +1833,21 @@ function startOledAnim() {
   oledAnimFrame = requestAnimationFrame(oledAnimTick);
 }
 
+// Same guard as klAnimTick: the re-arm is in a `finally`, so one bad frame
+// costs a frame instead of the rest of the session. See that comment for what
+// happens without it.
+let _oledErr = false;
 function oledAnimTick(now) {
+  try {
+    oledAnimTickBody(now);
+  } catch (e) {
+    if (!_oledErr) { _oledErr = true; logError(e, "oledAnimTick"); }
+  } finally {
+    oledAnimFrame = requestAnimationFrame(oledAnimTick);
+  }
+}
+
+function oledAnimTickBody(now) {
   // Countdown completion
   if (oledCdRunning && getCdRemaining() <= 0) {
     oledCdRunning = false; oledCdDone = true;
@@ -1810,8 +1876,6 @@ function oledAnimTick(now) {
     // rebuilt on the animation tick — replacing button DOM nodes while the
     // user is clicking them swallows the click event.
   }
-
-  oledAnimFrame = requestAnimationFrame(oledAnimTick);
 }
 
 // ── Key hover tooltip ─────────────────────────────────────────────────────
@@ -2355,7 +2419,21 @@ function computeCornerStates(elapsed) {
   }
 }
 
+// Same guard as klAnimTick: the re-arm is in a `finally`, so one bad frame
+// costs a frame instead of the rest of the session. See that comment for what
+// happens without it.
+let _ugErr = false;
 function ugAnimTick(now) {
+  try {
+    ugAnimTickBody(now);
+  } catch (e) {
+    if (!_ugErr) { _ugErr = true; logError(e, "ugAnimTick"); }
+  } finally {
+    ugAnimFrame = requestAnimationFrame(ugAnimTick);
+  }
+}
+
+function ugAnimTickBody(now) {
   if (!ugAnimStart) ugAnimStart = now;
   const elapsed = (now - ugAnimStart) / 1000;
   const [tl, tr, bl, br] = computeCornerStates(elapsed);
@@ -2373,7 +2451,6 @@ function ugAnimTick(now) {
     });
   }
 
-  ugAnimFrame = requestAnimationFrame(ugAnimTick);
 }
 
 function startUgAnimation() {
@@ -2508,7 +2585,27 @@ function computeKeyLedColor(idx, row, col, elapsed) {
   }
 }
 
+// The re-arm lives in a `finally`, not at the end of the body.
+//
+// This loop used to schedule its next frame as its last statement, so ONE
+// exception unscheduled it for the rest of the session — silently, because a
+// dead requestAnimationFrame chain makes no further noise and nothing here was
+// catching. That is exactly what a ReferenceError in the snake branch did on
+// 2026-08-17: every key went flat, on every theme, until the app restarted.
+// A bad frame should cost one frame.
+let _klAnimErr = false;
 function klAnimTick(now) {
+  try {
+    klAnimTickBody(now);
+  } catch (e) {
+    // Once. A throw that repeats at 60 Hz would bury the log it is reporting.
+    if (!_klAnimErr) { _klAnimErr = true; logError(e, "klAnimTick"); }
+  } finally {
+    klAnimFrame = requestAnimationFrame(klAnimTick);
+  }
+}
+
+function klAnimTickBody(now) {
   if (!klAnimStart) klAnimStart = now;
   const elapsed = (now - klAnimStart) / 1000;
 
@@ -2541,8 +2638,7 @@ function klAnimTick(now) {
       dot.style.background = alertOn ? "#ff2828" : "#2a0808";
     }
     alertWasPainting = true;
-    klAnimFrame = requestAnimationFrame(klAnimTick);
-    return;
+    return; /* the finally in klAnimTick() re-arms */
   }
   // Hand everything back. The !important properties have to be REMOVED, not
   // overwritten — the normal per-frame path assigns plain inline styles, which
@@ -2588,8 +2684,6 @@ function klAnimTick(now) {
     el.style.boxShadow   = `0 0 8px rgba(${rgb},${(opacity * 0.6).toFixed(3)})`;
     el.style.color       = "";
   }
-
-  klAnimFrame = requestAnimationFrame(klAnimTick);
 }
 
 function startKlAnimation() {
@@ -3867,7 +3961,13 @@ function eventsForCopy(copyFrom, toType) {
 // "Copy + New Screen" over a plain duplicate.
 function openScreenPicker(copyFrom = null) {
   if (document.getElementById("oled-screen-picker")) return;
+  // One of each type, layers included. Two holes used to let duplicates in:
+  // this set was built only from oledCustomScreens, so "layer" was never in it
+  // and could be added without limit; and `custom` was explicitly exempted
+  // below. The board's nav space is now one screen per type plus the permanent
+  // logo screen, so both are closed.
   const existing = new Set(oledCustomScreens.map(s => s.type));
+  if (getSavedLayers().length) existing.add("layer");
 
   const TYPES = [
     // A layer IS a screen in this model — the OLED list is layers followed by
@@ -3928,7 +4028,7 @@ function openScreenPicker(copyFrom = null) {
     },
   ];
 
-  const available = TYPES.filter(t => t.type === "custom" || !existing.has(t.type));
+  const available = TYPES.filter(t => !existing.has(t.type));
   if (!available.length) return;
 
   const overlay = document.createElement("div");

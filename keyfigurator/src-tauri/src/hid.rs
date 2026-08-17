@@ -456,6 +456,7 @@ fn screen_kind_to_type(kind: &str) -> u8 {
         "pomodoro" => kf::SCREEN_POMODORO,
         // The app calls it a "gif" screen; the firmware calls it an image screen.
         "image" => kf::SCREEN_IMAGE,
+        "logo" => kf::SCREEN_LOGO,
         _ => kf::SCREEN_CUSTOM_TEXT,
     }
 }

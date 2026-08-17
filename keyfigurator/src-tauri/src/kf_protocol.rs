@@ -144,7 +144,9 @@ pub const QK_MACRO_0: u16 = 0x7700;
 pub const MACRO_COUNT: u8 = 16;
 
 // OLED limits (kf_hid.h).
-pub const OLED_MAX_CUSTOM_SCREENS: usize = 6;
+/// 7, not 6: the home screen occupies one custom slot, alongside the six
+/// content types (timer, countdown, datetime, custom text, pomodoro, image).
+pub const OLED_MAX_CUSTOM_SCREENS: usize = 7;
 pub const OLED_LAYER_NAME_MAX: usize = 16;
 pub const OLED_CUSTOM_TITLE_MAX: usize = 14;
 pub const OLED_BODY_MAX: usize = 48;
@@ -160,6 +162,9 @@ pub const SCREEN_DATETIME: u8 = 3;
 pub const SCREEN_CUSTOM_TEXT: u8 = 4;
 pub const SCREEN_POMODORO: u8 = 5;
 pub const SCREEN_IMAGE: u8 = 6;
+/// The permanent home screen. Always present, never deletable, and drawn by the
+/// board from its own logo bitmap — no content crosses the wire for it.
+pub const SCREEN_LOGO: u8 = 7;
 
 /// The board's single image buffer (`KF_OLED_IMG_MAX_BYTES`), and the caps the
 /// encoder must respect to stay inside it.

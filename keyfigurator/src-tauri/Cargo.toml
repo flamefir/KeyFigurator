@@ -1,6 +1,6 @@
 [package]
 name = "macropad-config"
-version = "0.2.7"
+version = "0.2.8"
 description = "Orbit - configuration app for the Lunar x MacroPad"
 edition = "2021"
 
