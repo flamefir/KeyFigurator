@@ -40,6 +40,27 @@
         <div class="home-empty-sub">Plug a board in and hit <b>New Device</b> to scan for it.</div>
       </div>
 
+      <!-- Chatrooms. One room = one Telegram bot this install owns, plus one
+           paired peer on any Telegram client. Lives on the home page rather
+           than in the editor because a room is not a property of a board: it
+           exists whether or not a Connection Screen is bound to it, and it
+           keeps receiving with no board plugged in at all. -->
+      <div class="home-head">
+        <h1 class="home-title">Chatrooms</h1>
+        <div class="lib-actions">
+          <button class="home-add" id="chat-add">+ Create connection</button>
+        </div>
+      </div>
+      <div class="home-list" id="chat-list"></div>
+      <div class="home-empty" id="chat-empty">
+        <div class="home-empty-icon">💬</div>
+        <div class="home-empty-title">No chatrooms yet</div>
+        <div class="home-empty-sub">
+          A room shows a two-person conversation on the board's OLED.
+          Hit <b>Create connection</b> to set one up.
+        </div>
+      </div>
+
       <!-- Macro libraries. Browsed like folders: tiles at the top level, macros
            inside. Each library is a self-contained, versioned document, which is
            the unit that gets exported and shared. -->

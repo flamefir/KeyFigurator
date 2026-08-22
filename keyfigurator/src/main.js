@@ -116,6 +116,20 @@ function browserMock(cmd, args) {
     case "run_binding":  return "exit=Some(0)\n--- stdout ---\n(browser mock)\n--- stderr ---\n";
     case "run_script":   return `exit=Some(0)\n--- stdout ---\n(browser mock ran: ${(args?.script || "").split("\n")[0]})\n--- stderr ---\n`;
     case "simulate_board_host_cmd": return;
+    // One paired demo room, for the same reason MockHid exists: the chat UI
+    // has to be workable without a bot token and a network, the way the editor
+    // is workable without a board. Creating and sending still fail loudly —
+    // those need a real backend, and pretending otherwise would hide it.
+    case "chat_list":   return [{
+      id: "demo", name: "Demo Room", bot_username: "orbit_demo_bot",
+      peer_name: "Sam", paired: true, token_tail: "demo",
+      pair_code: null, pair_link: null, pair_expires: 0, led_ping: false,
+    }];
+    case "chat_create": throw new Error("Chatrooms need the desktop app.");
+    case "chat_delete": return true;
+    case "chat_rename": case "chat_set_led_ping": case "chat_unpair": case "chat_new_invite":
+      throw new Error("Chatrooms need the desktop app.");
+    case "chat_send":   throw new Error("Chatrooms need the desktop app.");
   }
 }
 
@@ -2757,6 +2771,7 @@ async function init() {
     e.target.value = ""; // so re-picking the same file fires change again
     if (file) await importDevicesFromFile(file);
   });
+  initChat();
 
   // ── Log panel ─────────────────────────────────────────────────────────────
   loadLog();
@@ -2896,6 +2911,11 @@ async function init() {
         console.log("board-connection", connected ? "attached" : "detached");
         onConnectionChange(connected);
       });
+      // Chat. The backend keeps no transcript, so a dropped event here is a
+      // lost message — these listeners are the only thing that records one.
+      await listen("chat-message", (e) => onChatMessage(e.payload || {}));
+      await listen("chat-paired",  (e) => onChatPaired(e.payload || {}));
+      await listen("chat-status",  (e) => onChatStatus(e.payload || {}));
     } catch (e) { logError(e, "backendEvents"); }
   }
 
@@ -6250,6 +6270,510 @@ function renameLibrary(libId, name) {
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+// ── Chatrooms ───────────────────────────────────────────────────────────────
+//
+// One room = one Telegram bot this install owns, plus one paired peer on any
+// Telegram client. The backend (`chat.rs`) owns the bot token, the pairing and
+// the poller; it delivers each message once as a `chat-message` event and keeps
+// no transcript.
+//
+// The transcript is OURS, here, in localStorage — the same place layers,
+// screens and device configuration live. That is not an accident of
+// convenience: everything the board is shown is assembled by buildOledConfig()
+// on this side, so putting the messages anywhere else would mean two owners of
+// one list and a second restore path to keep in step with this one.
+
+const CHAT_HISTORY_KEY = "kf-chat-history";
+// Per room. The board shows the newest 8 lines; this is what the app's own
+// scrollback holds, and it is capped because localStorage is not a database.
+const CHAT_HISTORY_MAX = 200;
+
+let chatConnections = [];          // ConnectionView[] from the backend
+let chatHistory     = {};          // { [connectionId]: {from, text, at, mine}[] }
+let chatStatus      = {};          // { [connectionId]: error string | null }
+let chatOpenId      = null;        // room whose panel is open, if any
+
+function loadChatHistory() {
+  try { chatHistory = JSON.parse(localStorage.getItem(CHAT_HISTORY_KEY)) || {}; }
+  catch { chatHistory = {}; }
+}
+
+function saveChatHistory() {
+  try { localStorage.setItem(CHAT_HISTORY_KEY, JSON.stringify(chatHistory)); }
+  catch (e) { logWarn(`Could not save chat history: ${e?.message ?? e}`, "chat"); }
+}
+
+function chatMessages(id) {
+  return chatHistory[id] || [];
+}
+
+function appendChatMessage(id, msg) {
+  const list = chatHistory[id] || (chatHistory[id] = []);
+  list.push(msg);
+  // Trimmed from the front: the newest messages are the ones worth keeping,
+  // and the board only ever shows the tail anyway.
+  if (list.length > CHAT_HISTORY_MAX) list.splice(0, list.length - CHAT_HISTORY_MAX);
+  saveChatHistory();
+}
+
+function chatConnection(id) {
+  return chatConnections.find(c => c.id === id) || null;
+}
+
+// Chat reaches the board inside the OLED config, which is only assembled once a
+// device is open in the editor — buildOledConfig() reads the active device's
+// screens and layers.
+//
+// So this is guarded rather than calling scheduleLiveSync() directly. Without
+// the guard, a message arriving while the home page is up would push an OLED
+// config built from whatever globals the last device left behind, AND autosave
+// it under an unscoped key. Rooms keep receiving with no board and no editor
+// open; the board simply catches up on the next push.
+function syncChatToBoard() {
+  if (!document.body.classList.contains("editor")) return;
+  scheduleLiveSync("oled");
+}
+
+async function refreshChatConnections() {
+  try {
+    chatConnections = await invoke("chat_list") || [];
+  } catch (e) {
+    chatConnections = [];
+    logError(e?.message ?? e, "chat");
+  }
+  renderChatList();
+}
+
+// ── The list on the home page ───────────────────────────────────────────────
+
+function chatRelativeTime(unixSecs) {
+  if (!unixSecs) return "";
+  const mins = Math.floor((Date.now() / 1000 - unixSecs) / 60);
+  if (mins < 1)    return "just now";
+  if (mins < 60)   return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24)  return `${hours}h ago`;
+  return `${Math.floor(hours / 24)}d ago`;
+}
+
+function renderChatList() {
+  const list  = document.getElementById("chat-list");
+  const empty = document.getElementById("chat-empty");
+  if (!list || !empty) return;
+
+  empty.style.display = chatConnections.length ? "none" : "";
+  list.innerHTML = "";
+
+  for (const c of chatConnections) {
+    const msgs = chatMessages(c.id);
+    const last = msgs[msgs.length - 1];
+    const err  = chatStatus[c.id];
+
+    const card = document.createElement("div");
+    card.className = "device-card chat-card" + (c.paired ? "" : " unknown");
+    card.title = c.paired ? "Open this room" : "Waiting for someone to join";
+
+    // Three states, three different things worth saying. A room waiting to be
+    // joined shows the invite, because that is the only action left on it.
+    const detail = err
+      ? `<div class="device-warn">${escapeHtml(err)}</div>`
+      : c.paired
+        ? (last
+            ? `<div class="chat-preview"><b>${escapeHtml(last.mine ? "You" : last.from)}:</b> ${escapeHtml(last.text)}</div>`
+            : `<div class="chat-preview dim">No messages yet</div>`)
+        : `<div class="chat-invite">
+             <span class="chat-code">${escapeHtml(formatPairCode(c.pair_code || ""))}</span>
+             <button class="chat-copy" data-copy="code">Copy code</button>
+             <button class="chat-copy" data-copy="link">Copy link</button>
+           </div>`;
+
+    card.innerHTML = `
+      <div class="device-dot${c.paired && !err ? " ok" : ""}"></div>
+      <div>
+        <div class="device-name">${escapeHtml(c.name)}</div>
+        <div class="device-meta">
+          <span>Bot <b>@${escapeHtml(c.bot_username)}</b></span>
+          <span>Token <b>…${escapeHtml(c.token_tail)}</b></span>
+          ${c.paired ? `<span>With <b>${escapeHtml(c.peer_name)}</b></span>` : `<span>Not joined yet</span>`}
+          ${last ? `<span>${escapeHtml(chatRelativeTime(last.at))}</span>` : ""}
+        </div>
+        ${detail}
+      </div>
+      <div class="device-actions">
+        <label class="chat-ping" title="Flash the board blue when a message arrives">
+          <input type="checkbox" class="chat-ping-inp" ${c.led_ping ? "checked" : ""} />
+          <span>LED ping</span>
+        </label>
+        ${c.paired ? `<button class="device-reset" title="Forget this person and issue a new code">Unpair</button>` : ""}
+        <button class="device-del" title="Delete this room">✕</button>
+      </div>`;
+
+    card.addEventListener("click", () => { if (c.paired) openChatRoom(c.id); });
+
+    // stopPropagation on every control, or each one also opens the room.
+    card.querySelectorAll(".chat-copy").forEach(btn => {
+      btn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        const link = pairLink(c);
+        const text = btn.dataset.copy === "link" ? link : formatPairCode(c.pair_code || "");
+        try {
+          await navigator.clipboard.writeText(text);
+          btn.textContent = "Copied";
+          setTimeout(() => renderChatList(), 1200);
+        } catch { logWarn("Could not reach the clipboard", "chat"); }
+      });
+    });
+
+    const ping = card.querySelector(".chat-ping-inp");
+    ping.addEventListener("click", (e) => e.stopPropagation());
+    ping.addEventListener("change", async (e) => {
+      try {
+        const view = await invoke("chat_set_led_ping", { id: c.id, on: e.target.checked });
+        replaceChatConnection(view);
+        // The board learns about it through the OLED config like everything else.
+        syncChatToBoard();
+      } catch (err) { logError(err?.message ?? err, "chat"); }
+    });
+
+    card.querySelector(".device-del").addEventListener("click", async (e) => {
+      e.stopPropagation();
+      await deleteChatRoom(c);
+    });
+
+    card.querySelector(".device-reset")?.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      await unpairChatRoom(c);
+    });
+
+    list.appendChild(card);
+  }
+}
+
+function replaceChatConnection(view) {
+  const i = chatConnections.findIndex(c => c.id === view.id);
+  if (i >= 0) chatConnections[i] = view; else chatConnections.push(view);
+  renderChatList();
+  if (chatOpenId === view.id) renderChatRoom();
+}
+
+// `ORBIT7K2M9QX4` is what crosses the wire; `ORBIT-7K2M-9QX4` is what a person
+// reads out. Mirrors format_pair_code() in chat.rs.
+function formatPairCode(code) {
+  const body = code.startsWith("ORBIT") ? code.slice(5) : code;
+  return body.length === 8 ? `ORBIT-${body.slice(0, 4)}-${body.slice(4)}` : code;
+}
+
+function pairLink(c) {
+  return c.pair_link || `https://t.me/${c.bot_username}?start=${c.pair_code || ""}`;
+}
+
+async function deleteChatRoom(c) {
+  const ok = await confirmModal({
+    title: `Delete "${c.name}"?`,
+    body: "This removes the room and its saved conversation from Orbit. The Telegram bot itself "
+        + "is not deleted — you can remove it in BotFather. Any Connection Screen using this room "
+        + "will go blank until you point it at another one.",
+    confirmLabel: "Delete",
+  });
+  if (!ok) return;
+  try {
+    await invoke("chat_delete", { id: c.id });
+    delete chatHistory[c.id];
+    delete chatStatus[c.id];
+    saveChatHistory();
+    if (chatOpenId === c.id) closeChatRoom();
+    await refreshChatConnections();
+    syncChatToBoard();
+  } catch (e) { logError(e?.message ?? e, "chat"); }
+}
+
+async function unpairChatRoom(c) {
+  const ok = await confirmModal({
+    title: `Unpair "${c.name}"?`,
+    body: `${c.peer_name || "The current person"} will no longer reach this room, and a new code `
+        + "is issued so you can invite someone else. The conversation so far is kept.",
+    confirmLabel: "Unpair",
+  });
+  if (!ok) return;
+  try {
+    replaceChatConnection(await invoke("chat_unpair", { id: c.id }));
+  } catch (e) { logError(e?.message ?? e, "chat"); }
+}
+
+// ── Create connection ───────────────────────────────────────────────────────
+
+// Two steps, and the second is the whole point: a room is created with an
+// invitation already outstanding, so "make a room" and "let someone in" are one
+// action rather than two the user has to discover separately.
+function openChatCreate() {
+  if (document.getElementById("chat-create")) return;
+
+  const overlay = document.createElement("div");
+  overlay.id = "chat-create";
+  overlay.className = "oled-picker-overlay";
+  overlay.innerHTML = `
+    <div class="oled-picker-modal chat-modal">
+      <div class="oled-picker-heading">Create connection</div>
+      <div class="chat-steps">
+        <p class="chat-help">
+          A room needs its own Telegram bot. In Telegram, message
+          <b>@BotFather</b>, send <b>/newbot</b>, and paste the token it gives you.
+          Each room needs a different bot: Telegram only lets one program collect
+          a given bot's messages.
+        </p>
+        <label class="chat-field">
+          <span>Room name</span>
+          <input type="text" id="chat-new-name" maxlength="14" placeholder="e.g. Ana" />
+        </label>
+        <label class="chat-field">
+          <span>Bot token</span>
+          <input type="password" id="chat-new-token" spellcheck="false"
+                 placeholder="123456789:AA…" />
+        </label>
+        <div class="chat-note">
+          The room name is what the board's Connection Screen shows as its title,
+          so it is limited to 14 characters.
+        </div>
+        <div class="macro-editor-err" id="chat-new-err"></div>
+      </div>
+      <div class="oled-picker-actions">
+        <button class="oled-picker-cancel" id="chat-new-cancel">Cancel</button>
+        <button class="oled-picker-add" id="chat-new-go">Create</button>
+      </div>
+    </div>`;
+
+  const close = () => { overlay._removeKey?.(); overlay.remove(); };
+  overlay.querySelector("#chat-new-cancel").addEventListener("click", close);
+  overlay.addEventListener("click", e => { if (e.target === overlay) close(); });
+  const onKey = e => { if (e.key === "Escape") close(); };
+  document.addEventListener("keydown", onKey);
+  overlay._removeKey = () => document.removeEventListener("keydown", onKey);
+
+  const go  = overlay.querySelector("#chat-new-go");
+  const err = overlay.querySelector("#chat-new-err");
+
+  go.addEventListener("click", async () => {
+    const name  = overlay.querySelector("#chat-new-name").value.trim();
+    const token = overlay.querySelector("#chat-new-token").value.trim();
+    if (!token) { err.textContent = "Paste the token BotFather gave you."; return; }
+
+    go.disabled = true;
+    go.textContent = "Checking…";
+    err.textContent = "";
+    try {
+      // The backend calls getMe, so a bad token fails here with Telegram's own
+      // verdict rather than becoming a room that silently never receives.
+      const view = await invoke("chat_create", { name, botToken: token });
+      chatConnections.push(view);
+      close();
+      renderChatList();
+      showChatInvite(view);
+    } catch (e) {
+      err.textContent = e?.message ?? String(e);
+      go.disabled = false;
+      go.textContent = "Create";
+    }
+  });
+
+  document.body.appendChild(overlay);
+  overlay.querySelector("#chat-new-name").focus();
+}
+
+// The invitation, shown once on creation and reachable afterwards from the
+// card. Stays open while the peer joins: `chat-paired` swaps it for a live room.
+function showChatInvite(view) {
+  if (document.getElementById("chat-invite-modal")) return;
+
+  const overlay = document.createElement("div");
+  overlay.id = "chat-invite-modal";
+  overlay.className = "oled-picker-overlay";
+  overlay.dataset.connectionId = view.id;
+  overlay.innerHTML = `
+    <div class="oled-picker-modal chat-modal">
+      <div class="oled-picker-heading">Invite someone to "${escapeHtml(view.name)}"</div>
+      <div class="chat-steps">
+        <p class="chat-help">
+          Send this to the person you want in the room. Opening the link starts a
+          chat with your bot and joins them automatically.
+        </p>
+        <div class="chat-code-big" id="chat-invite-code">${escapeHtml(formatPairCode(view.pair_code || ""))}</div>
+        <div class="chat-invite-actions">
+          <button class="chat-copy" data-copy="link">Copy link</button>
+          <button class="chat-copy" data-copy="code">Copy code</button>
+          <button class="chat-copy ghost" data-copy="new">New code</button>
+        </div>
+        <div class="chat-note">
+          The code works once and expires after 24 hours. Anyone who has not used
+          it cannot reach the room, and a stranger who finds the bot is ignored.
+        </div>
+        <div class="chat-waiting" id="chat-invite-wait">
+          <span class="chat-spinner"></span> Waiting for them to join…
+        </div>
+      </div>
+      <div class="oled-picker-actions">
+        <button class="oled-picker-cancel" id="chat-invite-close">Close</button>
+      </div>
+    </div>`;
+
+  const close = () => { overlay._removeKey?.(); overlay.remove(); };
+  overlay.querySelector("#chat-invite-close").addEventListener("click", close);
+  overlay.addEventListener("click", e => { if (e.target === overlay) close(); });
+  const onKey = e => { if (e.key === "Escape") close(); };
+  document.addEventListener("keydown", onKey);
+  overlay._removeKey = () => document.removeEventListener("keydown", onKey);
+
+  overlay.querySelectorAll(".chat-copy").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      const c = chatConnection(overlay.dataset.connectionId);
+      if (!c) return;
+      if (btn.dataset.copy === "new") {
+        try {
+          const fresh = await invoke("chat_new_invite", { id: c.id });
+          replaceChatConnection(fresh);
+          overlay.querySelector("#chat-invite-code").textContent = formatPairCode(fresh.pair_code || "");
+        } catch (e) { logError(e?.message ?? e, "chat"); }
+        return;
+      }
+      const text = btn.dataset.copy === "link" ? pairLink(c) : formatPairCode(c.pair_code || "");
+      try {
+        await navigator.clipboard.writeText(text);
+        const was = btn.textContent;
+        btn.textContent = "Copied";
+        setTimeout(() => { btn.textContent = was; }, 1200);
+      } catch { logWarn("Could not reach the clipboard", "chat"); }
+    });
+  });
+
+  document.body.appendChild(overlay);
+}
+
+// ── The room itself ─────────────────────────────────────────────────────────
+
+function openChatRoom(id) {
+  chatOpenId = id;
+  if (!document.getElementById("chat-room")) {
+    const overlay = document.createElement("div");
+    overlay.id = "chat-room";
+    overlay.className = "oled-picker-overlay";
+    overlay.innerHTML = `
+      <div class="oled-picker-modal chat-modal chat-room-modal">
+        <div class="macro-editor-head">
+          <span class="macro-test-title" id="chat-room-title"></span>
+          <button class="macro-close" id="chat-room-close" title="Close">✕</button>
+        </div>
+        <div class="chat-log" id="chat-room-log"></div>
+        <div class="chat-compose">
+          <input type="text" id="chat-room-input" maxlength="1000"
+                 placeholder="Message…" spellcheck="false" />
+          <button class="oled-picker-add" id="chat-room-send">Send</button>
+        </div>
+        <div class="macro-editor-err" id="chat-room-err"></div>
+      </div>`;
+    overlay.querySelector("#chat-room-close").addEventListener("click", closeChatRoom);
+    overlay.addEventListener("click", e => { if (e.target === overlay) closeChatRoom(); });
+    const onKey = e => { if (e.key === "Escape") closeChatRoom(); };
+    document.addEventListener("keydown", onKey);
+    overlay._removeKey = () => document.removeEventListener("keydown", onKey);
+
+    const input = overlay.querySelector("#chat-room-input");
+    const send  = overlay.querySelector("#chat-room-send");
+    send.addEventListener("click", () => sendChatMessage());
+    input.addEventListener("keydown", e => {
+      if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendChatMessage(); }
+    });
+    document.body.appendChild(overlay);
+  }
+  renderChatRoom();
+  document.getElementById("chat-room-input")?.focus();
+}
+
+function closeChatRoom() {
+  const el = document.getElementById("chat-room");
+  if (el) { el._removeKey?.(); el.remove(); }
+  chatOpenId = null;
+}
+
+function renderChatRoom() {
+  const log = document.getElementById("chat-room-log");
+  if (!log || !chatOpenId) return;
+  const c = chatConnection(chatOpenId);
+  const title = document.getElementById("chat-room-title");
+  if (title) title.textContent = c ? `${c.name} · ${c.peer_name || "not joined"}` : "";
+
+  const msgs = chatMessages(chatOpenId);
+  log.innerHTML = msgs.length
+    ? msgs.map(m => `
+        <div class="chat-line ${m.mine ? "mine" : "theirs"}">
+          <div class="chat-line-who">${escapeHtml(m.mine ? "You" : m.from)}</div>
+          <div class="chat-line-text">${escapeHtml(m.text)}</div>
+        </div>`).join("")
+    : `<div class="chat-log-empty">Nothing here yet. Say something.</div>`;
+  // Newest at the bottom, which is where a conversation is read from.
+  log.scrollTop = log.scrollHeight;
+}
+
+async function sendChatMessage() {
+  const input = document.getElementById("chat-room-input");
+  const err   = document.getElementById("chat-room-err");
+  if (!input || !chatOpenId) return;
+  const text = input.value.trim();
+  if (!text) return;
+
+  const id = chatOpenId;
+  input.value = "";
+  if (err) err.textContent = "";
+  try {
+    await invoke("chat_send", { id, text });
+    // Recorded only after Telegram accepted it. Showing it first would put a
+    // message in the transcript, and on the board, that nobody ever received.
+    appendChatMessage(id, { from: "You", text, at: Math.floor(Date.now() / 1000), mine: true });
+    renderChatRoom();
+    renderChatList();
+    syncChatToBoard();
+  } catch (e) {
+    if (err) err.textContent = e?.message ?? String(e);
+    input.value = text; // give it back rather than losing what they typed
+  }
+}
+
+// ── Backend events ──────────────────────────────────────────────────────────
+
+function onChatMessage(p) {
+  appendChatMessage(p.connectionId, {
+    from: p.from || "Them",
+    text: p.text || "",
+    at: p.at || Math.floor(Date.now() / 1000),
+    mine: false,
+  });
+  renderChatList();
+  if (chatOpenId === p.connectionId) renderChatRoom();
+  syncChatToBoard();
+}
+
+async function onChatPaired(p) {
+  logInfo(`${p.peerName} joined a chatroom`, "chat");
+  await refreshChatConnections();
+  // The invite modal has done its job the moment somebody walks through it.
+  const invite = document.getElementById("chat-invite-modal");
+  if (invite && invite.dataset.connectionId === p.connectionId) {
+    invite._removeKey?.();
+    invite.remove();
+  }
+  syncChatToBoard();
+}
+
+function onChatStatus(p) {
+  chatStatus[p.connectionId] = p.ok ? null : (p.error || "Chat connection failed");
+  if (!p.ok) logWarn(`Chatroom: ${p.error}`, "chat");
+  renderChatList();
+}
+
+function initChat() {
+  loadChatHistory();
+  document.getElementById("chat-add")?.addEventListener("click", openChatCreate);
+  refreshChatConnections();
 }
 
 // ── Editor ──────────────────────────────────────────────────────────────────
