@@ -352,9 +352,9 @@ touching the board.**
 | 3 | `chat.rs` — connections, pairing, poller thread, Tauri commands + events | app | ✅ 18 tests |
 | 4 | Home page **Chatrooms** + Create connection flow | app | ✅ 23 browser checks in `keyfigurator/tests/chat-ui.mjs` |
 | 5 | Chat frames: `kf_protocol` + `model` + `hid::push_chats` | app | ✅ 29 tests; `MockHid` round-trips a conversation |
-| 6 | Firmware: `KF_SCREEN_CHAT`, `0x62`/`0x63`, render, mark-read, blue pulse, NVM | firmware | compiles clean; mock-side bytes match the app's |
-| 7 | **Connection Screen**: screen type, cap of 3, connection dropdown, `"chat"` live-sync part, LED-ping toggle | app | a message reaches the panel through the real transport |
-| 8 | Bench gate (human) | hardware | see below |
+| 6 | Firmware: `KF_SCREEN_CHAT`, `0x62`/`0x63`, render, mark-read, blue pulse | firmware | ✅ fw 0.5.1; no NVM field moves (chat is RAM-only) |
+| 7 | **Connection Screen**: screen type, cap of 3, connection dropdown, `"chat"` live-sync part, LED-ping toggle | app | ✅ 24 offline tests in `tests/chat-text.mjs`; preview verified byte-identical to the wire |
+| 8 | Bench gate (human) | hardware | ⏳ recorded as backlog items, see below |
 
 Phase 8 checklist:
 - chat screen renders, `>` marks own lines, badge counts and clears
@@ -363,7 +363,10 @@ Phase 8 checklist:
 - a board on NVM v5 upgrades to v6 by falling to defaults, and the app re-pushes
 - bulk push (3 rooms x 8 lines = 27 frames) does not starve the display task
 
-Versions at ship: firmware **0.5.0** (new screen type + NVM break), app **0.3.0**.
+Versions at ship: firmware **0.5.1**, app **0.3.0**. The firmware moved in two
+steps rather than one — **0.5.0** was the slot space and the NVM break (phase 1),
+**0.5.1** is the commands and the rendering (phase 6). Chat content is RAM-only,
+so phase 6 moved no NVM field and is a patch.
 
 ## 9. Open questions
 

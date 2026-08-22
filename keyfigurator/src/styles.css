@@ -1976,6 +1976,51 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 50%; }
   flex: 1; overflow: hidden;
 }
 
+/* ── OLED Connection (chat) screen ───────────────────────────── */
+/* Left-aligned and monospaced on purpose: the board draws a fixed-width font
+   and the host has already wrapped to its column count, so centring here would
+   put the preview's line breaks somewhere the panel's are not. */
+.oled-chat-screen {
+  display: flex; flex-direction: column; align-items: stretch;
+  padding: 5px; width: 100%; height: 100%; gap: 3px; overflow: hidden;
+}
+.oled-chat-title {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 4px;
+  color: #ffb454; font-family: 'Courier New', monospace; font-size: 11px; font-weight: bold;
+  text-shadow: 0 0 5px rgba(255,180,84,.8);
+  border-bottom: 1px solid rgba(255,180,84,0.2); width: 100%; padding-bottom: 3px;
+  white-space: nowrap; overflow: hidden;
+}
+.oled-chat-title > span:first-child { overflow: hidden; text-overflow: ellipsis; }
+.oled-chat-badge { flex: none; opacity: .65; font-size: 9px; }
+.oled-chat-lines {
+  display: flex; flex-direction: column; justify-content: flex-end;
+  flex: 1; overflow: hidden; gap: 1px;
+}
+.oled-chat-line {
+  color: rgba(255,180,84,0.6); font-family: 'Courier New', monospace;
+  font-size: 8px; line-height: 1.25; letter-spacing: .02em;
+  white-space: pre; overflow: hidden;
+}
+/* Own lines are brighter rather than a different colour: the panel is one
+   colour, and the '>' marker is what actually distinguishes them there. */
+.oled-chat-line.mine { color: rgba(255,180,84,0.95); }
+.oled-chat-line.dim  { color: rgba(255,180,84,0.3); font-style: italic; }
+
+/* ── Connection screen controls in the pill ──────────────────── */
+.oled-chat-select {
+  flex: 1; min-width: 0;
+  background: #14151b; color: #e6e8ef;
+  border: 1px solid rgba(255,255,255,.12); border-radius: 6px;
+  padding: 5px 7px; font-size: 12px; font-family: inherit;
+}
+.oled-chat-select:focus { outline: none; border-color: rgba(255,180,84,.55); }
+.oled-chat-ping {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 12px; font-size: 12px; color: #c8ccd8; cursor: pointer;
+}
+.oled-chat-ping input { accent-color: #4a9eff; cursor: pointer; }
+
 /* ── OLED Date & Time screen ─────────────────────────────────── */
 .oled-datetime-screen {
   display: flex; flex-direction: column; align-items: center; justify-content: center;

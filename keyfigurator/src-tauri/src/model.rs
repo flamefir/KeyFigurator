@@ -333,8 +333,14 @@ fn fold_char(c: char) -> Option<&'static str> {
         'ú' | 'ù' | 'û' => "u",
         'ñ' => "n",
         'ç' => "c",
-        // A tab is whitespace the font has no glyph for.
-        '\t' => " ",
+        // Whitespace the font has no glyph for. A NEWLINE has to land here
+        // too, not in the catch-all: it sorts below ' ' so it was being
+        // DROPPED, and dropping it glues the lines either side of it into
+        // one word - a two-line Telegram message arrived on the panel as
+        // "helloworld". Collapsing to a space is what split_whitespace
+        // below then folds away, so a break costs nothing when it is not
+        // needed and does not destroy a word when it is.
+        '\t' | '\n' | '\r' => " ",
         c if (' '..='~').contains(&c) => return Some(leak_ascii(c)),
         _ => return None,
     })
@@ -688,6 +694,10 @@ mod chat_tests {
     #[test]
     fn accented_names_stay_readable() {
         assert_eq!(fold_to_ascii("Søren"), "Soeren");
+        // A newline separates, it does not vanish: dropping it ran the
+        // words either side together.
+        assert_eq!(fold_to_ascii("hello\nworld"), "hello world");
+        assert_eq!(fold_to_ascii("a\r\nb"), "a b");
         assert_eq!(fold_to_ascii("café"), "cafe");
         assert_eq!(fold_to_ascii("Müller"), "Mueller");
     }

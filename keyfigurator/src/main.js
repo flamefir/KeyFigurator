@@ -1,5 +1,8 @@
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
+// The panel's own text rules. Pure and DOM-free so `node` can test them
+// directly — see tests/chat-text.mjs.
+import { CHAT_LINES, CHAT_LINE_MAX, foldToAscii, wrapChatLines } from "./chat-text.js";
 
 const hasTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
@@ -466,6 +469,22 @@ let oledCustomScreens = [];         // { id, type:"custom", title, imageDataUrl 
 let oledAnimFrame     = null;
 let oledLastTick      = 0;
 
+// The board's custom-screen space, quoting kf_hid.h: KF_MAX_CUSTOM_SCREENS 10
+// (6 content types + the logo + up to KF_MAX_CHAT_SCREENS chat screens) and
+// KF_SCREEN_SLOTS 14 = KF_LAYER_COUNT + that.
+//
+// This was the FOURTH copy of a number that has drifted three times already —
+// kf_protocol's SCREEN_SLOTS said 10 against the firmware's 11, push_oled's
+// event loop said 10, and BoardModel::event_keys said [9][10]. All three were
+// pinned to one constant in the chat-frames commit; this side still had a bare
+// `6` in four places and was ALREADY wrong before chat: six content types plus
+// the permanent logo screen is seven, so the seventh screen's LED profile,
+// event keys, sleep bit and content were all being silently dropped on the way
+// to a board with room for them.
+const MAX_CUSTOM_SCREENS = 10;
+// Each costs a custom screen, a slot, and 161 bytes of board RAM.
+const MAX_CHAT_SCREENS = 3;
+
 // ── Keycode palette ────────────────────────────────────────────────────────
 const KC_CATEGORIES = [
   { label: "Letters", keys: "A B C D E F G H I J K L M N O P Q R S T U V W X Y Z".split(" ").map(k => "KC_" + k) },
@@ -839,6 +858,38 @@ function renderOledScreenContent(screenEl) {
       }
       break;
     }
+    // Deliberately drawn from the same wrapChatLines() the wire uses, at the
+    // same width and line count, so this is the panel rather than an
+    // impression of it. The room name is the screen title and travels through
+    // OLED_SET_TEXT like every other screen's.
+    case "chat": {
+      const conn = screen.connectionId ? chatConnection(screen.connectionId) : null;
+      if (!conn) {
+        screenEl.innerHTML = `<div class="oled-custom-screen">
+          <div class="oled-custom-screen-title">CONNECTION</div>
+          <div class="oled-custom-screen-body">${
+            chatConnections.length ? "No room selected" : "No chatrooms yet"}</div>
+        </div>`;
+        break;
+      }
+      const name   = foldToAscii(conn.name).toUpperCase().slice(0, oledTitleMax());
+      const unread = chatUnreadCount(conn.id);
+      const lines  = wrapChatLines(chatMessages(conn.id));
+      screenEl.innerHTML = `<div class="oled-chat-screen">
+        <div class="oled-chat-title">
+          <span>${escapeHtml(name || "ROOM")}</span>
+          ${unread ? `<span class="oled-chat-badge">(${unread})</span>` : ""}
+        </div>
+        <div class="oled-chat-lines">${
+          lines.length
+            ? lines.map(l => `<div class="oled-chat-line${l.mine ? " mine" : ""}">${
+                escapeHtml((l.mine ? ">" : "") + l.text)}</div>`).join("")
+            : `<div class="oled-chat-line dim">${
+                conn.paired ? "No messages yet" : "Waiting to be joined"}</div>`
+        }</div>
+      </div>`;
+      break;
+    }
   }
 }
 
@@ -928,6 +979,16 @@ function triggerOledEvent(eventName) {
     case "cdDown":
       if (!oledCdRunning && !oledCdDone) adjustCdField(-1);
       break;
+    // The board clears its own badge and tells the host; this is the app-side
+    // half of the same action, so the two agree without a round trip.
+    case "chatMarkRead": {
+      const screen = getOledScreens()[oledScreenIdx];
+      const id = screen?.type === "chat" ? screen.connectionId : null;
+      if (id && clearChatUnread(id)) {
+        updateOledDisplay(); renderChatList(); syncChatToBoard();
+      }
+      break;
+    }
     case "pomoStartStop":
       // A fixed cycle count gives the session an end, so push needs a way out
       // of it that is not "reload the app".
@@ -984,6 +1045,11 @@ function onEncoderPress() {
       oledPomoRunning = true;
     }
     updateOledDisplay(); return;
+  }
+
+  if (screen?.type === "chat") {
+    triggerOledEvent("chatMarkRead");
+    return;
   }
 
   if (screen?.type === "timer") {
@@ -1108,6 +1174,7 @@ const OLED_EVENT_LABELS = {
   cdUp:           "Value +",
   cdDown:         "Value −",
   pomoStartStop:  "Start / Pause",
+  chatMarkRead:   "Mark Read",
 };
 
 // One glyph per screen event, drawn on the key it is bound to.
@@ -1180,6 +1247,10 @@ const EVENT_WIRE_ID = {
   cdUp:           6,
   cdDown:         7,
   pomoStartStop:  8,
+  // KF_EVENT_CHAT_MARK_READ. Hardware revision 1.0.0 has no encoder push
+  // soldered, which is exactly why a chat screen's mark-read has to be
+  // reachable from a key.
+  chatMarkRead:   9,
 };
 
 // What Present Keys says about a key, in priority order: the ICON if the key
@@ -1227,7 +1298,7 @@ function buildEventKeys() {
   // are slots 0..3, custom screens follow at 4..9.
   const slotOf = {};
   getSavedLayers().slice(0, 4).forEach((l, i) => { slotOf[l.id] = i; });
-  oledCustomScreens.slice(0, 6).forEach((sc, i) => { slotOf[sc.id] = 4 + i; });
+  oledCustomScreens.slice(0, MAX_CUSTOM_SCREENS).forEach((sc, i) => { slotOf[sc.id] = 4 + i; });
 
   const out = [];
   for (const [screenKey, events] of Object.entries(oledEventKeys)) {
@@ -1285,7 +1356,7 @@ function buildScreenLeds() {
     });
   };
   getSavedLayers().slice(0, 4).forEach((l, i) => add(i, l.id, l));
-  oledCustomScreens.slice(0, 6).forEach((s, i) => add(4 + i, s.id, s.profile));
+  oledCustomScreens.slice(0, MAX_CUSTOM_SCREENS).forEach((s, i) => add(4 + i, s.id, s.profile));
   return out;
 }
 
@@ -1294,7 +1365,7 @@ function buildSleepMask() {
   getSavedLayers().slice(0, 4).forEach((l, i) => {
     if (screenSleepEnabled(l.id)) mask |= 1 << i;
   });
-  oledCustomScreens.slice(0, 6).forEach((s, i) => {
+  oledCustomScreens.slice(0, MAX_CUSTOM_SCREENS).forEach((s, i) => {
     if (screenSleepEnabled(s.id)) mask |= 1 << (4 + i);
   });
   return mask;
@@ -1452,6 +1523,7 @@ function screenDisplayName(screen) {
     case "countdown": return "Countdown";
     case "datetime":  return "Date & Time";
     case "pomodoro":  return "Pomodoro";
+    case "chat":      return "Connection";
     case "gif":       return "GIF / Image";
     case "custom":    return screen.title || "Custom Screen";
     default:          return "";
@@ -1534,6 +1606,7 @@ function renderOledPillNav() {
     case "countdown": name = "Countdown";   break;
     case "datetime":  name = "Date & Time"; break;
     case "pomodoro":  name = "Pomodoro";    break;
+    case "chat":      name = "Connection";  break;
     case "gif":       name = "GIF / Image"; break;
     case "custom":    name = screen.title || "Custom Screen"; break;
   }
@@ -1734,6 +1807,62 @@ function renderOledPillContent() {
         </div>
         ${eventRowHTML("presentKeys", "Present Keys")}
         ${sleepRowHTML()}`;
+      wireEventRows(container);
+      wireSleepRow(container);
+      break;
+    }
+    case "chat": {
+      const conn = screen.connectionId ? chatConnection(screen.connectionId) : null;
+      // The room list, plus whatever this screen points at even if that room
+      // has since been deleted. Dropping the dangling id from the options
+      // would make the select silently show the wrong room as selected.
+      const opts = chatConnections.map(c =>
+        `<option value="${escapeHtml(c.id)}"${c.id === screen.connectionId ? " selected" : ""}>${
+          escapeHtml(c.name)}${c.paired ? "" : " (not joined)"}</option>`).join("");
+      const dangling = screen.connectionId && !conn
+        ? `<option value="${escapeHtml(screen.connectionId)}" selected>Deleted room</option>` : "";
+
+      container.innerHTML = `
+        <div class="oled-pill-section">
+          <span class="pill-label">ROOM</span>
+          <select class="oled-chat-select" id="oled-chat-conn">
+            <option value=""${screen.connectionId ? "" : " selected"}>— none —</option>
+            ${opts}${dangling}
+          </select>
+        </div>
+        <div class="oled-pill-hint">
+          ${chatConnections.length
+            ? `The room this screen shows. Its name is the screen title, and the newest ${CHAT_LINES} lines are drawn below it. Messages are sent from the Chatrooms list on the home page.`
+            : `No chatrooms yet. Create one under <b>Chatrooms</b> on the home page, then pick it here.`}
+        </div>
+        <label class="oled-chat-ping">
+          <input type="checkbox" id="oled-chat-ping" ${screen.ledPing ? "checked" : ""} />
+          <span>Flash the LEDs on a new message</span>
+        </label>
+        <div class="oled-pill-hint">
+          Two blue pulses. Blue rather than red on purpose: red is the countdown
+          alarm and the pomodoro phase change, and a chat ping that looks like an
+          alarm is a worse alert than none.
+        </div>
+        <div class="oled-pill-section" style="padding-bottom:6px">
+          <span class="pill-label">SCREEN EVENTS</span>
+        </div>
+        ${eventRowHTML("chatMarkRead", "Mark Read")}
+        ${eventRowHTML("presentKeys", "Present Keys")}
+        ${sleepRowHTML()}`;
+
+      document.getElementById("oled-chat-conn")?.addEventListener("change", (e) => {
+        screen.connectionId = e.target.value || null;
+        saveOledCustomScreens();
+        updateOledDisplay();
+        renderLayerBar();
+        scheduleLiveSync("oled");
+      });
+      document.getElementById("oled-chat-ping")?.addEventListener("change", (e) => {
+        screen.ledPing = e.target.checked;
+        saveOledCustomScreens();
+        scheduleLiveSync("oled");
+      });
       wireEventRows(container);
       wireSleepRow(container);
       break;
@@ -4044,9 +4173,22 @@ function openScreenPicker(copyFrom = null) {
         <div style="font-size:8px;font-weight:bold;border-bottom:1px solid rgba(255,180,84,.25);padding-bottom:2px;margin-bottom:3px">TITLE</div>
         <div style="font-size:6px;opacity:.5">body text here</div></div>`,
     },
+    // The first type the board allows more than one of, which is why it carries
+    // its own cap instead of riding the one-of-each rule below.
+    {
+      type: "chat", label: "Connection", desc: `A chatroom on the panel — up to ${MAX_CHAT_SCREENS}`,
+      preview: `<div style="color:#ffb454;font-family:monospace;text-align:left;padding:2px;width:100%">
+        <div style="font-size:7px;font-weight:bold;border-bottom:1px solid rgba(255,180,84,.25);padding-bottom:2px;margin-bottom:2px">MALTE <span style="opacity:.6">(2)</span></div>
+        <div style="font-size:6px;opacity:.5">on my way</div>
+        <div style="font-size:6px;opacity:.8">&gt;see you there</div></div>`,
+    },
   ];
 
-  const available = TYPES.filter(t => !existing.has(t.type));
+  // Chat is exempt from one-of-each and capped on its own count. Offered even
+  // with no connections yet — the card explains itself and the dropdown says
+  // what to do next, which is better than a type that silently does not exist.
+  const chatFull = chatScreenCount() >= MAX_CHAT_SCREENS;
+  const available = TYPES.filter(t => t.type === "chat" ? !chatFull : !existing.has(t.type));
   if (!available.length) return;
 
   const overlay = document.createElement("div");
@@ -4119,6 +4261,15 @@ function openScreenPicker(copyFrom = null) {
       const s = { id: `${Date.now()}-${i++}`, type };
       if (type === "custom") { s.title = ""; s.body = ""; s.imageDataUrl = null; }
       if (type === "gif")    { s.imageDataUrl = null; }
+      if (type === "chat") {
+        // Auto-linked to the first room nothing else points at, so adding a
+        // screen with one room set up is one click rather than two. The
+        // dropdown is still there to change it.
+        s.connectionId = firstUnusedConnectionId();
+        // Off by default. A board that flashes on every message is a choice,
+        // not something to discover after the fact.
+        s.ledPing = false;
+      }
       // Keys are not copied onto a custom screen: the board has four hardware
       // layers and a custom screen is not one of them, so it types whatever the
       // active layer types. LEDs, animation and underglow ARE per-screen on the
@@ -4488,12 +4639,28 @@ function buildOledConfig() {
       name: l.name || "",
       show_title: l.showTitle !== false,
     })),
-    screens: oledCustomScreens.slice(0, 6).map(s => ({
+    screens: oledCustomScreens.slice(0, MAX_CUSTOM_SCREENS).map(s => ({
       // "gif" is the app's name for it; the wire/firmware call it an IMAGE
       // screen (KF_SCREEN_IMAGE).
       kind: s.type === "gif" ? "image" : (s.type || "custom"),
-      title: s.title || "",
+      // A Connection Screen's title is the room's name. There is no second
+      // command for it — it rides OLED_SET_TEXT field 0 like every other
+      // screen's title, which is why the wire needs no chat-name frame.
+      title: s.type === "chat" ? chatScreenTitle(s) : (s.title || ""),
       body: s.body || "",
+    })),
+    // The conversations themselves, addressed by the same nav-index slot space
+    // as the event keys, sleep mask and screen LEDs: layers 0..3, customs 4+.
+    // Capped here as well as on the wire so the cap is visible in one place
+    // that is not a silent `take()`.
+    chats: chatScreens().slice(0, MAX_CHAT_SCREENS).map(({ screen, slot, conn }) => ({
+      slot,
+      // Sent untrimmed and unwrapped: model.rs owns the fold and the wrap, and
+      // doing it twice risks the two disagreeing about what the panel shows.
+      // The tail is what gets sent, so a long scrollback costs nothing.
+      messages: (conn ? chatMessages(conn.id) : []).map(m => ({ mine: !!m.mine, text: m.text || "" })),
+      unread: conn ? chatUnreadCount(conn.id) : 0,
+      led_ping: !!screen.ledPing,
     })),
     countdown: [oledCdH, oledCdM, oledCdS],
     // Bitmap over the board's nav-index space: bits 0..3 the four hardware
@@ -6322,6 +6489,72 @@ function chatConnection(id) {
   return chatConnections.find(c => c.id === id) || null;
 }
 
+// ── What a Connection Screen shows ──────────────────────────────────────────
+// Pure functions, deliberately: the doc's test plan wants wrapChatLines and the
+// slot mapping liftable into the Playwright harness unchanged once that lands.
+
+// Unread is per ROOM, not per screen: two screens pointing at one connection
+// are two views of the same conversation, and reading it on either has read it.
+const CHAT_UNREAD_KEY = "kf-chat-unread";
+let chatUnread = {};   // { [connectionId]: count }
+
+function loadChatUnread() {
+  try { chatUnread = JSON.parse(localStorage.getItem(CHAT_UNREAD_KEY)) || {}; }
+  catch { chatUnread = {}; }
+}
+
+function saveChatUnread() {
+  try { localStorage.setItem(CHAT_UNREAD_KEY, JSON.stringify(chatUnread)); }
+  catch (e) { logWarn(`Could not save unread counts: ${e?.message ?? e}`, "chat"); }
+}
+
+function chatUnreadCount(id) {
+  return chatUnread[id] || 0;
+}
+
+function bumpChatUnread(id) {
+  chatUnread[id] = Math.min(255, chatUnreadCount(id) + 1);   // the wire field is a u8
+  saveChatUnread();
+}
+
+function clearChatUnread(id) {
+  if (!chatUnread[id]) return false;
+  delete chatUnread[id];
+  saveChatUnread();
+  return true;
+}
+
+// Every Connection Screen, with the room it points at resolved. A screen whose
+// connection has been deleted keeps its slot and renders as unlinked rather
+// than disappearing — dropping it silently would renumber every screen after
+// it, which moves LED profiles and event keys onto the wrong screens.
+function chatScreens() {
+  return oledCustomScreens
+    .slice(0, MAX_CUSTOM_SCREENS)
+    .map((s, i) => ({ screen: s, slot: 4 + i, conn: s.connectionId ? chatConnection(s.connectionId) : null }))
+    .filter(e => e.screen.type === "chat");
+}
+
+function chatScreenCount() {
+  return oledCustomScreens.filter(s => s.type === "chat").length;
+}
+
+// Two screens on one room is allowed — it is only a second view — but it is
+// almost never what someone adding a screen meant, so a new one starts on a
+// room nothing else is showing. Null when there is nothing left to pick.
+// What the panel draws at the top of a Connection Screen. A screen with no
+// room still gets a title, because the alternative is a blank header that reads
+// as a broken screen rather than an unfinished one.
+function chatScreenTitle(screen) {
+  const conn = screen.connectionId ? chatConnection(screen.connectionId) : null;
+  return conn ? conn.name : "Connection";
+}
+
+function firstUnusedConnectionId() {
+  const taken = new Set(oledCustomScreens.filter(s => s.type === "chat").map(s => s.connectionId));
+  return chatConnections.find(c => !taken.has(c.id))?.id ?? chatConnections[0]?.id ?? null;
+}
+
 // Chat reaches the board inside the OLED config, which is only assembled once a
 // device is open in the editor — buildOledConfig() reads the active device's
 // screens and layers.
@@ -6344,6 +6577,11 @@ async function refreshChatConnections() {
     logError(e?.message ?? e, "chat");
   }
   renderChatList();
+  // A Connection Screen renders its room's NAME and messages, so the editor is
+  // stale the moment the room list changes underneath it — a room created,
+  // renamed or deleted while a board is open. Guarded the same way
+  // syncChatToBoard() is: outside the editor there is no OLED to update.
+  if (document.body.classList.contains("editor")) updateOledDisplay();
 }
 
 // ── The list on the home page ───────────────────────────────────────────────
@@ -6653,6 +6891,10 @@ function showChatInvite(view) {
 
 function openChatRoom(id) {
   chatOpenId = id;
+  // Opening the room reads it, so the badge clears on the panel too. Pushed
+  // rather than left for the next edit: the count is on the board right now,
+  // and the board is what the user is looking away from to read this.
+  if (clearChatUnread(id)) { updateOledDisplay(); syncChatToBoard(); }
   if (!document.getElementById("chat-room")) {
     const overlay = document.createElement("div");
     overlay.id = "chat-room";
@@ -6747,6 +6989,10 @@ function onChatMessage(p) {
     at: p.at || Math.floor(Date.now() / 1000),
     mine: false,
   });
+  // Reading it in the app is reading it. Counting a message as unread while
+  // it is on screen would put a badge on the panel for something the user is
+  // looking at.
+  if (chatOpenId !== p.connectionId) bumpChatUnread(p.connectionId);
   renderChatList();
   if (chatOpenId === p.connectionId) renderChatRoom();
   syncChatToBoard();
@@ -6772,6 +7018,7 @@ function onChatStatus(p) {
 
 function initChat() {
   loadChatHistory();
+  loadChatUnread();
   document.getElementById("chat-add")?.addEventListener("click", openChatCreate);
   refreshChatConnections();
 }
