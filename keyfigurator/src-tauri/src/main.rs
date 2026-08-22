@@ -18,6 +18,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod chat;
 mod hid;
 mod kf_protocol;
 #[cfg(target_os = "windows")]
@@ -28,6 +29,7 @@ mod model;
 mod products;
 mod qgf;
 mod runner;
+mod telegram;
 
 use hid::{BoardLink, HidTransport, PingInfo, RealHid};
 use model::{AnimState, HostBinding, KeyMap, LedState, OledConfig, Palette, UnderglowAnim};
@@ -308,6 +310,100 @@ fn eeprom_commit(state: State<AppState>) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Chat connections
+//
+// Managed separately from `AppState` because the service needs Tauri's config
+// directory, which only exists once `setup` runs. Every command here returns a
+// `ConnectionView`, never a `Connection`: the bot token has no field to travel
+// in, so no command can leak it by omission.
+// ---------------------------------------------------------------------------
+
+struct ChatState(Arc<chat::ChatService>);
+
+#[tauri::command]
+fn chat_list(chat: State<ChatState>) -> Vec<chat::ConnectionView> {
+    chat.0.store.lock().unwrap().views()
+}
+
+/// Create a room from a BotFather token.
+///
+/// Calls `getMe` first, so a mistyped token fails here — with Telegram's own
+/// verdict — rather than becoming a room that silently never receives anything.
+/// That call is also where the bot's username comes from, and without it there
+/// is no pairing deep link to hand out.
+#[tauri::command(async)]
+fn chat_create(
+    chat: State<ChatState>,
+    name: String,
+    bot_token: String,
+) -> Result<chat::ConnectionView, String> {
+    let bot_token = bot_token.trim().to_string();
+    let identity = telegram::TelegramApi::new(bot_token.clone())
+        .get_me()
+        .map_err(|e| e.to_string())?;
+
+    let name = match name.trim() {
+        "" => identity.first_name.clone(),
+        n => n.to_string(),
+    };
+
+    let conn = chat::Connection {
+        id: chat::new_id(),
+        name,
+        bot_token,
+        bot_username: identity.username,
+        peer_chat_id: None,
+        peer_name: String::new(),
+        // Created with an invitation already outstanding: a room nobody can
+        // join is not a step anyone wants to take separately.
+        pair_code: Some(chat::new_pair_code()),
+        pair_expires: chat::now_secs() + chat::PAIR_CODE_TTL_SECS,
+        led_ping: false,
+        offset: 0,
+    };
+    let id = conn.id.clone();
+    let view = chat.0.store.lock().unwrap().add(conn)?;
+    chat.0.clone().start_poller(&id);
+    Ok(view)
+}
+
+#[tauri::command]
+fn chat_delete(chat: State<ChatState>, id: String) -> bool {
+    // Stopped before removal, so the poller cannot re-save the record it is
+    // holding an offset for after the store has dropped it.
+    chat.0.stop_poller(&id);
+    chat.0.store.lock().unwrap().remove(&id)
+}
+
+#[tauri::command]
+fn chat_rename(chat: State<ChatState>, id: String, name: String) -> Result<chat::ConnectionView, String> {
+    chat.0.store.lock().unwrap().rename(&id, &name)
+}
+
+#[tauri::command]
+fn chat_set_led_ping(chat: State<ChatState>, id: String, on: bool) -> Result<chat::ConnectionView, String> {
+    chat.0.store.lock().unwrap().set_led_ping(&id, on)
+}
+
+/// Issue a fresh invitation, replacing any outstanding one.
+#[tauri::command]
+fn chat_new_invite(chat: State<ChatState>, id: String) -> Result<chat::ConnectionView, String> {
+    chat.0.store.lock().unwrap().new_invite(&id)
+}
+
+/// Forget the peer and issue a new code, so a room can be handed to someone
+/// else without deleting it and re-registering its bot.
+#[tauri::command]
+fn chat_unpair(chat: State<ChatState>, id: String) -> Result<chat::ConnectionView, String> {
+    chat.0.store.lock().unwrap().unpair(&id)
+}
+
+#[tauri::command(async)]
+fn chat_send(chat: State<ChatState>, id: String, text: String) -> Result<(), String> {
+    chat.0.send(&id, &text)
+}
+
 #[tauri::command]
 fn get_bindings(state: State<AppState>) -> Vec<HostBinding> {
     state.bindings.lock().unwrap().clone()
@@ -506,6 +602,54 @@ fn main() {
                     let _ = handle.emit("host-cmd", payload);
                 }
             });
+
+            // Chat connections. The service needs a config directory, which is
+            // why it is built here rather than alongside the transport.
+            //
+            // The frontend owns the transcript (localStorage, like layers and
+            // devices); the backend delivers each message once and forgets it.
+            // So these events are the whole interface, and a dropped one is a
+            // lost message — hence a plain forwarding thread with no filtering.
+            let (chat_tx, chat_rx) = channel::<chat::ChatEvent>();
+            let chat_handle = app.handle().clone();
+            std::thread::spawn(move || {
+                while let Ok(ev) = chat_rx.recv() {
+                    let (name, payload) = match ev {
+                        chat::ChatEvent::Message { connection_id, from, text, at } => (
+                            "chat-message",
+                            serde_json::json!({
+                                "connectionId": connection_id,
+                                "from": from, "text": text, "at": at,
+                            }),
+                        ),
+                        chat::ChatEvent::Paired { connection_id, peer_name } => (
+                            "chat-paired",
+                            serde_json::json!({
+                                "connectionId": connection_id, "peerName": peer_name,
+                            }),
+                        ),
+                        chat::ChatEvent::Status { connection_id, error } => (
+                            "chat-status",
+                            serde_json::json!({
+                                "connectionId": connection_id,
+                                "ok": error.is_none(),
+                                "error": error,
+                            }),
+                        ),
+                    };
+                    let _ = chat_handle.emit(name, payload);
+                }
+            });
+
+            let config_dir = app
+                .path()
+                .app_config_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("."));
+            app.manage(ChatState(chat::ChatService::new(
+                chat::store_path(&config_dir),
+                chat_tx,
+            )));
+
             Ok(())
         })
         .manage(state)
@@ -536,6 +680,14 @@ fn main() {
             run_binding,
             run_script,
             simulate_board_host_cmd,
+            chat_list,
+            chat_create,
+            chat_delete,
+            chat_rename,
+            chat_set_led_ping,
+            chat_new_invite,
+            chat_unpair,
+            chat_send,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -21,3 +21,17 @@ color_quant = "1.1"
 base64 = "0.22"
 tauri-plugin-dialog = "2.7.2"
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Threading"] }
+# Telegram chat connections. Blocking on purpose: every long-lived job in this
+# app is a plain thread (the RealHid supervisor, the host-command runner), and a
+# blocking client keeps the poller in that shape instead of borrowing Tauri's
+# tokio runtime. reqwest is already in the tree via Tauri but carries no TLS
+# backend, so either choice adds rustls — and this one does not tie us to
+# whichever reqwest version Tauri happens to pin.
+# rustls + webpki-roots rather than the platform verifier: bundled roots behave
+# the same on every machine, and api.telegram.org is the only host we call.
+ureq = { version = "3", default-features = false, features = ["rustls", "json", "gzip"] }
+# OS entropy for pairing codes. A guessable code is a stranger in your chat
+# room, so this needs a real CSPRNG rather than a hash of the clock. Already in
+# the tree under rustls; taken as a direct dependency so nothing here rests on
+# a transitive staying put.
+getrandom = "0.3"
