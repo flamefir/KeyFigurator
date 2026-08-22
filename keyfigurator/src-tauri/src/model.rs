@@ -259,6 +259,181 @@ pub struct OledConfig {
     /// of them once you rotated away from it.
     #[serde(default)]
     pub screen_leds: Vec<ScreenLeds>,
+    /// Connection Screens, at most `MAX_CHAT_SCREENS` of them.
+    ///
+    /// Absent from every payload written before chat existed, so it defaults
+    /// rather than failing the whole `oled_push` — the trap that made Save to
+    /// Board silently do nothing after the pomodoro reshape.
+    #[serde(default)]
+    pub chats: Vec<ChatScreen>,
+}
+
+/// One message in a room, as the frontend hands it over.
+///
+/// Deliberately not the frontend's whole record: no sender name, no timestamp.
+/// A 128px panel showing 20 characters a line cannot spend any of them on
+/// either, and `mine` is the only distinction it draws.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatMessage {
+    /// Written from this app rather than received from the peer.
+    #[serde(default)]
+    pub mine: bool,
+    pub text: String,
+}
+
+/// One Connection Screen's contents.
+///
+/// The room's NAME is not here: it is the screen's title and travels through
+/// `OLED_SET_TEXT` like every other screen's, so there is no second path for it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatScreen {
+    /// The app's fixed slot space: 4 layer screens, then custom screens.
+    pub slot: u8,
+    /// Newest last. More than the board can show is fine and expected — the
+    /// tail is what gets sent.
+    #[serde(default)]
+    pub messages: Vec<ChatMessage>,
+    #[serde(default)]
+    pub unread: u8,
+    #[serde(default)]
+    pub led_ping: bool,
+}
+
+/// Fold one character to something the board's 5x7 font can draw (ASCII
+/// 32..126).
+///
+/// The board cannot do this: a Unicode table is far more than this firmware has
+/// room for, and the app already holds the string. Same division of labour as
+/// Present Keys' labels and the key icons.
+///
+/// Returns `None` for a character with no sensible ASCII stand-in, which is
+/// most of what makes a Telegram message interesting — emoji above all.
+fn fold_char(c: char) -> Option<&'static str> {
+    Some(match c {
+        // Smart punctuation, which Telegram clients insert on their own.
+        '\u{2018}' | '\u{2019}' | '\u{201B}' => "'",
+        '\u{201C}' | '\u{201D}' | '\u{201F}' => "\"",
+        '\u{2013}' | '\u{2014}' | '\u{2212}' => "-",
+        '\u{2026}' => "...",
+        '\u{00A0}' | '\u{2007}' | '\u{202F}' => " ",
+        '\u{2022}' => "*",
+        // Latin-1 letters, so a Danish or German name is readable rather than
+        // blanked. Not a full transliteration table, just the common ones.
+        'æ' => "ae", 'Æ' => "AE",
+        'ø' => "oe", 'Ø' => "OE",
+        'å' => "aa", 'Å' => "AA",
+        'ä' => "ae", 'Ä' => "AE",
+        'ö' => "oe", 'Ö' => "OE",
+        'ü' => "ue", 'Ü' => "UE",
+        'ß' => "ss",
+        'é' | 'è' | 'ê' | 'ë' => "e",
+        'á' | 'à' | 'â' => "a",
+        'í' | 'ì' | 'î' | 'ï' => "i",
+        'ó' | 'ò' | 'ô' => "o",
+        'ú' | 'ù' | 'û' => "u",
+        'ñ' => "n",
+        'ç' => "c",
+        // A tab is whitespace the font has no glyph for.
+        '\t' => " ",
+        c if (' '..='~').contains(&c) => return Some(leak_ascii(c)),
+        _ => return None,
+    })
+}
+
+/// `fold_char` needs to return `&'static str` for the multi-character cases, and
+/// a plain ASCII character has to come back the same way. The 95 printable
+/// ASCII characters are a fixed, tiny set, so they live in a table.
+fn leak_ascii(c: char) -> &'static str {
+    const ASCII: &str =
+        " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
+    let i = c as usize - 0x20;
+    &ASCII[i..i + 1]
+}
+
+/// Fold a whole message to ASCII the panel can draw.
+///
+/// A message that folds away to nothing becomes `[?]` rather than vanishing: a
+/// message you cannot read is a different thing from no message, and an
+/// emoji-only reply is common enough that silence would look like a bug.
+pub fn fold_to_ascii(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut dropped = false;
+    for c in text.chars() {
+        match fold_char(c) {
+            Some(s) => out.push_str(s),
+            None => dropped = true,
+        }
+    }
+    // Collapse the gaps dropped characters leave behind, so "hi 👋 there" does
+    // not arrive as "hi  there".
+    let collapsed = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() && (dropped || !text.is_empty()) {
+        return "[?]".into();
+    }
+    collapsed
+}
+
+/// Break already-folded text into lines of at most `width` characters, keeping
+/// words whole where they fit.
+///
+/// A word longer than a line (a URL, most often) is hard-split rather than
+/// allowed to overflow — the board does no wrapping of its own and would simply
+/// draw off the edge of the panel.
+pub fn wrap_ascii(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let mut word = word;
+        // Long word: fill the current line, then take whole lines out of it.
+        while word.len() > width {
+            if !line.is_empty() {
+                lines.push(std::mem::take(&mut line));
+            }
+            let (head, tail) = word.split_at(width);
+            lines.push(head.to_string());
+            word = tail;
+        }
+        if word.is_empty() {
+            continue;
+        }
+        if line.is_empty() {
+            line.push_str(word);
+        } else if line.len() + 1 + word.len() <= width {
+            line.push(' ');
+            line.push_str(word);
+        } else {
+            lines.push(std::mem::replace(&mut line, word.to_string()));
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+impl ChatScreen {
+    /// The exact lines the board should hold: folded, wrapped, and cut to the
+    /// newest `max_lines`.
+    ///
+    /// Newest-last, and the cut is taken **after** wrapping rather than before.
+    /// Trimming to the last N messages first would be wrong whenever one of them
+    /// wraps: eight one-line messages and one nine-line message both fill the
+    /// panel, and only counting lines knows that.
+    pub fn lines(&self, width: usize, max_lines: usize) -> Vec<(bool, String)> {
+        let mut all: Vec<(bool, String)> = Vec::new();
+        // Only the tail can possibly survive the cut, so fold at most enough
+        // messages to fill the panel even if every one of them is a single line.
+        let start = self.messages.len().saturating_sub(max_lines);
+        for m in &self.messages[start..] {
+            for line in wrap_ascii(&fold_to_ascii(&m.text), width) {
+                all.push((m.mine, line));
+            }
+        }
+        if all.len() > max_lines {
+            all.drain(..all.len() - max_lines);
+        }
+        all
+    }
 }
 
 /// One screen's LEDs: which slot it is, its colours, and the two animations.
@@ -474,6 +649,174 @@ pub struct HostBinding {
     pub keys: Vec<MacroAction>,
     /// Working directory to run it in (so git knows which repo).
     pub cwd: Option<String>,
+}
+
+#[cfg(test)]
+mod chat_tests {
+    use super::*;
+
+    const W: usize = 20; // kf_protocol::CHAT_LINE_MAX
+    const N: usize = 8;  // kf_protocol::CHAT_LINES
+
+    fn screen(msgs: &[(bool, &str)]) -> ChatScreen {
+        ChatScreen {
+            slot: 4,
+            messages: msgs
+                .iter()
+                .map(|(mine, t)| ChatMessage { mine: *mine, text: (*t).into() })
+                .collect(),
+            unread: 0,
+            led_ping: false,
+        }
+    }
+
+    // ── folding to what the panel can draw ──────────────────────────────────
+
+    #[test]
+    fn plain_ascii_is_untouched() {
+        assert_eq!(fold_to_ascii("meet at 7? bring the KEY!"), "meet at 7? bring the KEY!");
+    }
+
+    /// Telegram clients insert these on their own, so they arrive constantly.
+    #[test]
+    fn smart_punctuation_folds_to_its_ascii_original() {
+        assert_eq!(fold_to_ascii("\u{201C}it\u{2019}s fine\u{201D}"), "\"it's fine\"");
+        assert_eq!(fold_to_ascii("wait\u{2026}"), "wait...");
+        assert_eq!(fold_to_ascii("a \u{2014} b"), "a - b");
+    }
+
+    #[test]
+    fn accented_names_stay_readable() {
+        assert_eq!(fold_to_ascii("Søren"), "Soeren");
+        assert_eq!(fold_to_ascii("café"), "cafe");
+        assert_eq!(fold_to_ascii("Müller"), "Mueller");
+    }
+
+    /// Every byte must be something the board's 5x7 font (32..126) can draw.
+    #[test]
+    fn nothing_outside_the_fonts_range_survives() {
+        for s in ["hej 👋", "→ go", "Sören’s café… 🎉", "日本語"] {
+            let folded = fold_to_ascii(s);
+            assert!(
+                folded.bytes().all(|b| (0x20..=0x7E).contains(&b)),
+                "{s:?} folded to {folded:?}, which the font cannot draw"
+            );
+        }
+    }
+
+    /// An emoji-only reply is common. Silence would read as a bug, so it has to
+    /// arrive as *something*.
+    #[test]
+    fn a_message_that_folds_away_is_still_visible() {
+        assert_eq!(fold_to_ascii("👍"), "[?]");
+        assert_eq!(fold_to_ascii("🎉🎉🎉"), "[?]");
+    }
+
+    #[test]
+    fn gaps_left_by_dropped_characters_are_closed_up() {
+        assert_eq!(fold_to_ascii("hi 👋 there"), "hi there");
+    }
+
+    // ── wrapping ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn words_are_kept_whole_where_they_fit() {
+        assert_eq!(
+            wrap_ascii("the quick brown fox jumps over it", W),
+            vec!["the quick brown fox", "jumps over it"]
+        );
+        for line in wrap_ascii("the quick brown fox jumps over it", W) {
+            assert!(line.len() <= W);
+        }
+    }
+
+    /// The board does no wrapping, so a URL that does not fit would be drawn
+    /// straight off the edge of the panel.
+    #[test]
+    fn a_word_longer_than_a_line_is_split_rather_than_overflowing() {
+        let lines = wrap_ascii("see https://example.com/a/very/long/path/indeed now", W);
+        assert!(lines.iter().all(|l| l.len() <= W), "{lines:?}");
+        assert!(lines.concat().contains("example.com"));
+    }
+
+    #[test]
+    fn wrapping_nothing_produces_no_lines() {
+        assert!(wrap_ascii("", W).is_empty());
+        assert!(wrap_ascii("   ", W).is_empty());
+    }
+
+    // ── what the board ends up holding ──────────────────────────────────────
+
+    #[test]
+    fn lines_are_ordered_oldest_first_and_carry_their_origin() {
+        let s = screen(&[(false, "you at the desk"), (true, "yep")]);
+        assert_eq!(
+            s.lines(W, N),
+            vec![(false, "you at the desk".to_string()), (true, "yep".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_long_message_becomes_at_most_a_panel_of_lines() {
+        let s = screen(&[(false, &"word ".repeat(60))]);
+        let lines = s.lines(W, N);
+        assert_eq!(lines.len(), N);
+        assert!(lines.iter().all(|(_, l)| l.len() <= W));
+    }
+
+    /// The cut has to happen AFTER wrapping. Keeping the last N *messages* would
+    /// overflow the panel the moment one of them wraps.
+    #[test]
+    fn the_newest_lines_win_not_the_newest_messages() {
+        // One message that wraps to ten lines, then a short one. Two messages,
+        // eleven lines: trimming to the last N *messages* would keep them all
+        // and overflow the panel, so only counting lines gets this right.
+        let long = format!("ALPHA {}", "word ".repeat(40));
+        let s = screen(&[(false, &long), (true, "last")]);
+
+        let lines = s.lines(W, N);
+        assert_eq!(lines.len(), N, "{lines:?}");
+        assert_eq!(lines.last().unwrap(), &(true, "last".to_string()));
+        // The oldest lines fell off the top rather than the newest message.
+        assert!(!lines.iter().any(|(_, l)| l.contains("ALPHA")), "{lines:?}");
+    }
+
+    #[test]
+    fn an_empty_room_has_no_lines() {
+        assert!(screen(&[]).lines(W, N).is_empty());
+    }
+
+    // ── payload compatibility ───────────────────────────────────────────────
+
+    /// Every config saved before chat existed. A missing field must default,
+    /// not fail the whole `oled_push` — that is exactly how a pomodoro reshape
+    /// once made Save to Board silently do nothing.
+    #[test]
+    fn a_config_written_before_chat_existed_still_parses() {
+        let cfg: OledConfig = serde_json::from_str(
+            r#"{"layers":[],"screens":[],"countdown":[0,0,0]}"#,
+        )
+        .expect("older payloads must still load");
+        assert!(cfg.chats.is_empty());
+    }
+
+    /// Literal frontend JSON, camelCase and all, parsed at the boundary the
+    /// real payload crosses.
+    #[test]
+    fn frontend_chat_json_parses() {
+        let cfg: OledConfig = serde_json::from_str(
+            r#"{"layers":[],"screens":[],"countdown":[0,0,0],
+                "chats":[{"slot":4,"unread":2,"led_ping":true,
+                          "messages":[{"mine":false,"text":"hi"},
+                                      {"mine":true,"text":"hello"}]}]}"#,
+        )
+        .expect("the frontend's own shape must parse");
+        assert_eq!(cfg.chats.len(), 1);
+        assert_eq!(cfg.chats[0].slot, 4);
+        assert_eq!(cfg.chats[0].unread, 2);
+        assert!(cfg.chats[0].led_ping);
+        assert_eq!(cfg.chats[0].messages[1], ChatMessage { mine: true, text: "hello".into() });
+    }
 }
 
 #[cfg(test)]

@@ -108,6 +108,8 @@ pub const KEY_INFO_COUNT: usize = 2;
 /// Bindings one frame can carry: 32 - (magic, cmd, slot, count), two bytes each.
 pub const EVENT_KEYS_CHUNK_MAX: usize = (REPORT_LEN - 4) / 2;
 pub const EVENT_KEY_NONE: u8 = 0xFF;
+/// `KF_EVENT_COUNT`. Grew to 10 with `KF_EVENT_CHAT_MARK_READ`.
+pub const EVENT_COUNT: usize = 10;
 
 /// Pomodoro limits + defaults, mirroring `KF_POMO_*` in `kf_hid.h`. The board
 /// clamps to these, so the app applies the same bounds rather than letting the
@@ -144,9 +146,14 @@ pub const QK_MACRO_0: u16 = 0x7700;
 pub const MACRO_COUNT: u8 = 16;
 
 // OLED limits (kf_hid.h).
-/// 7, not 6: the home screen occupies one custom slot, alongside the six
-/// content types (timer, countdown, datetime, custom text, pomodoro, image).
-pub const OLED_MAX_CUSTOM_SCREENS: usize = 7;
+/// 10: the six content types (timer, countdown, datetime, custom text,
+/// pomodoro, image), the permanent home screen, and up to `MAX_CHAT_SCREENS`
+/// chat screens — the first type the app allows more than one of.
+pub const OLED_MAX_CUSTOM_SCREENS: usize = 10;
+/// How many Connection Screens can exist at once. The cap is a slot-space
+/// decision, not a UI one: each costs a custom screen, a `SCREEN_SLOTS` entry
+/// and 161 bytes of the board's persisted config block.
+pub const MAX_CHAT_SCREENS: usize = 3;
 pub const OLED_LAYER_NAME_MAX: usize = 16;
 pub const OLED_CUSTOM_TITLE_MAX: usize = 14;
 pub const OLED_BODY_MAX: usize = 48;
@@ -165,6 +172,30 @@ pub const SCREEN_IMAGE: u8 = 6;
 /// The permanent home screen. Always present, never deletable, and drawn by the
 /// board from its own logo bitmap — no content crosses the wire for it.
 pub const SCREEN_LOGO: u8 = 7;
+/// A Connection Screen: one chat room's recent history. Its title is the room
+/// name and travels through `OLED_SET_TEXT` field 0 like any other screen's;
+/// its lines travel through `CHAT_SET_LINE`.
+pub const SCREEN_CHAT: u8 = 8;
+
+// Chat (kf_hid.h). One history line per frame; `CHAT_SET_STATE` commits.
+pub const CMD_CHAT_SET_LINE: u8 = 0x62;
+pub const CMD_CHAT_SET_STATE: u8 = 0x63;
+/// History lines the board keeps per chat screen.
+pub const CHAT_LINES: usize = 8;
+/// Characters per line. The panel is 128px and the font is 6px wide at scale 1,
+/// giving 21 columns; one is the origin marker.
+pub const CHAT_LINE_MAX: usize = 20;
+/// Most line bytes ONE frame can carry: 32 - (magic, cmd, slot, line, origin,
+/// offset, len). A source limit like `OLED_TEXT_CHUNK_MAX`, and unrelated to
+/// `CHAT_LINE_MAX` — validating only the destination is what let an
+/// `OLED_SET_TEXT` frame claim a length that ran off the end of the report.
+pub const CHAT_LINE_CHUNK_MAX: usize = REPORT_LEN - 7;
+/// `flags` bit 0 of `CHAT_SET_STATE`: flash the board on a new message.
+pub const CHAT_FLAG_LED_PING: u8 = 0x01;
+/// A line the app wrote.
+pub const CHAT_ORIGIN_ME: u8 = 1;
+/// A line from the paired peer.
+pub const CHAT_ORIGIN_PEER: u8 = 0;
 
 /// The board's single image buffer (`KF_OLED_IMG_MAX_BYTES`), and the caps the
 /// encoder must respect to stay inside it.
@@ -354,6 +385,55 @@ pub fn set_screen_leds_frames(
         out.push(frame(CMD_SET_SCREEN_LEDS, &p));
     }
     out
+}
+
+/// One chat history line.
+///
+/// Chunked like `oled_set_text_frames`, even though a `CHAT_LINE_MAX` line
+/// always fits one frame today. The offset stays in the wire format so that
+/// widening the line is a change of constant rather than a change of protocol —
+/// and so this cannot become the function that writes past the end of a report
+/// the day it is widened.
+///
+/// The text is expected to be ASCII and already the right width: the board's
+/// 5x7 font covers 32..126 and it does no wrapping. `ChatScreen::lines()` in
+/// `model.rs` is what produces that; this only truncates as a last guard.
+pub fn chat_line_frames(slot: u8, line: u8, origin: u8, text: &str) -> Vec<[u8; REPORT_LEN]> {
+    let bytes = text.as_bytes();
+    let bytes = &bytes[..bytes.len().min(CHAT_LINE_MAX)];
+    if bytes.is_empty() {
+        return vec![frame(CMD_CHAT_SET_LINE, &[slot, line, origin, 0, 0])];
+    }
+    bytes
+        .chunks(CHAT_LINE_CHUNK_MAX)
+        .enumerate()
+        .map(|(ci, chunk)| {
+            let mut p = Vec::with_capacity(5 + chunk.len());
+            p.push(slot);
+            p.push(line);
+            p.push(origin);
+            p.push((ci * CHAT_LINE_CHUNK_MAX) as u8);
+            p.push(chunk.len() as u8);
+            p.extend_from_slice(chunk);
+            frame(CMD_CHAT_SET_LINE, &p)
+        })
+        .collect()
+}
+
+/// Commit a chat screen: how many of the pushed lines are live, the unread
+/// badge, and the flags.
+///
+/// Sent last on purpose. The board renders nothing for a slot until this
+/// arrives, so a half-pushed conversation is never drawn — the same "length
+/// after the data" rule `set_palette` follows, for the same reason.
+///
+/// `count` of 0 clears the slot, which is how a deleted room stops showing an
+/// old conversation rather than leaving it on the panel forever.
+pub fn chat_state_frame(slot: u8, count: u8, unread: u8, flags: u8) -> [u8; REPORT_LEN] {
+    frame(
+        CMD_CHAT_SET_STATE,
+        &[slot, count.min(CHAT_LINES as u8), unread, flags],
+    )
 }
 
 pub fn oled_img_begin_frame(total_len: u32) -> [u8; REPORT_LEN] {
@@ -785,7 +865,37 @@ impl Default for PaletteState {
 /// How many screens the board can hold bindings for: 4 layer screens plus
 /// MAX_CUSTOM_SCREENS. The app's FIXED slot space, mirroring KF_SCREEN_SLOTS —
 /// not the board's compressed nav_index.
-pub const SCREEN_SLOTS: usize = 10;
+///
+/// This was **10 while the firmware was 11**, from 0.4.6 (when the home screen
+/// took a slot of its own) until 2026-08-22. The seventh custom screen's LED
+/// profile was silently rejected here and had nowhere to live in
+/// `BoardModel::screen_leds`, so a board that accepted it was told otherwise by
+/// its own config app. `slot_space_matches_the_firmware` below pins the
+/// arithmetic so the two cannot drift again.
+pub const SCREEN_SLOTS: usize = LAYER_COUNT + OLED_MAX_CUSTOM_SCREENS;
+
+/// One chat screen as the board holds it.
+///
+/// `lines` is written by `CHAT_SET_LINE` and `count` by `CHAT_SET_STATE`, and
+/// they are separate for a reason: the board draws `count` lines, not
+/// `lines.len()`. A push in progress has lines written but no count yet, so a
+/// half-sent conversation is never on screen.
+#[derive(Clone, PartialEq, Debug, Default)]
+pub struct ChatSlotState {
+    /// Indexed by line number, oldest first. `(origin, text)`.
+    pub lines: [(u8, String); CHAT_LINES],
+    /// How many of `lines` are live. 0 means the slot shows nothing.
+    pub count: u8,
+    pub unread: u8,
+    pub flags: u8,
+}
+
+impl ChatSlotState {
+    /// What the panel would actually show: the live lines, in order.
+    pub fn visible(&self) -> Vec<(u8, String)> {
+        self.lines[..(self.count as usize).min(CHAT_LINES)].to_vec()
+    }
+}
 
 /// One screen's LED profile as the board holds it. Mirrors `kf_screen_leds_t`.
 #[derive(Clone, PartialEq, Debug)]
@@ -853,7 +963,11 @@ pub struct BoardModel {
     /// has, which is always LAYER_COUNT).
     pub layer_screen_count: u8,
     /// [screen_slot][event] -> key index, 0xFF unbound. Mirrors event_key[][].
-    pub event_keys: [[u8; 9]; 10],
+    ///
+    /// Sized from the constants, not from literals. It was `[[u8; 9]; 10]`
+    /// while the firmware's array was `[14][10]`, which is the same drift
+    /// `SCREEN_SLOTS` had: the model quietly rejected slots the board accepts.
+    pub event_keys: [[u8; EVENT_COUNT]; SCREEN_SLOTS],
     /// Present Keys text per key, as the board holds it: [macro, keycode].
     pub key_info: [[String; KEY_INFO_COUNT]; KEY_COUNT],
     /// Present Keys icon mask per key. `None` is a key with no icon.
@@ -863,6 +977,9 @@ pub struct BoardModel {
     /// Per-screen LED profiles, indexed by the app's fixed slot space. `None`
     /// is a slot the app never pushed, which the board leaves alone.
     pub screen_leds: [Option<ScreenLedState>; SCREEN_SLOTS],
+    /// Chat history per screen slot. `None` is a slot with no room bound to it;
+    /// the board draws nothing for one.
+    pub chats: [Option<ChatSlotState>; SCREEN_SLOTS],
     pub sleep_mask: u16,
     pub sleep_timeout_s: u8,
     /// Image upload state, mirroring the board's single image buffer.
@@ -896,11 +1013,12 @@ impl Default for BoardModel {
             // Zero, like the firmware: an unconfigured board has no screens
             // and shows the Orbit mark, not four empty layer screens.
             layer_screen_count: 0,
-            event_keys: [[EVENT_KEY_NONE; 9]; 10],
+            event_keys: [[EVENT_KEY_NONE; EVENT_COUNT]; SCREEN_SLOTS],
             key_info: Default::default(),
             key_icons: [None; KEY_COUNT],
             font_scale: 2,
             screen_leds: Default::default(),
+            chats: Default::default(),
             sleep_mask: 0,
             sleep_timeout_s: 60,
             oled_img_expected: 0,
@@ -1185,6 +1303,42 @@ impl BoardModel {
                 } else {
                     self.key_info[idx][field] =
                         String::from_utf8_lossy(&p[3..3 + len]).into_owned();
+                    r[0] = STATUS_OK;
+                }
+            }
+            CMD_CHAT_SET_LINE => {
+                let (slot, line, origin, offset, len) =
+                    (p[0] as usize, p[1] as usize, p[2], p[3] as usize, p[4] as usize);
+                // `len` is checked against what the REPORT can hold, not just
+                // against the line buffer: a frame claiming len 20 at offset 20
+                // would otherwise read past the end of `p`.
+                if slot >= SCREEN_SLOTS
+                    || line >= CHAT_LINES
+                    || len > CHAT_LINE_CHUNK_MAX
+                    || offset + len > CHAT_LINE_MAX
+                {
+                    r[0] = STATUS_ERROR;
+                } else {
+                    let chat = self.chats[slot].get_or_insert_with(ChatSlotState::default);
+                    let text = String::from_utf8_lossy(&p[5..5 + len]).into_owned();
+                    if offset == 0 {
+                        chat.lines[line] = (origin, text);
+                    } else {
+                        chat.lines[line].0 = origin;
+                        chat.lines[line].1.push_str(&text);
+                    }
+                    r[0] = STATUS_OK;
+                }
+            }
+            CMD_CHAT_SET_STATE => {
+                let slot = p[0] as usize;
+                if slot >= SCREEN_SLOTS || p[1] as usize > CHAT_LINES {
+                    r[0] = STATUS_ERROR;
+                } else {
+                    let chat = self.chats[slot].get_or_insert_with(ChatSlotState::default);
+                    chat.count = p[1];
+                    chat.unread = p[2];
+                    chat.flags = p[3];
                     r[0] = STATUS_OK;
                 }
             }
@@ -1518,6 +1672,174 @@ mod tests {
         // led offset+count out of range
         let bad_led = frame(CMD_SET_LEDS, &[20, 9]);
         assert_eq!(b.handle(&bad_led).unwrap()[2], STATUS_ERROR);
+    }
+
+    /// The app's slot space against `kf_hid.h`. These four numbers have to agree
+    /// with the firmware exactly, and for eight months two of them did not:
+    /// `SCREEN_SLOTS` sat at 10 while `KF_SCREEN_SLOTS` was 11, so the seventh
+    /// custom screen's LED profile was rejected by an app talking to a board
+    /// that would have accepted it.
+    ///
+    /// Written as literals rather than derived, deliberately. A test that
+    /// recomputes what the code computes proves nothing; these are transcribed
+    /// from the header, so changing the header without changing the app fails
+    /// here instead of on a bench.
+    #[test]
+    fn slot_space_matches_the_firmware() {
+        assert_eq!(LAYER_COUNT, 4, "DYNAMIC_KEYMAP_LAYER_COUNT");
+        assert_eq!(OLED_MAX_CUSTOM_SCREENS, 10, "KF_MAX_CUSTOM_SCREENS");
+        assert_eq!(SCREEN_SLOTS, 14, "KF_SCREEN_SLOTS");
+        assert_eq!(MAX_CHAT_SCREENS, 3);
+        // 6 content types + the home screen + the chat screens.
+        assert_eq!(OLED_MAX_CUSTOM_SCREENS, 6 + 1 + MAX_CHAT_SCREENS);
+        // The sleep mask is a u16 over this same space (OLED_SET_SLEEP). 14 fit;
+        // 16 is the ceiling, and the next multi-instance screen type has to
+        // widen the field rather than quietly drop the top slots.
+        assert!(SCREEN_SLOTS <= 16, "sleep_mask is u16 — widen it before growing past 16");
+    }
+
+    /// `screen_leds` is indexed by the slot the wire carries, so its length and
+    /// the bounds check have to be the same number. Sizing it from a literal
+    /// while checking against a constant is how the 10-vs-11 drift stayed
+    /// invisible.
+    #[test]
+    fn every_screen_slot_has_an_led_profile_and_one_past_the_end_does_not() {
+        let mut b = BoardModel::default();
+        assert_eq!(b.screen_leds.len(), SCREEN_SLOTS);
+
+        let last = (SCREEN_SLOTS - 1) as u8;
+        let ok = set_screen_leds_frames(last, &[[1, 2, 3]; LED_COUNT], 0, 128, (0, 0, 0), 0, 128, 180);
+        for f in &ok {
+            assert_eq!(b.handle(f).unwrap()[2], STATUS_OK, "slot {last} must be accepted");
+        }
+        assert!(b.screen_leds[last as usize].is_some());
+
+        let past = SCREEN_SLOTS as u8;
+        let hdr = frame(CMD_SET_SCREEN_LEDS, &[past, SCREEN_LEDS_HDR, 0, 128, 0, 0, 0, 0, 128, 180]);
+        assert_eq!(b.handle(&hdr).unwrap()[2], STATUS_ERROR, "slot {past} must be rejected");
+    }
+
+    // ── chat frames ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn chat_line_frame_is_byte_exact() {
+        let f = &chat_line_frames(4, 2, CHAT_ORIGIN_ME, "hi there")[0];
+        assert_eq!(f[0], KF_MAGIC);
+        assert_eq!(f[1], CMD_CHAT_SET_LINE);
+        assert_eq!(&f[2..7], &[4, 2, CHAT_ORIGIN_ME, 0, 8]);
+        assert_eq!(&f[7..15], b"hi there");
+        assert!(f[15..].iter().all(|&b| b == 0), "tail must be zero-padded");
+    }
+
+    /// The `OLED_SET_TEXT` version of this bug shipped: validating only the
+    /// destination let a frame claim a length that ran off the end of the
+    /// report. One frame has to hold a whole line.
+    #[test]
+    fn a_full_width_line_still_fits_one_frame() {
+        let text = "12345678901234567890"; // exactly CHAT_LINE_MAX
+        let frames = chat_line_frames(0, 0, CHAT_ORIGIN_PEER, text);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0][6] as usize, CHAT_LINE_MAX);
+        assert!(CHAT_LINE_MAX <= CHAT_LINE_CHUNK_MAX);
+    }
+
+    #[test]
+    fn an_over_long_line_is_truncated_not_overrun() {
+        let text = "x".repeat(200);
+        let frames = chat_line_frames(0, 0, CHAT_ORIGIN_PEER, &text);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0][6] as usize, CHAT_LINE_MAX);
+    }
+
+    /// An empty line has to be sent, not skipped: it is how a line that used to
+    /// hold text is blanked.
+    #[test]
+    fn an_empty_line_is_still_a_frame() {
+        let f = &chat_line_frames(1, 3, CHAT_ORIGIN_PEER, "")[0];
+        assert_eq!(&f[2..7], &[1, 3, CHAT_ORIGIN_PEER, 0, 0]);
+    }
+
+    #[test]
+    fn chat_state_frame_is_byte_exact_and_clamps() {
+        let f = chat_state_frame(6, 3, 2, CHAT_FLAG_LED_PING);
+        assert_eq!(&f[..6], &[KF_MAGIC, CMD_CHAT_SET_STATE, 6, 3, 2, CHAT_FLAG_LED_PING]);
+        // A count above what the board can hold would index past its buffer.
+        let over = chat_state_frame(6, 99, 0, 0);
+        assert_eq!(over[3] as usize, CHAT_LINES);
+    }
+
+    #[test]
+    fn board_model_round_trips_a_conversation() {
+        let mut b = BoardModel::default();
+        let slot = 5u8;
+        for f in chat_line_frames(slot, 0, CHAT_ORIGIN_PEER, "you at the desk") {
+            assert_eq!(b.handle(&f).unwrap()[2], STATUS_OK);
+        }
+        for f in chat_line_frames(slot, 1, CHAT_ORIGIN_ME, "yep") {
+            assert_eq!(b.handle(&f).unwrap()[2], STATUS_OK);
+        }
+
+        // Lines are written, but nothing is live until the state frame lands.
+        assert_eq!(b.chats[slot as usize].as_ref().unwrap().count, 0);
+        assert!(b.chats[slot as usize].as_ref().unwrap().visible().is_empty());
+
+        b.handle(&chat_state_frame(slot, 2, 1, CHAT_FLAG_LED_PING)).unwrap();
+        let chat = b.chats[slot as usize].as_ref().unwrap();
+        assert_eq!(
+            chat.visible(),
+            vec![
+                (CHAT_ORIGIN_PEER, "you at the desk".to_string()),
+                (CHAT_ORIGIN_ME, "yep".to_string()),
+            ]
+        );
+        assert_eq!(chat.unread, 1);
+        assert_eq!(chat.flags & CHAT_FLAG_LED_PING, CHAT_FLAG_LED_PING);
+    }
+
+    /// How a deleted room stops showing an old conversation.
+    #[test]
+    fn count_zero_clears_a_slot() {
+        let mut b = BoardModel::default();
+        for f in chat_line_frames(2, 0, CHAT_ORIGIN_PEER, "old news") {
+            b.handle(&f).unwrap();
+        }
+        b.handle(&chat_state_frame(2, 1, 0, 0)).unwrap();
+        assert_eq!(b.chats[2].as_ref().unwrap().visible().len(), 1);
+
+        b.handle(&chat_state_frame(2, 0, 0, 0)).unwrap();
+        assert!(b.chats[2].as_ref().unwrap().visible().is_empty());
+    }
+
+    #[test]
+    fn chat_frames_out_of_range_are_rejected() {
+        let mut b = BoardModel::default();
+        let past_slot = SCREEN_SLOTS as u8;
+        let f = frame(CMD_CHAT_SET_LINE, &[past_slot, 0, 0, 0, 1, b'x']);
+        assert_eq!(b.handle(&f).unwrap()[2], STATUS_ERROR);
+
+        let past_line = frame(CMD_CHAT_SET_LINE, &[0, CHAT_LINES as u8, 0, 0, 1, b'x']);
+        assert_eq!(b.handle(&past_line).unwrap()[2], STATUS_ERROR);
+
+        // A length that would read past the end of the report.
+        let long = frame(CMD_CHAT_SET_LINE, &[0, 0, 0, 0, (CHAT_LINE_CHUNK_MAX + 1) as u8]);
+        assert_eq!(b.handle(&long).unwrap()[2], STATUS_ERROR);
+
+        assert_eq!(b.handle(&frame(CMD_CHAT_SET_STATE, &[past_slot, 0, 0, 0])).unwrap()[2], STATUS_ERROR);
+    }
+
+    /// Three rooms fit the custom-screen list; a fourth does not.
+    #[test]
+    fn three_chat_screens_fit_and_a_fourth_does_not() {
+        let mut b = BoardModel::default();
+        let mut types = vec![SCREEN_LOGO, SCREEN_TIMER, SCREEN_COUNTDOWN, SCREEN_DATETIME,
+                             SCREEN_CUSTOM_TEXT, SCREEN_POMODORO, SCREEN_IMAGE];
+        types.extend(std::iter::repeat_n(SCREEN_CHAT, MAX_CHAT_SCREENS));
+        assert_eq!(types.len(), OLED_MAX_CUSTOM_SCREENS);
+        b.handle(&oled_set_screens_frame(&types)).unwrap();
+        assert_eq!(b.oled_screen_types.len(), OLED_MAX_CUSTOM_SCREENS);
+
+        let too_many = frame(CMD_OLED_SET_SCREENS, &[(OLED_MAX_CUSTOM_SCREENS + 1) as u8]);
+        assert_eq!(b.handle(&too_many).unwrap()[2], STATUS_ERROR);
     }
 
     #[test]

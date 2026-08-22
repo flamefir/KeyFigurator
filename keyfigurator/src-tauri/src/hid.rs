@@ -17,7 +17,10 @@
 //!   moment it is plugged in.
 
 use crate::kf_protocol::{self as kf, BoardModel, REPORT_LEN};
-use crate::model::{AnimState, KeyMap, Layer, LedState, OledConfig, Palette, PomodoroConfig, UnderglowAnim};
+use crate::model::{
+    AnimState, ChatScreen, KeyMap, Layer, LedState, OledConfig, Palette, PomodoroConfig,
+    UnderglowAnim,
+};
 use crate::products::Version;
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -308,7 +311,10 @@ pub trait HidTransport: Send + Sync {
             }
         }
         // Group by screen: one frame per screen carries all of its bindings.
-        for slot in 0u8..10 {
+        // Bounded by SCREEN_SLOTS rather than a literal 10 — it was hardcoded
+        // while the slot space grew, so bindings on the highest screens were
+        // dropped here without a word.
+        for slot in 0u8..kf::SCREEN_SLOTS as u8 {
             let pairs: Vec<(u8, u8)> = cfg
                 .event_keys
                 .iter()
@@ -396,6 +402,8 @@ pub trait HidTransport: Send + Sync {
             }
         }
 
+        self.push_chats(cfg)?;
+
         let (h, m, s) = cfg.countdown;
         let resp = self.transceive(&kf::oled_set_countdown_frame(h, m, s))?;
         expect_ok(&resp)?;
@@ -406,6 +414,90 @@ pub trait HidTransport: Send + Sync {
         let sleep = kf::oled_set_sleep_frame(cfg.sleep_timeout_s, cfg.sleep_mask);
         let _ = self.transceive(&sleep)?;
         self.push_pomodoro(&cfg.pomodoro)
+    }
+
+    /// Push every Connection Screen's history.
+    ///
+    /// Two rules, both about not showing a conversation that is half-true:
+    ///
+    /// * **Lines first, state last.** The board draws `count` lines, and the
+    ///   count only arrives at the end, so a push interrupted halfway leaves
+    ///   the previous conversation up rather than a torn one.
+    /// * **Every slot is cleared, not just the ones with rooms.** A screen that
+    ///   lost its room — deleted, or repointed — gets `count = 0`. Sending only
+    ///   the live rooms would leave the old text sitting on the panel, which is
+    ///   the same bug cleared key icons had.
+    ///
+    /// Rejection is not fatal. Firmware predating `0x62`/`0x63` answers
+    /// `STATUS_ERROR`, and everything else in the push is still good on such a
+    /// board — support is detected by asking, per the 2026-07-28 decision.
+    ///
+    /// The clear pass walks the **chat screens in `cfg.screens`**, not all
+    /// fourteen slots. Blanket-clearing every slot costs fourteen USB round
+    /// trips on every push — and live sync pushes on a 120 ms debounce while
+    /// you drag a colour — for a board that may have no chat screens at all.
+    /// It is also unnecessary: a slot whose screen is no longer a chat screen
+    /// is not drawn as one, because `OLED_SET_SCREENS` has already redefined
+    /// the list. The case that genuinely needs clearing is a Connection Screen
+    /// that stays put and loses its room, and that slot is right here.
+    fn push_chats(&mut self, cfg: &OledConfig) -> Result<(), HidError> {
+        let chats = &cfg.chats;
+        let mut used = [false; kf::SCREEN_SLOTS];
+
+        for chat in chats.iter().take(kf::MAX_CHAT_SCREENS) {
+            let slot = chat.slot as usize;
+            if slot >= kf::SCREEN_SLOTS {
+                continue;
+            }
+            used[slot] = true;
+
+            let lines = chat.lines(kf::CHAT_LINE_MAX, kf::CHAT_LINES);
+            let mut sent_all = true;
+            for (i, (mine, text)) in lines.iter().enumerate() {
+                let origin = if *mine { kf::CHAT_ORIGIN_ME } else { kf::CHAT_ORIGIN_PEER };
+                for f in kf::chat_line_frames(chat.slot, i as u8, origin, text) {
+                    let resp = self.transceive(&f)?;
+                    if expect_ok(&resp).is_err() {
+                        sent_all = false;
+                        break;
+                    }
+                }
+                if !sent_all {
+                    break;
+                }
+            }
+            if !sent_all {
+                // The board did not take the lines, so committing a count over
+                // them would point at whatever was there before.
+                continue;
+            }
+
+            let flags = if chat.led_ping { kf::CHAT_FLAG_LED_PING } else { 0 };
+            let resp = self.transceive(&kf::chat_state_frame(
+                chat.slot,
+                lines.len() as u8,
+                chat.unread,
+                flags,
+            ))?;
+            let _ = expect_ok(&resp);
+        }
+
+        for (si, s) in cfg.screens.iter().enumerate().take(kf::OLED_MAX_CUSTOM_SCREENS) {
+            if screen_kind_to_type(&s.kind) != kf::SCREEN_CHAT {
+                continue;
+            }
+            let slot = kf::LAYER_COUNT + si;
+            if slot >= kf::SCREEN_SLOTS || used[slot] {
+                continue;
+            }
+            let resp = self.transceive(&kf::chat_state_frame(slot as u8, 0, 0, 0))?;
+            if expect_ok(&resp).is_err() {
+                // Old firmware. It has no chat slots to clear either, so there
+                // is nothing to salvage by trying the rest.
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// Push the pomodoro phase durations.
@@ -457,6 +549,7 @@ fn screen_kind_to_type(kind: &str) -> u8 {
         // The app calls it a "gif" screen; the firmware calls it an image screen.
         "image" => kf::SCREEN_IMAGE,
         "logo" => kf::SCREEN_LOGO,
+        "chat" => kf::SCREEN_CHAT,
         _ => kf::SCREEN_CUSTOM_TEXT,
     }
 }
@@ -917,6 +1010,7 @@ mod tests {
             key_icons: Vec::new(),
             font_scale: 0,
             screen_leds: Vec::new(),
+            chats: Vec::new(),
         };
         println!("push_oled:   {:?}", real.push_oled(&cfg));
         println!("eeprom:      {:?}", real.eeprom_commit());
@@ -1165,6 +1259,7 @@ mod tests {
             key_icons: Vec::new(),
             font_scale: 0,
             screen_leds: Vec::new(),
+            chats: Vec::new(),
         };
         hid.push_oled(&cfg).unwrap();
 
@@ -1195,6 +1290,7 @@ mod tests {
             key_icons: Vec::new(),
             font_scale: 0,
             screen_leds: Vec::new(),
+            chats: Vec::new(),
         };
         hid.push_oled(&cfg).expect("the rest of the config still lands");
         assert_eq!(hid.board.oled_layer_names[0], "GIT");
@@ -1283,6 +1379,7 @@ mod tests {
             sleep_timeout_s: 60,
             event_keys: Vec::new(),
             screen_leds: Vec::new(),
+            chats: Vec::new(),
             key_icons: Vec::new(),
             font_scale: 0,
             key_info: vec![
@@ -1333,6 +1430,7 @@ mod tests {
             sleep_timeout_s: 60,
             event_keys: Vec::new(),
             screen_leds: Vec::new(),
+            chats: Vec::new(),
             key_info: Vec::new(),
             key_icons: vec![Some(mask.clone()), None],
             font_scale: 0,
@@ -1373,6 +1471,7 @@ mod tests {
             sleep_timeout_s: 60,
             event_keys: Vec::new(),
             screen_leds: Vec::new(),
+            chats: Vec::new(),
             key_info: Vec::new(),
             key_icons: Vec::new(),
             font_scale: 0,
@@ -1391,6 +1490,170 @@ mod tests {
         // Out of range is clamped on the way out, never sent as-is.
         let f = kf::oled_set_font_frame(9);
         assert_eq!(f[2], kf::FONT_SCALE_MAX);
+    }
+
+    /// `n_screens` chat screens in the custom-screen list, so slots
+    /// LAYER_COUNT.. are chat slots — the shape the frontend actually sends.
+    fn chat_cfg_with(n_screens: usize, chats: Vec<ChatScreen>) -> OledConfig {
+        let mut cfg = chat_cfg(chats);
+        cfg.screens = (0..n_screens)
+            .map(|_| crate::model::OledScreen {
+                kind: "chat".into(),
+                title: "Ana".into(),
+                body: String::new(),
+            })
+            .collect();
+        cfg
+    }
+
+    fn chat_cfg(chats: Vec<ChatScreen>) -> OledConfig {
+        OledConfig {
+            layers: Vec::new(),
+            screens: Vec::new(),
+            countdown: (0, 0, 0),
+            pomodoro: PomodoroConfig::default(),
+            sleep_mask: 0,
+            sleep_timeout_s: 60,
+            event_keys: Vec::new(),
+            key_info: Vec::new(),
+            key_icons: Vec::new(),
+            font_scale: 0,
+            screen_leds: Vec::new(),
+            chats,
+        }
+    }
+
+    fn chat(slot: u8, msgs: &[(bool, &str)]) -> ChatScreen {
+        ChatScreen {
+            slot,
+            messages: msgs
+                .iter()
+                .map(|(mine, t)| crate::model::ChatMessage { mine: *mine, text: (*t).into() })
+                .collect(),
+            unread: 0,
+            led_ping: false,
+        }
+    }
+
+    /// A whole conversation, from the frontend's shape to what the panel holds.
+    #[test]
+    fn push_oled_round_trips_a_conversation() {
+        let mut hid = MockHid::new();
+        let mut c = chat(4, &[(false, "you at the desk?"), (true, "yep")]);
+        c.unread = 2;
+        c.led_ping = true;
+        hid.push_oled(&chat_cfg(vec![c])).unwrap();
+
+        let slot = hid.board.chats[4].as_ref().expect("slot 4 must hold the room");
+        assert_eq!(
+            slot.visible(),
+            vec![
+                (kf::CHAT_ORIGIN_PEER, "you at the desk?".to_string()),
+                (kf::CHAT_ORIGIN_ME, "yep".to_string()),
+            ]
+        );
+        assert_eq!(slot.unread, 2);
+        assert_eq!(slot.flags & kf::CHAT_FLAG_LED_PING, kf::CHAT_FLAG_LED_PING);
+    }
+
+    /// Three rooms at once, each on its own slot and not bleeding into another.
+    #[test]
+    fn three_rooms_stay_separate() {
+        let mut hid = MockHid::new();
+        hid.push_oled(&chat_cfg(vec![
+            chat(4, &[(false, "room one")]),
+            chat(5, &[(false, "room two")]),
+            chat(6, &[(false, "room three")]),
+        ]))
+        .unwrap();
+
+        for (slot, text) in [(4, "room one"), (5, "room two"), (6, "room three")] {
+            let c = hid.board.chats[slot].as_ref().expect("configured");
+            assert_eq!(c.visible(), vec![(kf::CHAT_ORIGIN_PEER, text.to_string())]);
+        }
+    }
+
+    /// A Connection Screen that stays put and loses its room must not keep
+    /// showing the old conversation — the same way a cleared key icon has to be
+    /// sent rather than simply not sent.
+    #[test]
+    fn a_screen_that_loses_its_room_is_cleared() {
+        let mut hid = MockHid::new();
+        hid.push_oled(&chat_cfg_with(1, vec![chat(4, &[(false, "old news")])])).unwrap();
+        assert_eq!(hid.board.chats[4].as_ref().unwrap().visible().len(), 1);
+
+        // The screen is still a chat screen; the room behind it is gone.
+        hid.push_oled(&chat_cfg_with(1, Vec::new())).unwrap();
+        assert!(
+            hid.board.chats[4].as_ref().unwrap().visible().is_empty(),
+            "the deleted room is still on the panel"
+        );
+    }
+
+    /// Deleting the screen itself needs no clear frame: `OLED_SET_SCREENS` has
+    /// already redefined the list, so the slot is not drawn as a chat screen
+    /// whatever stale bytes it still holds.
+    #[test]
+    fn deleting_the_screen_takes_it_out_of_the_list() {
+        let mut hid = MockHid::new();
+        hid.push_oled(&chat_cfg_with(1, vec![chat(4, &[(false, "old news")])])).unwrap();
+        assert_eq!(hid.board.oled_screen_types, vec![kf::SCREEN_CHAT]);
+
+        hid.push_oled(&chat_cfg(Vec::new())).unwrap();
+        assert!(hid.board.oled_screen_types.is_empty());
+    }
+
+    /// Live sync pushes on a 120 ms debounce, so a board with no chat screens
+    /// must not pay for the feature on every colour drag.
+    #[test]
+    fn a_board_with_no_chat_screens_sends_no_chat_frames() {
+        let mut hid = MockHid::new();
+        hid.push_oled(&chat_cfg(Vec::new())).unwrap();
+        assert!(
+            hid.board.chats.iter().all(Option::is_none),
+            "a slot was touched on a board that has no chat screens"
+        );
+    }
+
+    /// The board draws `count` lines, and the count is what arrives last, so a
+    /// push that dies partway leaves the previous conversation up rather than a
+    /// half-written one.
+    #[test]
+    fn lines_are_written_before_the_count_commits_them() {
+        let mut hid = MockHid::new();
+        // Write lines directly, with no state frame behind them.
+        for f in kf::chat_line_frames(4, 0, kf::CHAT_ORIGIN_PEER, "half sent") {
+            hid.transceive(&f).unwrap();
+        }
+        assert!(
+            hid.board.chats[4].as_ref().unwrap().visible().is_empty(),
+            "uncommitted lines must not be drawn"
+        );
+    }
+
+    /// Long, emoji-laden, and accented text is the normal case for Telegram.
+    /// What reaches the wire has to be inside the board's 5x7 font either way.
+    #[test]
+    fn what_reaches_the_board_is_always_drawable() {
+        let mut hid = MockHid::new();
+        hid.push_oled(&chat_cfg(vec![chat(
+            4,
+            &[
+                (false, "Søren says \u{201C}hey\u{201D} 👋"),
+                (true, "https://example.com/a/very/long/path/that/cannot/fit"),
+            ],
+        )]))
+        .unwrap();
+
+        let c = hid.board.chats[4].as_ref().unwrap();
+        assert!(!c.visible().is_empty());
+        for (_, line) in c.visible() {
+            assert!(line.len() <= kf::CHAT_LINE_MAX, "{line:?} is wider than the panel");
+            assert!(
+                line.bytes().all(|b| (0x20..=0x7E).contains(&b)),
+                "{line:?} has bytes the font cannot draw"
+            );
+        }
     }
 
     /// Every screen gets its own LED profile on the board.
@@ -1429,6 +1692,7 @@ mod tests {
                 profile(0, "breathe", [255, 0, 0], "wave"),
                 profile(4, "solid", [255, 255, 255], "solid"),
             ],
+            chats: Vec::new(),
         };
         hid.push_oled(&cfg).unwrap();
 
@@ -1466,6 +1730,7 @@ mod tests {
             sleep_timeout_s: 60,
             event_keys: Vec::new(),
             screen_leds: Vec::new(),
+            chats: Vec::new(),
             key_icons: Vec::new(),
             font_scale: 0,
             key_info: vec![
@@ -1513,6 +1778,7 @@ mod tests {
             key_icons: Vec::new(),
             font_scale: 0,
             screen_leds: Vec::new(),
+            chats: Vec::new(),
         };
         hid.push_oled(&cfg).unwrap();
         assert_eq!(hid.board.event_keys[0][0], 5);
@@ -1542,6 +1808,7 @@ mod tests {
             key_icons: Vec::new(),
             font_scale: 0,
             screen_leds: Vec::new(),
+            chats: Vec::new(),
         };
         hid.push_oled(&cfg).unwrap();
         assert_eq!(hid.board.sleep_mask, 0b0001_0100);
@@ -1608,6 +1875,7 @@ mod tests {
             key_icons: Vec::new(),
             font_scale: 0,
             screen_leds: Vec::new(),
+            chats: Vec::new(),
         };
         assert!(hid.push_oled(&cfg).is_ok());
         assert!(hid.eeprom_commit().is_ok());
