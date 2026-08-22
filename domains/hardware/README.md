@@ -34,8 +34,39 @@ report-id framing still need a proper exercise under load.
 - [x] Firmware: cover the app's remaining two animations — added `riverflow` (snake) + `pixel_rain` (sparkle) to `keyboard.json`, so all seven app animations have a board-side effect for protocol v2 to map onto. Mapping documented in `config.h`
 - [x] Document the real key-matrix + LED index map → [[keymatrix-led-layout]] (written from the firmware's `kf_hid.c` tables; the app mirrors it)
 
+### Chat screen (`feature/chat-screen`, fw 0.5.0) — design in [[telegram-chat-screens]]
+- [ ] `KF_SCREEN_CHAT = 8` + `0x62 CHAT_SET_LINE` / `0x63 CHAT_SET_STATE`, 8 lines x 20 chars
+  per screen (504 bytes for three rooms)
+- [x] **`EECONFIG_KB_DATA_SIZE` 1792 → 2048.** `kf_nvm_t` was at **1791 of 1792** — one byte
+  spare, against a `config.h` comment claiming room to grow. Two corrections on the way there:
+  an estimated 2560 **failed to build**, because Vial's own features (tap dance, combos, key
+  overrides, alt repeat) take 1192 bytes before the macro buffer sees any, and QMK asserts a
+  100-byte floor on it — the real ceiling is ~2506. Then probing the compiler for the actual
+  layout showed 449 bytes of `kf_display_nvm_t` were a body per custom screen, nine of which
+  can never be filled (only `KF_SCREEN_CUSTOM_TEXT` draws one, and there is one of those). It
+  now stores one body plus its owning slot, so the block is **1836 of 2048** with 212 spare and
+  the move is 256 bytes instead of 768. Vial macro buffer 814 → 559. Every flashed board must
+  still be reset and re-pushed; Vial macro CONTENT is the only thing Orbit cannot restore.
+  See §5.1 of [[telegram-chat-screens]]
+- [x] `KF_MAX_CUSTOM_SCREENS` 7 → 10, `KF_SCREEN_SLOTS` 11 → 14, `KF_EVENT_COUNT` 9 → 10
+  (`KF_EVENT_CHAT_MARK_READ`) → `KF_LED_STATE_VERSION` 5 → 6, plus `_Static_assert`s pinning
+  slots == layers + custom, slots <= 16, and the body sentinel outside the slot range.
+  `sleep_mask` is `uint16_t`: 14 slots fit, **16 is the ceiling**, so the next multi-instance
+  screen type has to widen it. fw 0.5.0 compiles clean
+- [ ] **Lever for later:** those 1192 bytes of Vial tap dance / combos / key overrides / alt
+  repeat are unused by this product through Orbit. Turning off the ones nobody wants is worth
+  more than anything left to squeeze out of `kf_nvm_t` — but it changes what Vial offers, so
+  it is a product decision rather than a slot-space one
+- [ ] `kf_alert_pulse_color()` — two BLUE flashes for a new message. Red is the countdown
+  alarm and the pomodoro change, amber is the control-key hint; a chat ping must not read as
+  either. Existing `kf_alert_pulse()` keeps its signature and delegates in red
+- [ ] Bench gate: chat screen renders with `>` on own lines · badge counts and clears from the
+  bound key · three rooms navigate independently · the blue ping is not mistaken for the alarm ·
+  an NVM v5 board upgrades by falling to defaults and the app re-pushes · 27 frames of bulk
+  chat push does not starve the display task
+
 ## Evidence & analysis
-[[vial-vs-custom-config-app]] · [[keymatrix-led-layout]] · [[protocol-feature-gaps]]
+[[vial-vs-custom-config-app]] · [[keymatrix-led-layout]] · [[protocol-feature-gaps]] · [[telegram-chat-screens]]
 
 ## Timeline
 2026-06-23 | setup — domain created; BOM locked, about to order.

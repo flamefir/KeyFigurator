@@ -170,14 +170,76 @@ Decide scope before building:
 - [ ] Unsigned. Windows SmartScreen will warn on first run; a code-signing certificate is the only real fix
 - [ ] WebView2 is a runtime dependency. Present on Win11 and most Win10, but a blank window means it is missing
 
+### In progress — chat on the OLED, over Telegram (`feature/telegram-chat-screens`)
+Design + test plan: [[telegram-chat-screens]]. A two-person room lives in Orbit and renders
+on the panel. Topology is forced by two Telegram rules — `getUpdates` is single-consumer
+(two Orbits on one bot token get 409 and steal each other's updates) and a bot never hears
+another bot — so it is **one bot per connection, owned by one Orbit, peer on any Telegram
+client**. Free, no server, no inbound port.
+- [x] **Phase 1 — slot space + the drift fix.** App `SCREEN_SLOTS` was 10 while firmware
+  `KF_SCREEN_SLOTS` had been 11 since 0.4.6, so the 7th custom screen's LED profile was
+  rejected by `BoardModel` against a board that would have taken it. Now 14 (4 layer +
+  10 custom) derived from `OLED_MAX_CUSTOM_SCREENS` (7 → 10) rather than a literal, `SCREEN_CHAT`
+  = 8, `MAX_CHAT_SCREENS` = 3, and two tests: one transcribing the four numbers from `kf_hid.h`,
+  one driving a real `SET_SCREEN_LEDS` at the last slot and one past it. Firmware side is
+  fw 0.5.0 / NVM v6 with matching `_Static_assert`s — see the hardware domain for the EEPROM
+  half, which needed the block to grow and turned up 449 bytes of unreachable storage
+- [x] Phase 2 — `telegram.rs`: getUpdates/sendMessage/getMe over `ureq`, thin HTTP + pure
+  parse halves so every test runs offline. Distinct errors for 401/409/429; the bot token
+  never reaches an error string or the log panel. **Done** — 20 tests, all offline. `ureq`
+  (blocking, rustls) over reqwest: every long-lived job here is a plain thread already, and
+  Tauri's reqwest carries no TLS backend so either way added rustls. The offset advances past
+  updates we skip, or one sticker would be redelivered forever
+- [x] Phase 3 — `chat.rs`: connections, single-use 24h pair code riding the `t.me/<bot>?start=`
+  deep link, per-connection poller thread, 8 Tauri commands + `chat-message`/`chat-paired`/
+  `chat-status` events. Bot token stays backend-side in the app-config dir, never `localStorage`,
+  never in an export. 18 tests. Decisions worth keeping: the poll **offset is recorded before
+  any message is acted on** (Telegram redelivers above the offset, so a crash costs one duplicate
+  rather than the batch); the store lock is **never held across a request**, or every command
+  would wait out a 25 s long poll; `ConnectionView` is a separate type rather than
+  `#[serde(skip)]` on the token, because a skip is one edit away from being undone; and two rooms
+  on one bot are refused at the door, since that is a self-inflicted 409
+- [x] Phase 4 — home page **Chatrooms** + Create connection + room panel. A conversation works
+  in Orbit with no board involved. **The frontend owns the transcript** (localStorage, beside
+  layers/screens/devices) and the backend keeps none: everything the board is shown is assembled
+  by `buildOledConfig()` on that side, so a second owner would mean a second restore path.
+  A sent message is recorded only after Telegram accepts it — showing it first would put a line
+  on the board that nobody received. Chat pushes are guarded by `syncChatToBoard()`, because
+  the home page has no active device to build an OLED config from
+- [x] Phase 5 — chat frames: `0x62 CHAT_SET_LINE` / `0x63 CHAT_SET_STATE`, `ChatScreen`/
+  `ChatMessage` in `model`, `push_chats` in `hid`, `ChatSlotState` in `BoardModel`. 29 tests.
+  The host folds to ASCII and wraps to 20 chars; the board draws what it is given, same
+  division of labour as Present Keys and key icons. Decisions worth keeping:
+  - **Lines are written, then `CHAT_SET_STATE` commits a count.** The board draws `count`
+    lines, not however many were written, so a push that dies partway leaves the previous
+    conversation up rather than a torn one — the rule `set_palette` already follows
+  - **The cut to 8 lines happens AFTER wrapping.** Keeping the last 8 *messages* overflows the
+    panel the moment one of them wraps; only counting lines gets it right
+  - **A message that folds away to nothing becomes `[?]`**, not silence. An emoji-only reply is
+    common and vanishing would read as a bug. Danish/German letters transliterate
+    (`Søren` → `Soeren`) rather than blanking
+  - **The clear pass walks the chat screens, not all 14 slots.** Blanket-clearing cost 14 USB
+    round trips on *every* OLED push — and live sync pushes on a 120 ms debounce mid colour-drag —
+    on boards that may have no chat screens at all. A deleted screen needs no clear anyway:
+    `OLED_SET_SCREENS` has already taken it out of the list
+- [x] **Two more instances of the slot drift**, found while wiring this and fixed with it:
+  `push_oled`'s event-key loop was `for slot in 0u8..10`, silently dropping bindings on the
+  highest screens, and `BoardModel::event_keys` was `[[u8; 9]; 10]` against a firmware array of
+  `[14][10]`. Both now sized from `SCREEN_SLOTS`/`EVENT_COUNT`
+- [ ] Phase 6 — firmware `KF_SCREEN_CHAT` (see the hardware domain)
+- [ ] Phase 7 — **Connection Screen**: screen type with a cap of 3 (the first type allowed more
+  than once), connection dropdown, `"chat"` live-sync part, per-room LED-ping toggle
+- [ ] Known limit, by design: if both people own a pad, only the owner's board shows the room.
+  Rules 1 and 2 above, not a shortcut — a symmetric room needs a userbot or a relay
+
 ### Remaining app work
-- [ ] Harness the repo: `/pr` with human HW gate. 76 Rust tests + 11 Playwright suites exist and pass, but they live in a scratchpad rather than the repo — moving them in is the actual task
+- [~] Harness the repo: `/pr` with human HW gate. The older Playwright suites still live in a scratchpad; **new ones now land in `keyfigurator/tests/`** — `chat-ui.mjs` (23 checks) is the first, driving the built app in browser mode against `browserMock`. Moving the older ones in is still the open half
 - [ ] **Standalone per-screen keymaps** — LED profiles now switch on the board with the app closed; the KEYMAP still does not. The board holds one dynamic keymap, so a screen's key bindings are app-side only
 - [ ] Repository renames — code says Orbit / Lunar x MacroPad, but `KeyFigurator`, `Macro-Pro-Firmware` and `Macro-Pro` keep the old names on GitHub and on disk. Outward-facing, so it needs a decision rather than a commit
 - [ ] (optional) Full QMK keycode table — deferred to Vial by the chosen scope
 
 ## Evidence & analysis
-[[vial-vs-custom-config-app]] · [[keymatrix-led-layout]] · [[protocol-feature-gaps]]
+[[vial-vs-custom-config-app]] · [[keymatrix-led-layout]] · [[protocol-feature-gaps]] · [[telegram-chat-screens]]
 
 ## Metrics
 `metrics/` — TBD (build/test pass rate once harnessed).
